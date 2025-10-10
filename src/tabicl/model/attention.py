@@ -158,11 +158,28 @@ def multi_head_attention_forward(
 
     # Apply elliptical per-head scaling to queries (hyper-ellipsoidal neighborhoods)
     if elliptical_scale is not None:
-        # Expected shape: (1, num_heads, 1, head_dim) broadcasting over batch and sequence dims
+        # Expected to be broadcastable over q: (..., nh, tgt_len, head_dim)
+        # Typical shapes: (1, nh, 1, head_dim) or (B, nh, 1, head_dim)
+        if elliptical_scale.dim() < 4:
+            raise ValueError(
+                f"elliptical_scale must have at least 4 dims (..., nh, 1|T, hs), got {elliptical_scale.shape}"
+            )
         if elliptical_scale.shape[-1] != head_dim:
             raise ValueError(
                 f"elliptical_scale head_dim mismatch: expected {head_dim}, got {elliptical_scale.shape[-1]}"
             )
+        if elliptical_scale.shape[-3] != num_heads:
+            raise ValueError(
+                f"elliptical_scale num_heads mismatch: expected {num_heads} at dim -3, got {elliptical_scale.shape[-3]}"
+            )
+        if elliptical_scale.shape[-2] not in (1, tgt_len):
+            raise ValueError(
+                f"elliptical_scale time dim must be 1 or tgt_len ({tgt_len}), got {elliptical_scale.shape[-2]}"
+            )
+
+        # Cast to q's dtype/device and re-normalize per head (safety) to mitigate temperature drift
+        elliptical_scale = elliptical_scale.to(dtype=q.dtype, device=q.device)
+        elliptical_scale = elliptical_scale / (elliptical_scale.amax(dim=-1, keepdim=True) + 1e-12)
         q = q * elliptical_scale
 
     # Disable dropout during evaluation
@@ -222,6 +239,21 @@ def multi_head_attention_forward(
                 attn_mask = key_padding_mask
             else:
                 attn_mask = attn_mask + key_padding_mask
+
+        # Ensure mask dtype/semantics: convert masks to additive form (0 keep, -inf ignore)
+        if attn_mask is not None:
+            if attn_mask.dtype == torch.bool:
+                # bool -> additive: True => -inf, False => 0
+                attn_mask = attn_mask.to(dtype=q.dtype, device=q.device)
+                attn_mask = attn_mask.masked_fill(attn_mask.to(torch.bool), float("-inf"))
+            elif attn_mask.dtype.is_floating_point:
+                # already additive; cast to q's dtype/device
+                attn_mask = attn_mask.to(dtype=q.dtype, device=q.device)
+            else:
+                # integer/binary mask: treat non-zeros as ignore
+                mask_bool = attn_mask != 0
+                attn_mask = mask_bool.to(dtype=q.dtype, device=q.device)
+                attn_mask = attn_mask.masked_fill(mask_bool, float("-inf"))
 
         attn_output = sdpa_with_flattened_batch(q, k, v, attn_mask, dropout_p)  # (..., nh, tgt_len, hs)
 
