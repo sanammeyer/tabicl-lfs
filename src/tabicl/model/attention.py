@@ -71,6 +71,7 @@ def multi_head_attention_forward(
     key_padding_mask: Optional[Tensor] = None,
     attn_mask: Optional[Tensor | int] = None,
     rope: Optional[RotaryEmbedding] = None,
+    elliptical_scale: Optional[Tensor] = None,
 ) -> Tensor:
     """Multi-head attention with support for rotary position embeddings
     as well as specialized processing when attn_mask is an integer.
@@ -154,6 +155,15 @@ def multi_head_attention_forward(
     if rope is not None:
         q = rope.rotate_queries_or_keys(q)
         k = rope.rotate_queries_or_keys(k)
+
+    # Apply elliptical per-head scaling to queries (hyper-ellipsoidal neighborhoods)
+    if elliptical_scale is not None:
+        # Expected shape: (1, num_heads, 1, head_dim) broadcasting over batch and sequence dims
+        if elliptical_scale.shape[-1] != head_dim:
+            raise ValueError(
+                f"elliptical_scale head_dim mismatch: expected {head_dim}, got {elliptical_scale.shape[-1]}"
+            )
+        q = q * elliptical_scale
 
     # Disable dropout during evaluation
     if not training:

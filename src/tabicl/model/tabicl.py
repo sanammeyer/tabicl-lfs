@@ -85,6 +85,7 @@ class TabICL(nn.Module):
         row_rope_base: float = 100000,
         icl_num_blocks: int = 12,
         icl_nhead: int = 4,
+        icl_elliptical: bool = False,
         ff_factor: int = 2,
         dropout: float = 0.0,
         activation: str | callable = "gelu",
@@ -102,6 +103,7 @@ class TabICL(nn.Module):
         self.row_rope_base = row_rope_base
         self.icl_num_blocks = icl_num_blocks
         self.icl_nhead = icl_nhead
+        self.icl_elliptical = icl_elliptical
         self.ff_factor = ff_factor
         self.dropout = dropout
         self.activation = activation
@@ -141,6 +143,7 @@ class TabICL(nn.Module):
             dropout=dropout,
             activation=activation,
             norm_first=norm_first,
+            elliptical=icl_elliptical,
         )
 
     def _train_forward(

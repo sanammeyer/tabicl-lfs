@@ -14,6 +14,7 @@ def extract_tf_row_embeddings(
     *,
     choose_random_variant: bool = False,
     rng: Optional[np.random.Generator] = None,
+    feature_perm_format: str = "list",
 ) -> Dict[str, Any]:
     """Return row interaction (tf_row) embeddings for a single ensemble variant.
 
@@ -77,7 +78,28 @@ def extract_tf_row_embeddings(
 
     with torch.no_grad():
         # Provide the feature permutation used for this variant to the embedder
-        feature_perm = [list(shuffle_patterns[variant_index])]
+        base_perm = list(shuffle_patterns[variant_index])
+        n_est = getattr(clf, "n_estimators", 1) or 1
+        if feature_perm_format not in {"list", "flat"}:
+            raise ValueError("feature_perm_format must be 'list' or 'flat'")
+
+        if feature_perm_format == "list":
+            # One list per estimator (default, expected by current backbone)
+            feature_perm = [base_perm for _ in range(max(1, int(n_est)))]
+        else:
+            # Flat list, for compatibility probing across builds
+            feature_perm = base_perm
+
+        if getattr(clf, "verbose", False):
+            try:
+                if isinstance(feature_perm, list) and feature_perm and isinstance(feature_perm[0], list):
+                    print(
+                        f"[embed] feature_shuffles(list): {len(feature_perm)} x {len(feature_perm[0])}  (n_estimators={n_est}, H={len(base_perm)})"
+                    )
+                else:
+                    print(f"[embed] feature_shuffles(flat): len={len(base_perm)} (n_estimators={n_est})")
+            except Exception:
+                pass
         col_out = model.col_embedder(
             X_tensor,
             train_size=train_size,

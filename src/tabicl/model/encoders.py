@@ -52,6 +52,7 @@ class Encoder(nn.Module):
         norm_first: bool = True,
         use_rope: bool = False,
         rope_base: int = 100000,
+        elliptical: bool = False,
     ):
         super().__init__()
 
@@ -67,6 +68,7 @@ class Encoder(nn.Module):
                     dropout=dropout,
                     activation=activation,
                     norm_first=norm_first,
+                    elliptical=elliptical,
                 )
                 for _ in range(num_blocks)
             ]

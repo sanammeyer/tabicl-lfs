@@ -975,7 +975,10 @@ class EnsembleGenerator(TransformerMixin, BaseEstimator):
         shuffle_shift_norm_configs = shuffle_shift_norm_configs[: self.n_estimators]
 
         # Reorganize configs so that those with the same normalization method are grouped together
-        used_methods = list(set([config[1] for config in shuffle_shift_norm_configs]))
+        # Preserve the order of self.norm_methods_ to avoid non-determinism
+        selected = [config[1] for config in shuffle_shift_norm_configs]
+        used_set = set(selected)
+        used_methods = [m for m in (self.norm_methods_ if hasattr(self, "norm_methods_") else selected) if m in used_set]
 
         ensemble_configs = OrderedDict()
         shuffle_patterns = OrderedDict()

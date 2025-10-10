@@ -180,6 +180,7 @@ class Trainer:
             "row_rope_base": self.config.row_rope_base,
             "icl_num_blocks": self.config.icl_num_blocks,
             "icl_nhead": self.config.icl_nhead,
+            "icl_elliptical": self.config.icl_elliptical,
             "ff_factor": self.config.ff_factor,
             "dropout": self.config.dropout,
             "activation": self.config.activation,
@@ -345,7 +346,19 @@ class Trainer:
         if "state_dict" not in checkpoint:
             raise ValueError("Checkpoint does not contain model state")
 
-        self.raw_model.load_state_dict(checkpoint["state_dict"])
+        # Allow missing keys to support optional features (e.g., elliptical ICL params in later stages)
+        load_result = self.raw_model.load_state_dict(checkpoint["state_dict"], strict=False)
+        try:
+            missing = getattr(load_result, "missing_keys", [])
+            unexpected = getattr(load_result, "unexpected_keys", [])
+        except Exception:
+            missing, unexpected = [], []
+        if self.master_process and (missing or unexpected):
+            print(
+                f"Loaded with missing_keys={len(missing)}, unexpected_keys={len(unexpected)}.\n"
+                f"Missing: {missing[:5]}{'...' if len(missing)>5 else ''} | "
+                f"Unexpected: {unexpected[:5]}{'...' if len(unexpected)>5 else ''}"
+            )
 
         # Optionally load optimizer and scheduler state
         if self.config.only_load_model:

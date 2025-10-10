@@ -48,9 +48,9 @@ def main():
     p.add_argument("--epochs_per_episode", type=int, default=3)
     p.add_argument("--head_hidden", type=int, default=256)
     p.add_argument("--head_dropout", type=float, default=0.05)
+    p.add_argument("--n_estimators", type=int, default=4, help="number of ensemble estimators for TabICL")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--save", type=str, default="models/pdlc_head_prior.pt")
-    p.add_argument("--model_path", type=str, default=None, help="Optional TabICL checkpoint path to force local load")
     p.add_argument("--log_csv", type=str, default="", help="Optional path to append per-episode metrics as CSV")
     # Episode quality controls
     p.add_argument("--min_anchors_per_class", type=int, default=2)
@@ -61,6 +61,15 @@ def main():
     p.add_argument("--warmup_episodes", type=int, default=0, help="episodes to warm-start by mimicking cosine similarity")
     p.add_argument("--mimic_weight", type=float, default=0.0, help="weight of cosine-mimic loss during warmup")
     p.add_argument("--max_anchor_class_ratio", type=float, default=0.7, help="skip episodes with anchors too imbalanced (max class ratio)")
+    # Episode difficulty gating (disabled by default)
+    p.add_argument("--gate_raw_logreg", type=float, default=-1.0, help="resample unless raw-feature logistic acc >= this (<=0 disables)")
+    p.add_argument("--gate_tfrow_knn5", type=float, default=-1.0, help="resample unless TF-row 5-NN acc >= this (<=0 disables)")
+    p.add_argument("--max_query_majority", type=float, default=1.1, help="resample if majority baseline on queries exceeds this (<1 disables)")
+    p.add_argument("--diagnostic_identity", action="store_true", help="use identity ensemble (no aug) while training")
+    # Prior overrides for easier/cleaner episodes (optional)
+    p.add_argument("--balanced_binary", action="store_true", help="force balanced binary when C=2 in Reg2Cls")
+    p.add_argument("--ordered_prob", type=float, default=None, help="override multiclass_ordered_prob (e.g., 0.8)")
+    p.add_argument("--no_permute_labels", action="store_true", help="disable label permutation in Reg2Cls")
     # Prior config (kept minimal; for advanced control tune src/tabicl/prior/prior_config.py)
     p.add_argument("--prior", type=str, default="mix_scm", choices=["mlp_scm", "tree_scm", "mix_scm", "dummy"], help="which prior to sample episodes from")
     p.add_argument("--min_features", type=int, default=4)
@@ -72,7 +81,7 @@ def main():
     args = p.parse_args()
 
     rng = np.random.default_rng(args.seed)
-    device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Set up prior episode generator
     prior_gen = PriorDataset(
@@ -86,25 +95,37 @@ def main():
         log_seq_len=args.log_seq_len,
         device="cpu",  # generation on CPU
     )
+    # Apply optional fixed-HP overrides to bias toward more separable episodes
+    fixed_hp_overrides = {}
+    if args.balanced_binary:
+        fixed_hp_overrides["balanced"] = True
+    if args.ordered_prob is not None:
+        fixed_hp_overrides["multiclass_ordered_prob"] = float(args.ordered_prob)
+    if args.no_permute_labels:
+        fixed_hp_overrides["permute_labels"] = False
+    if fixed_hp_overrides:
+        try:
+            prior_gen.prior.fixed_hp.update(fixed_hp_overrides)
+        except Exception:
+            pass
 
     head = None
     best_nll = float("inf")
     best_state = None
-    opt = None
+    opt = None  
 
     # Initialize a single TabICLClassifier and load backbone once
     clf = TabICLClassifier(
-        n_estimators=4,
+        n_estimators=(1 if args.diagnostic_identity else args.n_estimators),
         batch_size=4,
         use_amp=True,
         verbose=False,
-        model_path=args.model_path,
-        allow_auto_download=True if args.model_path is None else False,
+        model_path="~/.cache/huggingface/hub/models--jingang--TabICL-clf/snapshots/eaf789a9b25ee8486d6f48997ba076f850bbc30b/tabicl-classifier-v1.1-0506.ckpt",
     )
     # Manually load model and prepare inference config once
     # Select device
     if clf.device is None:
-        clf.device_ = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+        clf.device_ = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     elif isinstance(clf.device, str):
         clf.device_ = torch.device(clf.device)
     else:
@@ -226,9 +247,9 @@ def main():
         # Fit ensemble generator on anchors
         eg = EnsembleGenerator(
             n_estimators=clf.n_estimators,
-            norm_methods=clf.norm_methods or ["none", "power"],
-            feat_shuffle_method=clf.feat_shuffle_method,
-            class_shift=clf.class_shift,
+            norm_methods=["none"] if args.diagnostic_identity else (clf.norm_methods or ["none", "power"]),
+            feat_shuffle_method="none" if args.diagnostic_identity else clf.feat_shuffle_method,
+            class_shift=False if args.diagnostic_identity else clf.class_shift,
             outlier_threshold=clf.outlier_threshold,
             random_state=clf.random_state,
         )
@@ -246,15 +267,76 @@ def main():
             choose_random_variant=do_rand_variant,
             rng=rng,
         )
+        # Sanity checks: anchors must be the first rows and labels must align
+        assert int(res["train_size"]) == len(y_tr), (
+            f"Extractor train_size {res['train_size']} != len(y_tr) {len(y_tr)}; ensemble order mismatch."
+        )
+        assert np.array_equal(np.asarray(res["train_labels"]), np.asarray(y_tr)), (
+            "Extractor train_labels do not match anchor labels; check ensemble ordering/decoding."
+        )
         emb_tr = l2_normalize(res["embeddings_train"])  # anchors
         emb_te = l2_normalize(res["embeddings_test"])   # queries
         y_anchor = np.asarray(res["train_labels"])      # decoded labels
         y_query = np.asarray(y_te)
 
+        # Episode difficulty gating (optional)
+        gate_reason = None
+        if args.max_query_majority < 1.0:
+            uniq_q, cnt_q = np.unique(y_query, return_counts=True)
+            majority_q = cnt_q.max() / cnt_q.sum()
+            if majority_q > args.max_query_majority:
+                gate_reason = f"maj_query={majority_q:.3f}"
+        # raw-feature logistic gate using the same preprocessor used by EG
+        if gate_reason is None and args.gate_raw_logreg > 0:
+            # pick the first method used
+            method = "none" if args.diagnostic_identity else next(iter(eg.preprocessors_.keys()))
+            preproc = eg.preprocessors_[method]
+            # Preprocess test like EnsembleGenerator.transform does: numeric -> unique-filter -> preprocessor
+            X_te_num = X_encoder.transform(X_te)
+            X_te_filt = eg.unique_filter_.transform(X_te_num)
+            X_tr_pre = preproc.X_transformed_
+            X_te_pre = preproc.transform(X_te_filt)
+            try:
+                from sklearn.linear_model import LogisticRegression
+                from sklearn.metrics import accuracy_score
+                # Train/eval on current episode labels (avoid stale y_anchor from prior loop)
+                lg = LogisticRegression(max_iter=2000, solver="lbfgs", multi_class="auto").fit(X_tr_pre, y_tr)
+                acc_raw = float(accuracy_score(y_te, lg.predict(X_te_pre)))
+                if acc_raw < args.gate_raw_logreg:
+                    gate_reason = f"raw_logreg={acc_raw:.3f}"
+            except Exception:
+                pass
+        # TF-row KNN gate
+        if gate_reason is None and args.gate_tfrow_knn5 > 0:
+            from sklearn.neighbors import KNeighborsClassifier
+            from sklearn.metrics import accuracy_score
+            knn5 = KNeighborsClassifier(n_neighbors=5, metric="euclidean").fit(emb_tr, y_anchor)
+            acc_knn = float(accuracy_score(y_query, knn5.predict(emb_te)))
+            if acc_knn < args.gate_tfrow_knn5:
+                gate_reason = f"tfrow_knn5={acc_knn:.3f}"
+        if gate_reason is not None:
+            # Resample this episode
+            # print a short note and continue
+            print(f"[Skip] episode rejected by gate: {gate_reason}")
+            continue
+
         # 5) Init head lazily
         if head is None:
             head = PDLCHead(emb_dim=emb_tr.shape[1], hidden=args.head_hidden, dropout=args.head_dropout).to(device)
             opt = torch.optim.AdamW(head.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+
+        # Quick cosine sanity on anchors (informative geometry expected)
+        if emb_tr.shape[0] >= 2:
+            S = emb_tr @ emb_tr.T  # cosine since L2-normalized
+            same = y_anchor[:, None] == y_anchor[None, :]
+            diag = np.eye(same.shape[0], dtype=bool)
+            same[diag] = False
+            diff = ~same
+            cos_within = float(S[same].mean()) if same.any() else float("nan")
+            cos_between = float(S[diff].mean()) if diff.any() else float("nan")
+        else:
+            cos_within = float("nan")
+            cos_between = float("nan")
 
         # 6) Train on balanced pairs from anchors
         # Build a fixed eval pair set to measure pre/post training AUC
@@ -316,11 +398,13 @@ def main():
         if args.report_pair_auc and auc_head is not None and auc_cos is not None:
             print(
                 f"[Episode {ep:03d}] pair-loss={loss:.4f}  PDLC: NLL={nll:.4f}  acc={acc:.3f}  priorNLL={prior_nll:.4f}  "
-                f"AUC(head)={auc_head:.3f}  AUC(cos)={auc_cos:.3f}  AUC(head_pre)={auc_head_pre:.3f}  AUC(head_post)={auc_head_post:.3f}  (C={len(classes_arr)}, H={H}, T={T}, split={split})"
+                f"AUC(head)={auc_head:.3f}  AUC(cos)={auc_cos:.3f}  AUC(head_pre)={auc_head_pre:.3f}  AUC(head_post)={auc_head_post:.3f}  "
+                f"cos_within={cos_within:.3f}  cos_between={cos_between:.3f}  (C={len(classes_arr)}, H={H}, T={T}, split={split})"
             )
         else:
             print(
-                f"[Episode {ep:03d}] pair-loss={loss:.4f}  PDLC: NLL={nll:.4f}  acc={acc:.3f}  priorNLL={prior_nll:.4f}  (C={len(classes_arr)}, H={H}, T={T}, split={split})"
+                f"[Episode {ep:03d}] pair-loss={loss:.4f}  PDLC: NLL={nll:.4f}  acc={acc:.3f}  priorNLL={prior_nll:.4f}  "
+                f"cos_within={cos_within:.3f}  cos_between={cos_between:.3f}  (C={len(classes_arr)}, H={H}, T={T}, split={split})"
             )
 
         # Append CSV log row if requested

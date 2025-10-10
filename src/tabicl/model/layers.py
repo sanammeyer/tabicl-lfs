@@ -259,6 +259,7 @@ class MultiheadAttention(nn.MultiheadAttention):
         key_padding_mask: Optional[Tensor] = None,
         attn_mask: Optional[Tensor | int] = None,
         rope: Optional[RotaryEmbedding] = None,
+        elliptical_scale: Optional[Tensor] = None,
     ) -> Tensor:
         """Compute multi-head attention with support for rotary positional encoding.
 
@@ -314,6 +315,7 @@ class MultiheadAttention(nn.MultiheadAttention):
             key_padding_mask=key_padding_mask,
             attn_mask=attn_mask,
             rope=rope,
+            elliptical_scale=elliptical_scale,
         )
 
 
@@ -350,11 +352,20 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         dropout: float = 0.0,
         activation: str | callable = "gelu",
         norm_first: bool = True,
+        elliptical: bool = False,
     ):
         super().__init__(d_model, nhead, dim_feedforward, dropout, activation, norm_first=norm_first, batch_first=True)
         del self.self_attn
         self.attn = MultiheadAttention(d_model, nhead, dropout)
         self.init_weights()
+        # Elliptical attention parameters (per-head diagonal metric), only if enabled
+        self.elliptical = elliptical
+        if self.elliptical:
+            head_dim = d_model // nhead
+            # Raw parameters -> positive via softplus; zeros init leads to ~1 after max-normalization
+            self.elliptical_m_raw = nn.Parameter(torch.zeros(nhead, head_dim))
+        else:
+            self.elliptical_m_raw = None
 
     def init_weights(self):
         """Initialize projection layers to zero for stable training."""
@@ -459,7 +470,16 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         attn_mask: Optional[Tensor | int],
         rope: Optional[RotaryEmbedding],
     ) -> Tensor:
-        attn = self.attn(q, k, v, key_padding_mask, attn_mask, rope)
+        if self.elliptical and self.elliptical_m_raw is not None:
+            # Build per-head positive, max-normalized scaling vector
+            m = F.softplus(self.elliptical_m_raw)
+            m = m / (m.max(dim=-1, keepdim=True).values + 1e-12)
+            # Shape to broadcast over batch and sequence dims: (1, nh, 1, hs)
+            elliptical_scale = m.view(1, self.attn.num_heads, 1, -1)
+        else:
+            elliptical_scale = None
+
+        attn = self.attn(q, k, v, key_padding_mask, attn_mask, rope, elliptical_scale=elliptical_scale)
         return self.dropout1(attn)
 
     def _ff_block(self, x: Tensor) -> Tensor:

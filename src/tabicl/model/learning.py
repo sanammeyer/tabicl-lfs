@@ -59,10 +59,12 @@ class ICLearning(nn.Module):
         dropout: float = 0.0,
         activation: str | callable = "gelu",
         norm_first: bool = True,
+        elliptical: bool = False,
     ):
         super().__init__()
         self.max_classes = max_classes
         self.norm_first = norm_first
+        self.elliptical = elliptical
 
         self.tf_icl = Encoder(
             num_blocks=num_blocks,
@@ -72,6 +74,7 @@ class ICLearning(nn.Module):
             dropout=dropout,
             activation=activation,
             norm_first=norm_first,
+            elliptical=elliptical,
         )
         if self.norm_first:
             self.ln = nn.LayerNorm(d_model)
