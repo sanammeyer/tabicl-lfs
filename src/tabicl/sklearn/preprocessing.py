@@ -52,6 +52,23 @@ class RecursionLimitManager:
         return False  # Return False to propagate exceptions
 
 
+class _SKCompat:
+    """Compat shim to provide _validate_data for sklearn>=1.7 where it's removed.
+
+    We keep this very lightweight and preserve DataFrame inputs to maintain column
+    dtypes for downstream encoders. It also sets n_features_in_ on first fit when
+    reset=True to emulate sklearn's behavior used by these transformers.
+    """
+
+    def _validate_data(self, X, y=None, *, reset: bool = True, **kwargs):
+        if reset and hasattr(self, "n_features_in_") is not None and hasattr(X, "shape"):
+            try:
+                self.n_features_in_ = X.shape[1]
+            except Exception:
+                pass
+        return (X, y) if y is not None else X
+
+
 class TransformToNumerical(TransformerMixin, BaseEstimator):
     """Transforms non-numerical data in a DataFrame to numerical representations.
 
@@ -147,7 +164,7 @@ class TransformToNumerical(TransformerMixin, BaseEstimator):
         return self.tfm_.transform(X)
 
 
-class UniqueFeatureFilter(TransformerMixin, BaseEstimator):
+class UniqueFeatureFilter(_SKCompat, TransformerMixin, BaseEstimator):
     """Filter that removes features with only one unique value in the training set.
 
     Parameters
@@ -228,7 +245,7 @@ class UniqueFeatureFilter(TransformerMixin, BaseEstimator):
         return X[:, self.features_to_keep_]
 
 
-class OutlierRemover(TransformerMixin, BaseEstimator):
+class OutlierRemover(_SKCompat, TransformerMixin, BaseEstimator):
     """Transformer that clips extreme values based on training data distribution.
 
     This implementation uses a two-stage Z-score based approach to identify and clip outliers:
@@ -337,7 +354,7 @@ class OutlierRemover(TransformerMixin, BaseEstimator):
         return X
 
 
-class CustomStandardScaler(TransformerMixin, BaseEstimator):
+class CustomStandardScaler(_SKCompat, TransformerMixin, BaseEstimator):
     """Custom implementation of standard scaling with clipping.
 
     This scaler computes the mean and standard deviation of the training data,
@@ -546,7 +563,7 @@ class RTDLQuantileTransformer(BaseEstimator, TransformerMixin):
         return X_noisy
 
 
-class PreprocessingPipeline(TransformerMixin, BaseEstimator):
+class PreprocessingPipeline(_SKCompat, TransformerMixin, BaseEstimator):
     """Preprocessing pipeline for tabular data.
 
     This pipeline combines scaling, normalization, and outlier handling.
@@ -803,7 +820,7 @@ class FeatureShuffler:
         return [list(shuffle) for shuffle in feature_shuffles]
 
 
-class EnsembleGenerator(TransformerMixin, BaseEstimator):
+class EnsembleGenerator(_SKCompat, TransformerMixin, BaseEstimator):
     """Generate ensemble variants for robust tabular prediction with TabICL.
 
     This class creates diverse data variants through:

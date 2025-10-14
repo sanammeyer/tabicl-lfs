@@ -219,6 +219,36 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         self.verbose = verbose
         self.inference_config = inference_config
 
+    # Compatibility shim for scikit-learn >=1.7 where BaseEstimator._validate_data was removed.
+    # This method maintains the expected behavior used within this class, in particular preserving
+    # pandas DataFrames when skip_check_array=True so column dtypes are available to the encoders.
+    def _validate_data(
+        self,
+        X,
+        y=None,
+        *,
+        reset: bool | None = True,
+        dtype=None,
+        skip_check_array: bool = False,
+        cast_to_ndarray: bool | None = False,
+        **kwargs,
+    ):
+        """Lightweight input validation compatible with sklearn APIs used here.
+
+        Parameters mirror sklearn.BaseEstimator._validate_data for backward compatibility.
+        When skip_check_array=True, returns inputs unchanged to preserve DataFrame types.
+        """
+        if skip_check_array:
+            return (X, y) if y is not None else X
+
+        # Fallback to minimal checks while preserving DataFrame when possible
+        from sklearn.utils.validation import check_X_y, check_array
+
+        if y is None:
+            return check_array(X, dtype=dtype)
+        else:
+            return check_X_y(X, y, dtype=dtype)
+
     def _more_tags(self):
         """Mark classifier as non-deterministic to bypass certain sklearn tests."""
         return dict(non_deterministic=True)
