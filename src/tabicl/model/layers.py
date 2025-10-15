@@ -362,10 +362,14 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         self.elliptical = elliptical
         if self.elliptical:
             head_dim = d_model // nhead
-            # Raw parameters -> positive via softplus; zeros init leads to ~1 after max-normalization
-            self.elliptical_m_raw = nn.Parameter(torch.zeros(nhead, head_dim))
+            # Raw parameters (logits) for diagonal scales; initialize with small IID noise to break symmetry
+            self.elliptical_m_raw = nn.Parameter(torch.empty(nhead, head_dim))
+            nn.init.trunc_normal_(self.elliptical_m_raw, std=0.02)
         else:
             self.elliptical_m_raw = None
+        # Optional extra scaling factor applied to the elliptical scale at inference/training
+        # This enables quick sensitivity checks without changing weights
+        self.elliptical_extra_scale: float = 1.0
 
     def init_weights(self):
         """Initialize projection layers to zero for stable training."""
@@ -471,11 +475,16 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         rope: Optional[RotaryEmbedding],
     ) -> Tensor:
         if self.elliptical and self.elliptical_m_raw is not None:
-            # Build per-head positive, max-normalized scaling vector
+            # Build per-head positive scaling vector and enforce per-head mean=1 (anisotropy only)
             m = F.softplus(self.elliptical_m_raw)
-            m = m / (m.max(dim=-1, keepdim=True).values + 1e-12)
+            m = m / (m.mean(dim=-1, keepdim=True) + 1e-12)
+            # Use sqrt(m) so that M = diag(m) in Q M K^T (clean Mahalanobis form)
+            m = torch.sqrt(m + 1e-12)
             # Shape to broadcast over batch and sequence dims: (1, nh, 1, hs)
             elliptical_scale = m.view(1, self.attn.num_heads, 1, -1)
+            # Optional external boost factor for sensitivity checks
+            if self.elliptical_extra_scale != 1.0:
+                elliptical_scale = elliptical_scale * self.elliptical_extra_scale
         else:
             elliptical_scale = None
 
@@ -541,13 +550,18 @@ class InducedSelfAttentionBlock(nn.Module):
         activation: str | callable = "gelu",
         norm_first: bool = True,
         skip_value: float = -100.0,
+        elliptical: bool = False,
     ):
         super().__init__()
         self.skip_value = skip_value
 
         # Two-stage attention mechanism
-        self.multihead_attn1 = MultiheadAttentionBlock(d_model, nhead, dim_feedforward, dropout, activation, norm_first)
-        self.multihead_attn2 = MultiheadAttentionBlock(d_model, nhead, dim_feedforward, dropout, activation, norm_first)
+        self.multihead_attn1 = MultiheadAttentionBlock(
+            d_model, nhead, dim_feedforward, dropout, activation, norm_first, elliptical=elliptical
+        )
+        self.multihead_attn2 = MultiheadAttentionBlock(
+            d_model, nhead, dim_feedforward, dropout, activation, norm_first, elliptical=elliptical
+        )
 
         # Learnable inducing points
         self.num_inds = num_inds

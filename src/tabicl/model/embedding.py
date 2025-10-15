@@ -67,6 +67,7 @@ class ColEmbedding(nn.Module):
         activation: str | callable = "gelu",
         norm_first: bool = True,
         reserve_cls_tokens: int = 4,
+        elliptical: bool = False,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -82,6 +83,7 @@ class ColEmbedding(nn.Module):
             dropout=dropout,
             activation=activation,
             norm_first=norm_first,
+            elliptical=elliptical,
         )
 
         self.out_w = SkippableLinear(embed_dim, embed_dim)

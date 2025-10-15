@@ -199,6 +199,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         n_jobs: Optional[int] = None,
         verbose: bool = False,
         inference_config: Optional[InferenceConfig | Dict] = None,
+        elliptical_scale_boost: float = 1.0,
     ):
         self.n_estimators = n_estimators
         self.norm_methods = norm_methods
@@ -218,6 +219,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         self.random_state = random_state
         self.verbose = verbose
         self.inference_config = inference_config
+        self.elliptical_scale_boost = elliptical_scale_boost
 
     # Compatibility shim for scikit-learn >=1.7 where BaseEstimator._validate_data was removed.
     # This method maintains the expected behavior used within this class, in particular preserving
@@ -355,6 +357,11 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         self.model_ = TabICL(**checkpoint["config"])
         self.model_.load_state_dict(checkpoint["state_dict"])
         self.model_.eval()
+        # Optional: set an extra multiplicative factor for elliptical scaling (diagnostics)
+        try:
+            self.model_.set_icl_elliptical_scale_boost(self.elliptical_scale_boost)
+        except Exception:
+            pass
 
     def fit(self, X, y):
         """Fit the classifier to training data.

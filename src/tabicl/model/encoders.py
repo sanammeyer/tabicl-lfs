@@ -164,6 +164,7 @@ class SetTransformer(nn.Module):
         dropout: float = 0.0,
         activation: str = "gelu",
         norm_first: bool = True,
+        elliptical: bool = False,
     ):
         super().__init__()
 
@@ -180,6 +181,7 @@ class SetTransformer(nn.Module):
                     dropout=dropout,
                     activation=activation,
                     norm_first=norm_first,
+                    elliptical=elliptical,
                 )
                 for _ in range(num_blocks)
             ]

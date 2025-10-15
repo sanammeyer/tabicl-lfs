@@ -61,6 +61,7 @@ class RowInteraction(nn.Module):
         dropout: float = 0.0,
         activation: str | callable = "gelu",
         norm_first: bool = True,
+        elliptical: bool = False,
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -77,6 +78,7 @@ class RowInteraction(nn.Module):
             norm_first=norm_first,
             use_rope=True,
             rope_base=rope_base,
+            elliptical=elliptical,
         )
 
         self.cls_tokens = nn.Parameter(torch.empty(num_cls, embed_dim))

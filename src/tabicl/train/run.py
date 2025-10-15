@@ -174,6 +174,7 @@ class Trainer:
             "col_num_blocks": self.config.col_num_blocks,
             "col_nhead": self.config.col_nhead,
             "col_num_inds": self.config.col_num_inds,
+            "col_elliptical": getattr(self.config, "col_elliptical", False),
             "row_num_blocks": self.config.row_num_blocks,
             "row_nhead": self.config.row_nhead,
             "row_num_cls": self.config.row_num_cls,
@@ -276,12 +277,64 @@ class Trainer:
         )
 
     def configure_optimizer(self):
-        """Configure optimizer and scheduler."""
+        """Configure optimizer and scheduler with a separate group for elliptical logits."""
 
-        self.optimizer = optim.AdamW(
-            params=self.raw_model.parameters(), lr=self.config.lr, weight_decay=self.config.weight_decay
-        )
+        # Split parameters: elliptical_m_raw vs. others
+        ellip_params = []
+        other_params = []
+        for n, p in self.raw_model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if n.endswith("elliptical_m_raw"):
+                ellip_params.append(p)
+            else:
+                other_params.append(p)
+
+        param_groups = []
+        if other_params:
+            param_groups.append({
+                "params": other_params,
+                "lr": self.config.lr,
+                "weight_decay": self.config.weight_decay,
+            })
+        if ellip_params:
+            param_groups.append({
+                "params": ellip_params,
+                "lr": self.config.lr * float(getattr(self.config, "icl_elliptical_lr_mult", 1.0)),
+                "weight_decay": float(getattr(self.config, "icl_elliptical_weight_decay", 0.0)),
+            })
+
+        self.optimizer = optim.AdamW(param_groups)
         self.scheduler = get_scheduler(config=self.config, optimizer=self.optimizer)
+
+    def _set_icl_qk_requires_grad(self, requires_grad: bool):
+        """Freeze/unfreeze ICL Q/K (in-proj) to encourage metric learning early on."""
+        try:
+            blocks = self.raw_model.icl_predictor.tf_icl.blocks
+        except Exception:
+            return
+        for blk in blocks:
+            attn = getattr(blk, "attn", None)
+            if attn is None:
+                continue
+            for attr in ("in_proj_weight", "in_proj_bias"):
+                par = getattr(attn, attr, None)
+                if par is not None and hasattr(par, "requires_grad"):
+                    par.requires_grad = requires_grad
+
+    def _update_qk_warmup_freeze(self, step: int):
+        """Apply warmup freeze for Q/K projections during initial steps."""
+        warmup = int(getattr(self.config, "freeze_qk_warmup_steps", 0) or 0)
+        if warmup <= 0:
+            return
+        if step < warmup:
+            if not getattr(self, "_qk_frozen", False):
+                self._set_icl_qk_requires_grad(False)
+                self._qk_frozen = True
+        else:
+            if getattr(self, "_qk_frozen", False):
+                self._set_icl_qk_requires_grad(True)
+                self._qk_frozen = False
 
     def configure_amp(self):
         """Configure automatic mixed precision (AMP) for training."""
@@ -437,6 +490,8 @@ class Trainer:
 
         dataloader = iter(self.dataloader)
         for step in step_progress:
+            # Optionally freeze/unfreeze Q/K during warmup
+            self._update_qk_warmup_freeze(step)
             # Get the next batch
             with Timer() as prior_timer:
                 batch = next(dataloader)
@@ -595,6 +650,24 @@ class Trainer:
             pred = pred.flatten(end_dim=-2)
             true = y_test.long().flatten()
             loss = F.cross_entropy(pred, true)
+            # Elliptical scale L2 regularization (ICL stage) to avoid drift and break symmetry
+            if getattr(self.config, "icl_elliptical", False) and getattr(
+                self.config, "icl_elliptical_reg_lambda", 0.0
+            ) > 0.0:
+                reg = 0.0
+                n_blocks = 0
+                try:
+                    blocks = self.raw_model.icl_predictor.tf_icl.blocks
+                except Exception:
+                    blocks = []
+                for blk in blocks:
+                    if getattr(blk, "elliptical", False) and getattr(blk, "elliptical_m_raw", None) is not None:
+                        m = F.softplus(blk.elliptical_m_raw)
+                        reg = reg + torch.mean((m - 1.0) ** 2)
+                        n_blocks += 1
+                if n_blocks > 0:
+                    reg = reg / n_blocks
+                    loss = loss + float(self.config.icl_elliptical_reg_lambda) * reg
 
         # Scale loss for gradient accumulation and backpropagate
         scaled_loss = loss / num_micro_batches
@@ -605,6 +678,13 @@ class Trainer:
             micro_results["ce"] = scaled_loss.item()
             accuracy = (pred.argmax(dim=1) == true).sum() / len(true)
             micro_results["accuracy"] = accuracy.item() / num_micro_batches
+            if getattr(self.config, "icl_elliptical", False) and getattr(
+                self.config, "icl_elliptical_reg_lambda", 0.0
+            ) > 0.0:
+                # Report unscaled regularization contribution (approximate)
+                micro_results["icl_reg"] = (
+                    (float(self.config.icl_elliptical_reg_lambda) * reg.item()) / num_micro_batches
+                )
 
         return micro_results
 

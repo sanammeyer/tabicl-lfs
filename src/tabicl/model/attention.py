@@ -156,7 +156,7 @@ def multi_head_attention_forward(
         q = rope.rotate_queries_or_keys(q)
         k = rope.rotate_queries_or_keys(k)
 
-    # Apply elliptical per-head scaling to queries (hyper-ellipsoidal neighborhoods)
+    # Apply elliptical per-head scaling to queries and keys (diagonal Mahalanobis)
     if elliptical_scale is not None:
         # Expected to be broadcastable over q: (..., nh, tgt_len, head_dim)
         # Typical shapes: (1, nh, 1, head_dim) or (B, nh, 1, head_dim)
@@ -177,10 +177,11 @@ def multi_head_attention_forward(
                 f"elliptical_scale time dim must be 1 or tgt_len ({tgt_len}), got {elliptical_scale.shape[-2]}"
             )
 
-        # Cast to q's dtype/device and re-normalize per head (safety) to mitigate temperature drift
+        # Cast to q/k dtype/device
         elliptical_scale = elliptical_scale.to(dtype=q.dtype, device=q.device)
-        elliptical_scale = elliptical_scale / (elliptical_scale.amax(dim=-1, keepdim=True) + 1e-12)
+        # No normalization here: any regularization handled during training
         q = q * elliptical_scale
+        k = k * elliptical_scale
 
     # Disable dropout during evaluation
     if not training:
