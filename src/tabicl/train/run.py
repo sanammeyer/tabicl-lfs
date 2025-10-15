@@ -174,7 +174,8 @@ class Trainer:
             "col_num_blocks": self.config.col_num_blocks,
             "col_nhead": self.config.col_nhead,
             "col_num_inds": self.config.col_num_inds,
-            "col_elliptical": getattr(self.config, "col_elliptical", False),
+            # Backward compatibility: fall back to old --col_elliptical if present
+            "row_elliptical": getattr(self.config, "row_elliptical", getattr(self.config, "col_elliptical", False)),
             "row_num_blocks": self.config.row_num_blocks,
             "row_nhead": self.config.row_nhead,
             "row_num_cls": self.config.row_num_cls,

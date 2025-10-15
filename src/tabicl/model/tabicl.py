@@ -79,7 +79,9 @@ class TabICL(nn.Module):
         col_num_blocks: int = 3,
         col_nhead: int = 4,
         col_num_inds: int = 128,
-        col_elliptical: bool = False,
+        # Backward-compat: accept old col_elliptical while preferring row_elliptical
+        col_elliptical: bool | None = None,
+        row_elliptical: bool = False,
         row_num_blocks: int = 3,
         row_nhead: int = 8,
         row_num_cls: int = 4,
@@ -98,7 +100,7 @@ class TabICL(nn.Module):
         self.col_num_blocks = col_num_blocks
         self.col_nhead = col_nhead
         self.col_num_inds = col_num_inds
-        self.col_elliptical = col_elliptical
+        self.row_elliptical = row_elliptical or (False if col_elliptical is None else col_elliptical)
         self.row_num_blocks = row_num_blocks
         self.row_nhead = row_nhead
         self.row_num_cls = row_num_cls
@@ -121,7 +123,7 @@ class TabICL(nn.Module):
             activation=activation,
             norm_first=norm_first,
             reserve_cls_tokens=row_num_cls,
-            elliptical=col_elliptical,
+            elliptical=self.row_elliptical,
         )
 
         self.row_interactor = RowInteraction(
@@ -134,7 +136,7 @@ class TabICL(nn.Module):
             dropout=dropout,
             activation=activation,
             norm_first=norm_first,
-            elliptical=col_elliptical,
+            elliptical=self.row_elliptical,
         )
 
         icl_dim = embed_dim * row_num_cls  # CLS tokens are concatenated for ICL

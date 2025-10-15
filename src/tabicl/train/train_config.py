@@ -174,7 +174,7 @@ def build_parser():
     parser.add_argument("--col_nhead", type=int, default=4, help="Number of attention heads in column embedder")
     parser.add_argument("--col_num_inds", type=int, default=128, help="Number of inducing points in column embedder")
     parser.add_argument(
-        "--col_elliptical",
+        "--row_elliptical",
         default=False,
         type=str2bool,
         help="Enable elliptical attention for stages 1–2 (column embedding and row interaction)",
