@@ -250,4 +250,42 @@ def build_parser():
     parser.add_argument("--checkpoint_path", default=None, type=str, help="Path to specific checkpoint file to load")
     parser.add_argument("--only_load_model", default=False, type=str2bool, help="Whether to only load model weights")
 
+    ###########################################################################
+    ###### Probe / Diagnostics #################################################
+    ###########################################################################
+    parser.add_argument(
+        "--probe_every",
+        type=int,
+        default=0,
+        help=(
+            "If > 0, run a fixed-dataset probe every N steps in eval mode with no grad. "
+            "Logs anisotropy/std(m), KL(attn), entropy, and ΔCE to wandb."
+        ),
+    )
+    parser.add_argument(
+        "--probe_batch_size",
+        type=int,
+        default=10,
+        help="Number of datasets to materialize for the fixed probe batch",
+    )
+    parser.add_argument(
+        "--probe_seed",
+        type=int,
+        default=1337,
+        help="Random seed used to draw the fixed probe batch for reproducibility",
+    )
+
+    ###########################################################################
+    ###### Local Metrics Logging ##############################################
+    ###########################################################################
+    parser.add_argument(
+        "--metrics_csv",
+        type=str,
+        default=None,
+        help=(
+            "Optional path to a CSV file for per-step metrics (master process only). "
+            "Includes ce, accuracy, lr, times, and probe metrics when available."
+        ),
+    )
+
     return parser

@@ -26,6 +26,7 @@ from tabicl.prior.dataset import PriorDataset
 from tabicl.prior.genload import LoadPriorDataset
 from tabicl.train.optim import get_scheduler
 from tabicl.train.train_config import build_parser
+import csv
 
 warnings.filterwarnings(
     "ignore", message=".*The PyTorch API of nested tensors is in prototype stage.*", category=UserWarning
@@ -85,9 +86,35 @@ class Trainer:
         self.configure_wandb()
         self.build_model()
         self.configure_prior()
+        # Probe: materialize once if configured
+        self._probe_data = None
+        if getattr(self.config, "probe_every", 0) and self.config.probe_every > 0:
+            try:
+                self.materialize_probe_batch()
+            except Exception as e:
+                print(f"Warning: failed to materialize probe batch: {e}")
         self.configure_optimizer()
         self.configure_amp()
         self.load_checkpoint()
+        # Local CSV logging (master only)
+        self.metrics_csv_path = getattr(self.config, "metrics_csv", None)
+        self.csv_fields = [
+            "step",
+            "ce",
+            "accuracy",
+            "lr",
+            "prior_time",
+            "train_time",
+            "icl_reg",
+            # Probe metrics (may be empty when not on probe step)
+            "probe/ellip_std_per_head_mean",
+            "probe/ellip_mean_m",
+            "probe/attn_kl_mean",
+            "probe/attn_entropy_mean",
+            "probe/delta_ce",
+            "probe/ce",
+            "probe/chance_entropy",
+        ]
 
     def configure_ddp(self):
         """Set up distributed training and system configuration.
@@ -344,12 +371,244 @@ class Trainer:
         self.scaler = torch.GradScaler("cuda", enabled=self.amp)
         if self.amp:
             if self.master_process:
-                print(f"Automatic Mixed Precision is enabled.")
-            self.amp_ctx = torch.autocast(
-                device_type="cuda", dtype=torch.float16 if self.config.dtype == "float16" else torch.float32
-            )
+                print("Automatic Mixed Precision is enabled.")
+            # Respect requested dtype for autocast
+            dtype_str = str(getattr(self.config, "dtype", "bfloat16")).lower()
+            if dtype_str in ("bf16", "bfloat16"):
+                amp_dtype = torch.bfloat16
+            elif dtype_str in ("fp16", "float16"):
+                amp_dtype = torch.float16
+            else:
+                amp_dtype = torch.float32
+            self.amp_ctx = torch.autocast(device_type="cuda", dtype=amp_dtype)
         else:
             self.amp_ctx = nullcontext()
+
+    # ------------------------------
+    # Probe utilities
+    # ------------------------------
+
+    @torch.no_grad()
+    def materialize_probe_batch(self) -> None:
+        """Draw and freeze a small, deterministic probe batch (CPU tensors)."""
+        # Save and set seeds deterministically
+        np_state = np.random.get_state()
+        torch_state = torch.get_rng_state()
+        np.random.seed(int(self.config.probe_seed))
+        torch.manual_seed(int(self.config.probe_seed))
+
+        try:
+            ds = self.dataloader.dataset
+            X, y, d, seq_len, train_size = ds.get_batch(batch_size=int(self.config.probe_batch_size))
+            # Convert nested to padded tensors if needed
+            tensors = [X, y]
+            tensors = [t.to_padded_tensor(padding=0.0) if hasattr(t, "is_nested") and t.is_nested else t for t in tensors]
+            X, y = tensors
+            self._probe_data = {
+                "X": X.cpu(),
+                "y": y.cpu(),
+                "d": d.cpu() if isinstance(d, torch.Tensor) else torch.as_tensor(d).cpu(),
+                "seq_len": seq_len.cpu() if isinstance(seq_len, torch.Tensor) else torch.as_tensor(seq_len).cpu(),
+                "train_size": train_size.cpu() if isinstance(train_size, torch.Tensor) else torch.as_tensor(train_size).cpu(),
+                "seed": int(self.config.probe_seed),
+            }
+            if self.master_process:
+                print(
+                    f"[probe] Materialized fixed batch: B={X.shape[0]}, T={X.shape[1]}, H={X.shape[2]}, train_size={int(self._probe_data['train_size'][0].item())}"
+                )
+        finally:
+            np.random.set_state(np_state)
+            torch.set_rng_state(torch_state)
+
+    @torch.no_grad()
+    def _gather_elliptical_params_stats(self) -> dict:
+        """Compute anisotropy (std of mean-one m) and mean(m) across all elliptical blocks."""
+        std_vals = []
+        mean_vals = []
+
+        def collect_from_module(m: nn.Module):
+            if getattr(m, "elliptical", False) and getattr(m, "elliptical_m_raw", None) is not None:
+                m_raw = m.elliptical_m_raw
+                m_sp = F.softplus(m_raw)
+                m_hat = m_sp / (m_sp.mean(dim=-1, keepdim=True) + 1e-12)
+                std_per_head = m_hat.std(dim=-1)
+                std_vals.append(std_per_head.mean().item())
+                mean_per_head = m_sp.mean(dim=-1)
+                mean_vals.append(mean_per_head.mean().item())
+
+        try:
+            for blk in getattr(self.raw_model.col_embedder, "tf_col", nn.Module()).blocks:
+                collect_from_module(blk)
+        except Exception:
+            pass
+        try:
+            for blk in getattr(self.raw_model.row_interactor, "tf_row", nn.Module()).blocks:
+                collect_from_module(blk)
+        except Exception:
+            pass
+        try:
+            for blk in getattr(self.raw_model.icl_predictor, "tf_icl", nn.Module()).blocks:
+                collect_from_module(blk)
+        except Exception:
+            pass
+
+        stats = {}
+        if std_vals:
+            stats["probe/ellip_std_per_head_mean"] = float(np.mean(std_vals))
+        if mean_vals:
+            stats["probe/ellip_mean_m"] = float(np.mean(mean_vals))
+        return stats
+
+    @torch.no_grad()
+    def _compute_icl_attn_metrics(self, R: torch.Tensor, y_train: torch.Tensor, train_size: int) -> dict:
+        """Compute KL(A_ellip || A_dot) and attention entropy on ICL encoder blocks."""
+        metrics = {}
+        try:
+            blocks = self.raw_model.icl_predictor.tf_icl.blocks
+        except Exception:
+            return metrics
+
+        B, T, E = R.shape
+        cut = int(train_size)
+
+        def attn_kl_entropy_for_block(blk: nn.Module, x: torch.Tensor) -> tuple[float, float]:
+            q_in = blk.norm1(x)
+            k_in = blk.norm1(x)
+            v_in = blk.norm1(x)
+            nh = blk.attn.num_heads
+            head_dim = E // nh
+            q, k, v = F._in_projection_packed(q_in, k_in, v_in, blk.attn.in_proj_weight, blk.attn.in_proj_bias)
+            q = q.view(B, T, nh, head_dim).transpose(1, 2)
+            k = k.view(B, T, nh, head_dim).transpose(1, 2)
+
+            if getattr(blk, "elliptical", False) and getattr(blk, "elliptical_m_raw", None) is not None:
+                m = F.softplus(blk.elliptical_m_raw)
+                m = m / (m.mean(dim=-1, keepdim=True) + 1e-12)
+                m = torch.sqrt(m + 1e-12)
+                ellip = m.view(1, nh, 1, head_dim).to(dtype=q.dtype, device=q.device)
+            else:
+                ellip = None
+
+            q_left, k_left = q[..., :cut, :], k[..., :cut, :]
+            q_right = q[..., cut:, :]
+            if ellip is not None:
+                ql_e, kl_e = q_left * ellip, k_left * ellip
+                qr_e = q_right * ellip
+            else:
+                ql_e, kl_e, qr_e = q_left, k_left, q_right
+
+            ql_d, kl_d, qr_d = q_left, k_left, q_right
+            scale = float(head_dim) ** -0.5
+
+            scores_e_left = torch.matmul(ql_e, kl_e.transpose(-1, -2)) * scale
+            scores_d_left = torch.matmul(ql_d, kl_d.transpose(-1, -2)) * scale
+            probs_e_left = scores_e_left.softmax(dim=-1)
+            probs_d_left = scores_d_left.softmax(dim=-1)
+
+            scores_e_right = torch.matmul(qr_e, kl_e.transpose(-1, -2)) * scale
+            scores_d_right = torch.matmul(qr_d, kl_d.transpose(-1, -2)) * scale
+            probs_e_right = scores_e_right.softmax(dim=-1)
+            probs_d_right = scores_d_right.softmax(dim=-1)
+
+            eps = 1e-12
+            log_e_left = (probs_e_left + eps).log()
+            log_e_right = (probs_e_right + eps).log()
+            kl_left = F.kl_div(log_e_left, probs_d_left, reduction="batchmean")
+            kl_right = F.kl_div(log_e_right, probs_d_right, reduction="batchmean")
+
+            ent_left = -(probs_e_left * log_e_left).sum(dim=-1).mean()
+            ent_right = -(probs_e_right * log_e_right).sum(dim=-1).mean()
+
+            kl = 0.5 * (kl_left + kl_right)
+            ent = 0.5 * (ent_left + ent_right)
+            return float(kl.item()), float(ent.item())
+
+        kls, ents = [], []
+        x = R
+        for blk in blocks:
+            kl, ent = attn_kl_entropy_for_block(blk, x)
+            kls.append(kl)
+            ents.append(ent)
+            x = blk(x, attn_mask=train_size)
+
+        if kls:
+            metrics["probe/attn_kl_mean"] = float(np.mean(kls))
+        if ents:
+            metrics["probe/attn_entropy_mean"] = float(np.mean(ents))
+        return metrics
+
+    @torch.no_grad()
+    def _compute_probe_delta_ce(self, logits: torch.Tensor, y: torch.Tensor, train_size: int) -> dict:
+        y_test = y[:, train_size:]
+        pred = logits[:, train_size:]
+        ce = F.cross_entropy(pred.flatten(end_dim=-2), y_test.long().flatten()).item()
+        B = y.shape[0]
+        entropies, weights = [], []
+        for i in range(B):
+            yt = y_test[i]
+            if yt.numel() == 0:
+                continue
+            vals, counts = yt.unique(return_counts=True)
+            p = counts.float() / counts.sum()
+            h = float(-(p * (p + 1e-12).log()).sum().item())
+            entropies.append(h)
+            weights.append(float(yt.numel()))
+        if weights:
+            w = np.array(weights, dtype=float); w = w / w.sum()
+            h_avg = float((w * np.array(entropies, dtype=float)).sum())
+            delta_ce = ce - h_avg
+            return {"probe/delta_ce": float(delta_ce), "probe/ce": float(ce), "probe/chance_entropy": float(h_avg)}
+        else:
+            return {"probe/delta_ce": float("nan"), "probe/ce": float(ce), "probe/chance_entropy": float("nan")}
+
+    @torch.no_grad()
+    def run_probe_once(self) -> dict:
+        if not self._probe_data:
+            return {}
+
+        prev_mode = self.model.training
+        self.model.eval()
+        try:
+            Xc = self._probe_data["X"].to(self.config.device)
+            yc = self._probe_data["y"].to(self.config.device)
+            dc = self._probe_data["d"].to(self.config.device)
+            train_size = int(self._probe_data["train_size"][0].item())
+
+            y_train = yc[:, :train_size]
+            # Build embeddings and row representations using training paths
+            emb = self.raw_model.col_embedder._train_forward(Xc, d=dc, train_size=train_size)
+            R = self.raw_model.row_interactor._train_forward(emb, d=dc)
+
+            # Compute full logits (train+test) via internal training path to avoid inference constraints
+            logits_full = self.raw_model.icl_predictor._icl_predictions(R.clone(), y_train)
+            metrics = self._compute_probe_delta_ce(logits_full, yc, train_size)
+            metrics.update(self._gather_elliptical_params_stats())
+
+            # Attention diagnostics on the ICL encoder (condition on training labels)
+            R[:, :train_size] = R[:, :train_size] + self.raw_model.icl_predictor.y_encoder(y_train.float())
+            metrics.update(self._compute_icl_attn_metrics(R, y_train, train_size))
+
+            return metrics
+        finally:
+            if prev_mode:
+                self.model.train()
+
+    def maybe_run_probe(self, step: int) -> None:
+        if not self.master_process:
+            return
+        N = int(getattr(self.config, "probe_every", 0) or 0)
+        if N <= 0:
+            return
+        if (step + 1) % N != 0:
+            return
+        try:
+            metrics = self.run_probe_once()
+            if metrics and self.wandb_run is not None:
+                wandb.log(metrics, step=self.curr_step)
+            if metrics and getattr(self, "metrics_csv_path", None):
+                self._csv_log_row({"step": self.curr_step, **metrics})
+        except Exception as e:
+            print(f"[probe] Warning: probe failed at step {self.curr_step}: {e}")
 
     def get_latest_checkpoint(self):
         """Returns the latest checkpoint from `checkpoint_dir`
@@ -532,13 +791,20 @@ class Trainer:
                 results["lr"] = self.scheduler.get_last_lr()[0]
                 wandb.log(results, step=self.curr_step)
 
+            # Periodic diagnostics probe
+            self.maybe_run_probe(step)
+
+            # Local CSV logging of training metrics
+            if getattr(self, "metrics_csv_path", None):
+                row = {"step": self.curr_step, **results}
+                self._csv_log_row(row)
+
     def validate_micro_batch(self, micro_seq_len, micro_train_size):
         """
-        Validate consistent sequence length and train size within a micro batch.
+        Determine a common (seq_len, train_size) for a micro batch.
 
-        Ensures all datasets in a micro batch share the same sequence length and
-        train/test split position, required for efficient batch processing during
-        gradient accumulation.
+        If inputs are inconsistent (due to --seq_len_per_gp True), pick the minimum
+        seq_len and train_size across the micro batch to enable robust trimming.
 
         Parameters
         ----------
@@ -551,22 +817,12 @@ class Trainer:
         Returns
         -------
         tuple (int, int)
-            The common (seq_len, train_size) for the micro batch.
-
-        Raises
-        ------
-        ValueError
-            If sequence lengths or train sizes are inconsistent.
+            The (seq_len, train_size) to use for trimming within the micro batch.
         """
-        if len(torch.unique(micro_seq_len)) > 1:
-            raise ValueError("All datasets in the micro batch must have the same sequence length.")
-
-        if len(torch.unique(micro_train_size)) > 1:
-            raise ValueError("All datasets in the micro batch must have the same training size.")
-
-        seq_len = micro_seq_len[0].item()
-        train_size = micro_train_size[0].item()
-
+        # Robust choice: pick the minimal values across the micro batch
+        # This guarantees valid slicing for all items and avoids shape mismatches.
+        seq_len = int(micro_seq_len.min().item())
+        train_size = int(micro_train_size.min().item())
         return seq_len, train_size
 
     def align_micro_batch(self, micro_X, micro_y, micro_d, seq_len):
@@ -760,6 +1016,27 @@ class Trainer:
         self.scheduler.step()
 
         return results
+
+    # ------------------------------
+    # CSV metrics logging
+    # ------------------------------
+    def _csv_log_row(self, row: dict) -> None:
+        if not self.master_process or not getattr(self, "metrics_csv_path", None):
+            return
+        path = self.metrics_csv_path
+        # Ensure directory exists
+        try:
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        except Exception:
+            pass
+        file_exists = os.path.exists(path)
+        # Normalize fields
+        out = {k: row.get(k, None) for k in getattr(self, "csv_fields", [])}
+        with open(path, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=self.csv_fields)
+            if not file_exists:
+                writer.writeheader()
+            writer.writerow(out)
 
 
 if __name__ == "__main__":
