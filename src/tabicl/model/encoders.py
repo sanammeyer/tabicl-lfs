@@ -53,6 +53,8 @@ class Encoder(nn.Module):
         use_rope: bool = False,
         rope_base: int = 100000,
         elliptical: bool = False,
+        elliptical_delta: float = 1.0,
+        elliptical_scale_mode: str = "max",
     ):
         super().__init__()
 
@@ -73,6 +75,10 @@ class Encoder(nn.Module):
                 for _ in range(num_blocks)
             ]
         )
+        # Propagate estimator settings to blocks
+        for blk in self.blocks:
+            blk.elliptical_delta = elliptical_delta
+            blk.elliptical_scale_mode = elliptical_scale_mode
 
         self.rope = RotaryEmbedding(dim=d_model // nhead, theta=rope_base) if use_rope else None
 
@@ -109,8 +115,18 @@ class Encoder(nn.Module):
             Output tensor of shape (..., seq_len, d_model)
         """
         out = src
-        for block in self.blocks:
-            out = block(q=out, key_padding_mask=key_padding_mask, attn_mask=attn_mask, rope=self.rope)
+        v_prev = None
+        for idx, block in enumerate(self.blocks):
+            out = block(
+                q=out,
+                key_padding_mask=key_padding_mask,
+                attn_mask=attn_mask,
+                rope=self.rope,
+                v_prev=v_prev,
+                block_index=idx,
+            )
+            # Stash current V for next block (parameter-free elliptical)
+            v_prev = getattr(block, "_last_v", None)
 
         return out
 

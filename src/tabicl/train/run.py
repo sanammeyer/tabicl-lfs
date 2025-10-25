@@ -105,10 +105,7 @@ class Trainer:
             "lr",
             "prior_time",
             "train_time",
-            "icl_reg",
             # Probe metrics (may be empty when not on probe step)
-            "probe/ellip_std_per_head_mean",
-            "probe/ellip_mean_m",
             "probe/attn_kl_mean",
             "probe/attn_entropy_mean",
             "probe/delta_ce",
@@ -210,6 +207,8 @@ class Trainer:
             "icl_num_blocks": self.config.icl_num_blocks,
             "icl_nhead": self.config.icl_nhead,
             "icl_elliptical": self.config.icl_elliptical,
+            "elliptical_delta": getattr(self.config, "elliptical_delta", 1.0),
+            "elliptical_scale_mode": getattr(self.config, "elliptical_scale_mode", "max"),
             "ff_factor": self.config.ff_factor,
             "dropout": self.config.dropout,
             "activation": self.config.activation,
@@ -305,34 +304,13 @@ class Trainer:
         )
 
     def configure_optimizer(self):
-        """Configure optimizer and scheduler with a separate group for elliptical logits."""
-
-        # Split parameters: elliptical_m_raw vs. others
-        ellip_params = []
-        other_params = []
-        for n, p in self.raw_model.named_parameters():
-            if not p.requires_grad:
-                continue
-            if n.endswith("elliptical_m_raw"):
-                ellip_params.append(p)
-            else:
-                other_params.append(p)
-
-        param_groups = []
-        if other_params:
-            param_groups.append({
-                "params": other_params,
-                "lr": self.config.lr,
-                "weight_decay": self.config.weight_decay,
-            })
-        if ellip_params:
-            param_groups.append({
-                "params": ellip_params,
-                "lr": self.config.lr * float(getattr(self.config, "icl_elliptical_lr_mult", 1.0)),
-                "weight_decay": float(getattr(self.config, "icl_elliptical_weight_decay", 0.0)),
-            })
-
-        self.optimizer = optim.AdamW(param_groups)
+        """Configure optimizer and scheduler (single parameter group)."""
+        params = [p for p in self.raw_model.parameters() if p.requires_grad]
+        self.optimizer = optim.AdamW(
+            params,
+            lr=float(self.config.lr),
+            weight_decay=float(self.config.weight_decay),
+        )
         self.scheduler = get_scheduler(config=self.config, optimizer=self.optimizer)
 
     def _set_icl_qk_requires_grad(self, requires_grad: bool):
@@ -420,44 +398,7 @@ class Trainer:
             np.random.set_state(np_state)
             torch.set_rng_state(torch_state)
 
-    @torch.no_grad()
-    def _gather_elliptical_params_stats(self) -> dict:
-        """Compute anisotropy (std of mean-one m) and mean(m) across all elliptical blocks."""
-        std_vals = []
-        mean_vals = []
-
-        def collect_from_module(m: nn.Module):
-            if getattr(m, "elliptical", False) and getattr(m, "elliptical_m_raw", None) is not None:
-                m_raw = m.elliptical_m_raw
-                m_sp = F.softplus(m_raw)
-                m_hat = m_sp / (m_sp.mean(dim=-1, keepdim=True) + 1e-12)
-                std_per_head = m_hat.std(dim=-1)
-                std_vals.append(std_per_head.mean().item())
-                mean_per_head = m_sp.mean(dim=-1)
-                mean_vals.append(mean_per_head.mean().item())
-
-        try:
-            for blk in getattr(self.raw_model.col_embedder, "tf_col", nn.Module()).blocks:
-                collect_from_module(blk)
-        except Exception:
-            pass
-        try:
-            for blk in getattr(self.raw_model.row_interactor, "tf_row", nn.Module()).blocks:
-                collect_from_module(blk)
-        except Exception:
-            pass
-        try:
-            for blk in getattr(self.raw_model.icl_predictor, "tf_icl", nn.Module()).blocks:
-                collect_from_module(blk)
-        except Exception:
-            pass
-
-        stats = {}
-        if std_vals:
-            stats["probe/ellip_std_per_head_mean"] = float(np.mean(std_vals))
-        if mean_vals:
-            stats["probe/ellip_mean_m"] = float(np.mean(mean_vals))
-        return stats
+    # Deprecated: learned-parameter elliptical diagnostics removed (parameter-free estimator now)
 
     @torch.no_grad()
     def _compute_icl_attn_metrics(self, R: torch.Tensor, y_train: torch.Tensor, train_size: int) -> dict:
@@ -481,13 +422,8 @@ class Trainer:
             q = q.view(B, T, nh, head_dim).transpose(1, 2)
             k = k.view(B, T, nh, head_dim).transpose(1, 2)
 
-            if getattr(blk, "elliptical", False) and getattr(blk, "elliptical_m_raw", None) is not None:
-                m = F.softplus(blk.elliptical_m_raw)
-                m = m / (m.mean(dim=-1, keepdim=True) + 1e-12)
-                m = torch.sqrt(m + 1e-12)
-                ellip = m.view(1, nh, 1, head_dim).to(dtype=q.dtype, device=q.device)
-            else:
-                ellip = None
+            # Parameter-free elliptical estimator is not reconstructed here; use dot-product as baseline
+            ellip = None
 
             q_left, k_left = q[..., :cut, :], k[..., :cut, :]
             q_right = q[..., cut:, :]
@@ -582,7 +518,6 @@ class Trainer:
             # Compute full logits (train+test) via internal training path to avoid inference constraints
             logits_full = self.raw_model.icl_predictor._icl_predictions(R.clone(), y_train)
             metrics = self._compute_probe_delta_ce(logits_full, yc, train_size)
-            metrics.update(self._gather_elliptical_params_stats())
 
             # Attention diagnostics on the ICL encoder (condition on training labels)
             R[:, :train_size] = R[:, :train_size] + self.raw_model.icl_predictor.y_encoder(y_train.float())
@@ -907,24 +842,7 @@ class Trainer:
             pred = pred.flatten(end_dim=-2)
             true = y_test.long().flatten()
             loss = F.cross_entropy(pred, true)
-            # Elliptical scale L2 regularization (ICL stage) to avoid drift and break symmetry
-            if getattr(self.config, "icl_elliptical", False) and getattr(
-                self.config, "icl_elliptical_reg_lambda", 0.0
-            ) > 0.0:
-                reg = 0.0
-                n_blocks = 0
-                try:
-                    blocks = self.raw_model.icl_predictor.tf_icl.blocks
-                except Exception:
-                    blocks = []
-                for blk in blocks:
-                    if getattr(blk, "elliptical", False) and getattr(blk, "elliptical_m_raw", None) is not None:
-                        m = F.softplus(blk.elliptical_m_raw)
-                        reg = reg + torch.mean((m - 1.0) ** 2)
-                        n_blocks += 1
-                if n_blocks > 0:
-                    reg = reg / n_blocks
-                    loss = loss + float(self.config.icl_elliptical_reg_lambda) * reg
+            # No learned-parameter elliptical regularization (parameter-free estimator)
 
         # Scale loss for gradient accumulation and backpropagate
         scaled_loss = loss / num_micro_batches
@@ -935,13 +853,7 @@ class Trainer:
             micro_results["ce"] = scaled_loss.item()
             accuracy = (pred.argmax(dim=1) == true).sum() / len(true)
             micro_results["accuracy"] = accuracy.item() / num_micro_batches
-            if getattr(self.config, "icl_elliptical", False) and getattr(
-                self.config, "icl_elliptical_reg_lambda", 0.0
-            ) > 0.0:
-                # Report unscaled regularization contribution (approximate)
-                micro_results["icl_reg"] = (
-                    (float(self.config.icl_elliptical_reg_lambda) * reg.item()) / num_micro_batches
-                )
+            # No separate regularization metric
 
         return micro_results
 

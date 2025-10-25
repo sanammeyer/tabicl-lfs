@@ -60,6 +60,8 @@ class ICLearning(nn.Module):
         activation: str | callable = "gelu",
         norm_first: bool = True,
         elliptical: bool = False,
+        elliptical_delta: float = 1.0,
+        elliptical_scale_mode: str = "max",
     ):
         super().__init__()
         self.max_classes = max_classes
@@ -75,6 +77,8 @@ class ICLearning(nn.Module):
             activation=activation,
             norm_first=norm_first,
             elliptical=elliptical,
+            elliptical_delta=elliptical_delta,
+            elliptical_scale_mode=elliptical_scale_mode,
         )
         if self.norm_first:
             self.ln = nn.LayerNorm(d_model)

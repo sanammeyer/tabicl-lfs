@@ -89,6 +89,8 @@ class TabICL(nn.Module):
         icl_num_blocks: int = 12,
         icl_nhead: int = 4,
         icl_elliptical: bool = False,
+        elliptical_delta: float = 1.0,
+        elliptical_scale_mode: str = "max",
         ff_factor: int = 2,
         dropout: float = 0.0,
         activation: str | callable = "gelu",
@@ -108,11 +110,14 @@ class TabICL(nn.Module):
         self.icl_num_blocks = icl_num_blocks
         self.icl_nhead = icl_nhead
         self.icl_elliptical = icl_elliptical
+        self.elliptical_delta = elliptical_delta
+        self.elliptical_scale_mode = elliptical_scale_mode
         self.ff_factor = ff_factor
         self.dropout = dropout
         self.activation = activation
         self.norm_first = norm_first
 
+        # Stage 1 (TFcol) does not use elliptical attention
         self.col_embedder = ColEmbedding(
             embed_dim=embed_dim,
             num_blocks=col_num_blocks,
@@ -123,7 +128,7 @@ class TabICL(nn.Module):
             activation=activation,
             norm_first=norm_first,
             reserve_cls_tokens=row_num_cls,
-            elliptical=self.row_elliptical,
+            elliptical=False,
         )
 
         self.row_interactor = RowInteraction(
@@ -137,6 +142,8 @@ class TabICL(nn.Module):
             activation=activation,
             norm_first=norm_first,
             elliptical=self.row_elliptical,
+            elliptical_delta=self.elliptical_delta,
+            elliptical_scale_mode=self.elliptical_scale_mode,
         )
 
         icl_dim = embed_dim * row_num_cls  # CLS tokens are concatenated for ICL
@@ -150,6 +157,8 @@ class TabICL(nn.Module):
             activation=activation,
             norm_first=norm_first,
             elliptical=icl_elliptical,
+            elliptical_delta=self.elliptical_delta,
+            elliptical_scale_mode=self.elliptical_scale_mode,
         )
 
     def _train_forward(
@@ -350,14 +359,5 @@ class TabICL(nn.Module):
 
     # Utilities for diagnostics/sensitivity checks
     def set_icl_elliptical_scale_boost(self, factor: float = 1.0) -> None:
-        """Set an extra multiplicative factor applied to the elliptical scale in ICL blocks.
-
-        This is useful for quick sensitivity checks at inference time without modifying weights.
-        """
-        try:
-            blocks = self.icl_predictor.tf_icl.blocks
-        except Exception:
-            return
-        for blk in blocks:
-            if hasattr(blk, "elliptical_extra_scale"):
-                blk.elliptical_extra_scale = float(factor)
+        """No-op: parameter-free elliptical attention has no extra scaling knob."""
+        return

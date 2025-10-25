@@ -301,7 +301,7 @@ class MultiheadAttention(nn.MultiheadAttention):
             assert key_padding_mask is None, "key_padding_mask is not supported with attn_mask as int"
             assert rope is None, "Rotary position embedding is not supported with attn_mask as int"
 
-        return multi_head_attention_forward(
+        attn_out, _ = multi_head_attention_forward(
             query,
             key,
             value,
@@ -317,6 +317,7 @@ class MultiheadAttention(nn.MultiheadAttention):
             rope=rope,
             elliptical_scale=elliptical_scale,
         )
+        return attn_out
 
 
 class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
@@ -358,18 +359,12 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         del self.self_attn
         self.attn = MultiheadAttention(d_model, nhead, dropout)
         self.init_weights()
-        # Elliptical attention parameters (per-head diagonal metric), only if enabled
+        # Elliptical attention gate (parameter-free metric from consecutive values)
         self.elliptical = elliptical
-        if self.elliptical:
-            head_dim = d_model // nhead
-            # Raw parameters (logits) for diagonal scales; initialize with small IID noise to break symmetry
-            self.elliptical_m_raw = nn.Parameter(torch.empty(nhead, head_dim))
-            nn.init.trunc_normal_(self.elliptical_m_raw, std=0.02)
-        else:
-            self.elliptical_m_raw = None
-        # Optional extra scaling factor applied to the elliptical scale at inference/training
-        # This enables quick sensitivity checks without changing weights
-        self.elliptical_extra_scale: float = 1.0
+        self.elliptical_delta: float = 1.0
+        self.elliptical_scale_mode: str = "max"
+        # Cache for previous block to consume
+        self._last_v: Optional[Tensor] = None
 
     def init_weights(self):
         """Initialize projection layers to zero for stable training."""
@@ -386,6 +381,8 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         key_padding_mask: Optional[Tensor] = None,
         attn_mask: Optional[Tensor | int] = None,
         rope: Optional[RotaryEmbedding] = None,
+        v_prev: Optional[Tensor] = None,
+        block_index: Optional[int] = None,
     ) -> Tensor:
         """Process input through attention with optional rotary positional encoding.
 
@@ -454,12 +451,14 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         x = q
         if self.norm_first:
             # Pre-norm: normalize before attention and FFN
-            attn = self._attn_block(self.norm1(q), self.norm1(k), self.norm1(v), key_padding_mask, attn_mask, rope)
+            attn = self._attn_block(
+                self.norm1(q), self.norm1(k), self.norm1(v), key_padding_mask, attn_mask, rope, v_prev, block_index
+            )
             x = x + attn
             x = x + self._ff_block(self.norm2(x))
         else:
             # Post-norm: normalize after attention and FFN
-            attn = self._attn_block(q, k, v, key_padding_mask, attn_mask, rope)
+            attn = self._attn_block(q, k, v, key_padding_mask, attn_mask, rope, v_prev, block_index)
             x = self.norm1(x + attn)
             x = self.norm2(x + self._ff_block(x))
 
@@ -474,22 +473,32 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         attn_mask: Optional[Tensor | int],
         rope: Optional[RotaryEmbedding],
     ) -> Tensor:
-        if self.elliptical and self.elliptical_m_raw is not None:
-            # Build per-head positive scaling vector and enforce per-head mean=1 (anisotropy only)
-            m = F.softplus(self.elliptical_m_raw)
-            m = m / (m.mean(dim=-1, keepdim=True) + 1e-12)
-            # Use sqrt(m) so that M = diag(m) in Q M K^T (clean Mahalanobis form)
-            m = torch.sqrt(m + 1e-12)
-            # Shape to broadcast over batch and sequence dims: (1, nh, 1, hs)
-            elliptical_scale = m.view(1, self.attn.num_heads, 1, -1)
-            # Optional external boost factor for sensitivity checks
-            if self.elliptical_extra_scale != 1.0:
-                elliptical_scale = elliptical_scale * self.elliptical_extra_scale
-        else:
-            elliptical_scale = None
+        # Parameter-free elliptical from previous block: only active if previous V is provided
+        use_elliptical = self.elliptical and (v_prev is not None) and (block_index is None or block_index >= 1)
 
-        attn = self.attn(q, k, v, key_padding_mask, attn_mask, rope, elliptical_scale=elliptical_scale)
-        return self.dropout1(attn)
+        # Call attention core and capture current V (per-head) for the next block
+        attn_out, v_heads = multi_head_attention_forward(
+            q,
+            k,
+            v,
+            self.attn.num_heads,
+            self.attn.in_proj_weight,
+            self.attn.in_proj_bias,
+            self.attn.dropout,
+            self.attn.out_proj.weight,
+            self.attn.out_proj.bias,
+            training=self.training,
+            key_padding_mask=key_padding_mask,
+            attn_mask=attn_mask,
+            rope=rope,
+            elliptical_scale=None,
+            elliptical=use_elliptical,
+            v_prev=v_prev,
+            elliptical_delta=self.elliptical_delta,
+            elliptical_scale_mode=self.elliptical_scale_mode,
+        )
+        self._last_v = v_heads.detach() if isinstance(v_heads, torch.Tensor) else None
+        return self.dropout1(attn_out)
 
     def _ff_block(self, x: Tensor) -> Tensor:
         x = self.linear2(self.dropout(self.activation(self.linear1(x))))

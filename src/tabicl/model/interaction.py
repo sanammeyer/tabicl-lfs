@@ -62,6 +62,8 @@ class RowInteraction(nn.Module):
         activation: str | callable = "gelu",
         norm_first: bool = True,
         elliptical: bool = False,
+        elliptical_delta: float = 1.0,
+        elliptical_scale_mode: str = "max",
     ) -> None:
         super().__init__()
         self.embed_dim = embed_dim
@@ -79,6 +81,8 @@ class RowInteraction(nn.Module):
             use_rope=True,
             rope_base=rope_base,
             elliptical=elliptical,
+            elliptical_delta=elliptical_delta,
+            elliptical_scale_mode=elliptical_scale_mode,
         )
 
         self.cls_tokens = nn.Parameter(torch.empty(num_cls, embed_dim))

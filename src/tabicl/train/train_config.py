@@ -177,7 +177,7 @@ def build_parser():
         "--row_elliptical",
         default=False,
         type=str2bool,
-        help="Enable elliptical attention for stages 1–2 (column embedding and row interaction)",
+        help="Enable elliptical attention for stage 2 (row interaction) only",
     )
     parser.add_argument("--freeze_col", default=False, type=str2bool, help="Whether to freeze the column embedder")
 
@@ -199,31 +199,24 @@ def build_parser():
         help="Enable per-head diagonal Mahalanobis scaling of queries (elliptical attention) in ICL",
     )
     parser.add_argument(
-        "--icl_elliptical_reg_lambda",
-        type=float,
-        default=0.0,
-        help=(
-            "L2 regularization strength for the elliptical scales m (on softplus(m_raw)). "
-            "Penalty term is lambda * mean((m - 1)^2) aggregated over ICL blocks."
-        ),
-    )
-    parser.add_argument(
         "--freeze_qk_warmup_steps",
         type=int,
         default=0,
         help="Number of initial training steps to freeze ICL Q/K projections to encourage metric learning",
     )
+    # Elliptical estimator (parameter-free) controls
     parser.add_argument(
-        "--icl_elliptical_lr_mult",
+        "--elliptical_delta",
         type=float,
-        default=3.0,
-        help="Learning-rate multiplier for elliptical scale logits (elliptical_m_raw)",
+        default=1.0,
+        help="Finite-difference step size delta for parameter-free elliptical attention",
     )
     parser.add_argument(
-        "--icl_elliptical_weight_decay",
-        type=float,
-        default=0.0,
-        help="Weight decay for elliptical scale logits (elliptical_m_raw) param group",
+        "--elliptical_scale_mode",
+        type=str,
+        default="max",
+        choices=["max", "mean"],
+        help="Normalization of per-head scales: max (default) or mean",
     )
     
 

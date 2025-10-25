@@ -1,11 +1,60 @@
 from __future__ import annotations
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
 from torch.nn import functional as F
 
 from .rope import RotaryEmbedding
+
+
+def compute_elliptical_diag(
+    v: Tensor,
+    v_prev: Tensor,
+    delta: float = 1.0,
+    scale_mode: str = "max",
+    eps: float = 1e-12,
+) -> Tensor:
+    """Compute per-head diagonal scaling from consecutive layers' values.
+
+    Parameters
+    ----------
+    v : Tensor
+        Current block values of shape (..., nh, L, Dh)
+
+    v_prev : Tensor
+        Previous block values with the same shape as `v`
+
+    delta : float, default=1.0
+        Finite-difference step size
+
+    scale_mode : str, default="max"
+        How to normalize per-head scales: "max" or "mean"
+
+    eps : float, default=1e-12
+        Numerical stability term
+
+    Returns
+    -------
+    Tensor
+        Per-head, per-dim scaling of shape (nh, Dh)
+    """
+    with torch.no_grad():
+        value_diff = (v - v_prev) / float(delta)
+        nd = value_diff.dim()
+        head_idx = nd - 3
+        dim_idx = nd - 1
+        reduce_dims = tuple(i for i in range(nd) if i not in (head_idx, dim_idx))
+        m = value_diff.abs().mean(dim=reduce_dims)  # (nh, Dh)
+
+        if scale_mode == "mean":
+            denom = m.mean(dim=-1, keepdim=True)
+        else:
+            denom = m.amax(dim=-1, keepdim=True)
+        denom = denom.clamp_min(eps)
+        m = m / denom
+
+    return m
 
 
 def sdpa_with_flattened_batch(
@@ -72,7 +121,12 @@ def multi_head_attention_forward(
     attn_mask: Optional[Tensor | int] = None,
     rope: Optional[RotaryEmbedding] = None,
     elliptical_scale: Optional[Tensor] = None,
-) -> Tensor:
+    # Parameter-free elliptical estimator controls
+    elliptical: bool = False,
+    v_prev: Optional[Tensor] = None,
+    elliptical_delta: float = 1.0,
+    elliptical_scale_mode: str = "max",
+) -> Tuple[Tensor, Tensor]:
     """Multi-head attention with support for rotary position embeddings
     as well as specialized processing when attn_mask is an integer.
 
@@ -127,8 +181,9 @@ def multi_head_attention_forward(
 
     Returns
     -------
-    Tensor
-        Attention output tensor of shape (..., tgt_len, embed_dim)
+    Tuple[Tensor, Tensor]
+        - Attention output tensor of shape (..., tgt_len, embed_dim)
+        - Current value projections reshaped to (..., nh, src_len, head_dim)
     """
 
     if isinstance(attn_mask, int):
@@ -182,6 +237,14 @@ def multi_head_attention_forward(
         # No normalization here: any regularization handled during training
         q = q * elliptical_scale
         k = k * elliptical_scale
+    elif elliptical and v_prev is not None:
+        if v_prev.shape != v.shape:
+            raise ValueError(f"v_prev shape {v_prev.shape} must match v shape {v.shape} for elliptical estimator")
+        m = compute_elliptical_diag(v, v_prev, delta=elliptical_delta, scale_mode=elliptical_scale_mode)
+        # Broadcast to (..., nh, 1, hs)
+        m_bc = m.view(*([1] * (v.dim() - 2)), m.shape[0], 1, m.shape[1])
+        q = q * m_bc
+        k = k * m_bc
 
     # Disable dropout during evaluation
     if not training:
@@ -262,4 +325,4 @@ def multi_head_attention_forward(
         attn_output = attn_output.transpose(-3, -2).contiguous().view(*batch_shape, tgt_len, embed_dim)
         attn_output = F.linear(attn_output, out_proj_weight, out_proj_bias)  # (batch_shape, tgt_len, E)
 
-    return attn_output
+    return attn_output, v
