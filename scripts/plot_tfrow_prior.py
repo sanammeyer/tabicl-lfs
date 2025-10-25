@@ -1,10 +1,13 @@
 """Plot TF-row embeddings on a random prior episode to sanity-check separability.
 
 Saves a 2D projection (t-SNE or PCA) of anchor and query embeddings, colored by class.
+Optionally fits a classifier (logistic regression or XGBoost) on anchor embeddings and evaluates on queries.
 
 Example:
+    # Plot + t-SNE, fit logistic regression, and save embeddings
     python scripts/plot_tfrow_prior.py --prior mix_scm --n_estimators 4 --proj tsne \
-        --max_points 2000 --out runs/tfrow_sanity.png
+        --max_points 2000 --fit_logreg --save_npz runs/tfrow_embeddings.npz \
+        --out runs/tfrow_sanity.png
 """
 
 from __future__ import annotations
@@ -62,11 +65,28 @@ def main():
     p.add_argument("--randomize_variant", action="store_true")
 
     # Projection / plotting
-    p.add_argument("--proj", type=str, default="tsne", choices=["tsne", "pca"]) \
-        
+    p.add_argument("--proj", type=str, default="tsne", choices=["tsne", "pca"]) 
     p.add_argument("--max_points", type=int, default=2000, help="max points to plot for readability")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out", type=str, default="runs/tfrow_sanity.png")
+
+    # Classifier on embeddings
+    p.add_argument("--fit_logreg", action="store_true", help="[deprecated] kept for backward-compat; prefer --clf")
+    p.add_argument("--clf", type=str, default="none", choices=["none", "logreg", "xgb"], help="classifier to train on embeddings")
+    # LR hyperparams
+    p.add_argument("--logreg_C", type=float, default=1.0)
+    p.add_argument("--logreg_max_iter", type=int, default=1000)
+    # XGBoost hyperparams
+    p.add_argument("--xgb_estimators", type=int, default=300, help="number of boosting rounds (n_estimators)")
+    p.add_argument("--xgb_max_depth", type=int, default=6)
+    p.add_argument("--xgb_lr", type=float, default=0.1, help="learning rate (eta)")
+    p.add_argument("--xgb_subsample", type=float, default=0.8)
+    p.add_argument("--xgb_colsample", type=float, default=0.8, help="colsample_bytree")
+    p.add_argument("--xgb_reg_lambda", type=float, default=1.0)
+    p.add_argument("--xgb_min_child_weight", type=float, default=1.0)
+    p.add_argument("--xgb_tree_method", type=str, default="hist", help="tree_method: hist, approx, gpu_hist (if available)")
+    # Save artifacts
+    p.add_argument("--save_npz", type=str, default="", help="optional .npz path to save embeddings+labels+metadata")
     args = p.parse_args()
 
     rng = np.random.default_rng(args.seed)
@@ -187,6 +207,91 @@ def main():
     P_tr = proj[: emb_tr_plot.shape[0]]
     P_te = proj[emb_tr_plot.shape[0] :]
 
+    # Optionally fit a classifier on embeddings (anchors -> train, queries -> test)
+    clf_info = None
+    chosen_clf = args.clf
+    if args.fit_logreg:
+        chosen_clf = "logreg"  # backward-compat
+    if chosen_clf in {"logreg", "xgb"}:
+        try:
+            from sklearn.metrics import accuracy_score, f1_score, log_loss
+            if chosen_clf == "logreg":
+                from sklearn.pipeline import make_pipeline
+                from sklearn.preprocessing import StandardScaler
+                from sklearn.linear_model import LogisticRegression
+                model = make_pipeline(
+                    StandardScaler(),
+                    LogisticRegression(C=args.logreg_C, max_iter=args.logreg_max_iter, multi_class="auto"),
+                )
+                model.fit(emb_tr, y_anchor)
+                y_pred_tr = model.predict(emb_tr)
+                y_pred_te = model.predict(emb_te)
+                proba_te = model.predict_proba(emb_te)
+                est_classes = model[-1].classes_
+            else:
+                # XGBoost classifier
+                try:
+                    import xgboost as xgb  # type: ignore
+                except Exception as e:
+                    raise RuntimeError("xgboost is required for --clf xgb. Install via 'pip install xgboost' or 'conda install -c conda-forge xgboost'.") from e
+
+                from sklearn.preprocessing import LabelEncoder
+                le_clf = LabelEncoder().fit(y_anchor)
+                y_tr_enc = le_clf.transform(y_anchor)
+                num_classes = len(le_clf.classes_)
+                objective = "binary:logistic" if num_classes == 2 else "multi:softprob"
+                model = xgb.XGBClassifier(
+                    n_estimators=args.xgb_estimators,
+                    max_depth=args.xgb_max_depth,
+                    learning_rate=args.xgb_lr,
+                    subsample=args.xgb_subsample,
+                    colsample_bytree=args.xgb_colsample,
+                    reg_lambda=args.xgb_reg_lambda,
+                    min_child_weight=args.xgb_min_child_weight,
+                    objective=objective,
+                    eval_metric="logloss",
+                    tree_method=args.xgb_tree_method,
+                    random_state=args.seed,
+                    n_jobs=0,
+                )
+                model.fit(emb_tr, y_tr_enc)
+                # predictions
+                y_pred_int = model.predict(emb_te).astype(int)
+                from numpy import asarray as _np_asarray  # avoid shadowing
+                y_pred_te = le_clf.inverse_transform(_np_asarray(y_pred_int))
+                # proba: ensure 2D
+                proba_te = model.predict_proba(emb_te)
+                if proba_te.ndim == 1:
+                    p1 = proba_te.reshape(-1, 1)
+                    proba_te = np.concatenate([1.0 - p1, p1], axis=1)
+                est_classes = le_clf.classes_
+                # Train predictions for train-acc
+                y_pred_tr_int = model.predict(emb_tr).astype(int)
+                y_pred_tr = le_clf.inverse_transform(y_pred_tr_int)
+
+            acc_tr = float(accuracy_score(y_anchor, y_pred_tr))
+            acc_te = float(accuracy_score(y_query, y_pred_te))
+            f1_te = float(f1_score(y_query, y_pred_te, average="macro"))
+            # Log-loss on seen test classes only (skip unseen)
+            seen_mask = np.isin(y_query, est_classes)
+            if np.any(seen_mask):
+                nll_te = float(log_loss(y_query[seen_mask], proba_te[seen_mask], labels=est_classes))
+            else:
+                nll_te = float("nan")
+            clf_info = {
+                "name": chosen_clf,
+                "acc_tr": acc_tr,
+                "acc_te": acc_te,
+                "f1_te": f1_te,
+                "nll_te": nll_te,
+                "classes_": est_classes,
+            }
+            print(
+                f"{chosen_clf.upper()} on embeddings: train-acc={acc_tr:.3f}  test-acc={acc_te:.3f}  test-mF1={f1_te:.3f}  test-NLL(seen)={nll_te:.4f}"
+            )
+        except Exception as e:
+            print(f"[warn] {chosen_clf} classifier failed: {e}")
+
     # Plot (use consistent color scaling across anchors/queries)
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -203,12 +308,44 @@ def main():
         P_te[:, 0], P_te[:, 1], c=y_te_plot, cmap="tab10", vmin=vmin, vmax=vmax,
         s=12, alpha=0.7, marker="x", label="queries",
     )
-    plt.title(f"TF-row embeddings ({args.proj.upper()})  C={len(np.unique(y))}, H={H}, T={T}, split={split}")
+    title = f"TF-row embeddings ({args.proj.upper()})  C={len(np.unique(y))}, H={H}, T={T}, split={split}"
+    if clf_info is not None:
+        title += f"\n{clf_info['name'].upper()} test-acc={clf_info['acc_te']:.3f}  test-mF1={clf_info['f1_te']:.3f}"
+    plt.title(title)
     plt.legend(loc="best")
     plt.xticks([]); plt.yticks([])
     plt.tight_layout()
     plt.savefig(out_path, dpi=140)
     print(f"Saved TF-row embedding plot to {out_path.resolve()}")
+
+    # Optionally save embeddings, labels, and metadata
+    if args.save_npz:
+        npz_path = Path(args.save_npz)
+        npz_path.parent.mkdir(parents=True, exist_ok=True)
+        save_dict = {
+            "emb_tr": emb_tr,
+            "emb_te": emb_te,
+            "y_tr": np.asarray(y_anchor),
+            "y_te": np.asarray(y_query),
+            "proj_tr": P_tr,
+            "proj_te": P_te,
+            "proj_method": args.proj,
+            "seed": int(args.seed),
+            "H": int(H),
+            "T": int(T),
+            "split": int(split),
+            "C": int(len(np.unique(y))),
+        }
+        if clf_info is not None:
+            save_dict.update({
+                "clf": clf_info["name"],
+                "clf_acc_tr": clf_info["acc_tr"],
+                "clf_acc_te": clf_info["acc_te"],
+                "clf_f1_te": clf_info["f1_te"],
+                "clf_nll_te": clf_info["nll_te"],
+            })
+        np.savez_compressed(npz_path, **save_dict)
+        print(f"Saved embeddings + labels to {npz_path.resolve()}")
 
 
 if __name__ == "__main__":
