@@ -363,6 +363,9 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         self.elliptical = elliptical
         self.elliptical_delta: float = 1.0
         self.elliptical_scale_mode: str = "max"
+        # Testing/override knobs
+        self.elliptical_override: str = "none"  # 'none' | 'identity' | 'manual'
+        self.elliptical_manual_m: Optional[Tensor] = None  # shape (nhead, head_dim) when set
         # Cache for previous block to consume
         self._last_v: Optional[Tensor] = None
 
@@ -472,6 +475,8 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         key_padding_mask: Optional[Tensor],
         attn_mask: Optional[Tensor | int],
         rope: Optional[RotaryEmbedding],
+        v_prev: Optional[Tensor] = None,
+        block_index: Optional[int] = None,
     ) -> Tensor:
         # Parameter-free elliptical from previous block: only active if previous V is provided
         use_elliptical = self.elliptical and (v_prev is not None) and (block_index is None or block_index >= 1)
@@ -496,6 +501,8 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
             v_prev=v_prev,
             elliptical_delta=self.elliptical_delta,
             elliptical_scale_mode=self.elliptical_scale_mode,
+            elliptical_force_identity=(self.elliptical_override == "identity"),
+            elliptical_manual_m=(self.elliptical_manual_m if self.elliptical_override == "manual" else None),
         )
         self._last_v = v_heads.detach() if isinstance(v_heads, torch.Tensor) else None
         return self.dropout1(attn_out)

@@ -126,6 +126,9 @@ def multi_head_attention_forward(
     v_prev: Optional[Tensor] = None,
     elliptical_delta: float = 1.0,
     elliptical_scale_mode: str = "max",
+    # Testing/override controls
+    elliptical_force_identity: bool = False,
+    elliptical_manual_m: Optional[Tensor] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Multi-head attention with support for rotary position embeddings
     as well as specialized processing when attn_mask is an integer.
@@ -212,7 +215,18 @@ def multi_head_attention_forward(
         k = rope.rotate_queries_or_keys(k)
 
     # Apply elliptical per-head scaling to queries and keys (diagonal Mahalanobis)
-    if elliptical_scale is not None:
+    if elliptical_manual_m is not None:
+        if elliptical_manual_m.shape != (num_heads, head_dim):
+            raise ValueError(
+                f"elliptical_manual_m must have shape (num_heads={num_heads}, head_dim={head_dim}), got {elliptical_manual_m.shape}"
+            )
+        m_bc = elliptical_manual_m.view(*([1] * (v.dim() - 2)), num_heads, 1, head_dim).to(dtype=q.dtype, device=q.device)
+        q = q * m_bc
+        k = k * m_bc
+    elif elliptical_force_identity:
+        # Identity metric fallback: no scaling
+        pass
+    elif elliptical_scale is not None:
         # Expected to be broadcastable over q: (..., nh, tgt_len, head_dim)
         # Typical shapes: (1, nh, 1, head_dim) or (B, nh, 1, head_dim)
         if elliptical_scale.dim() < 4:
