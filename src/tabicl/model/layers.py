@@ -503,6 +503,8 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
             elliptical_scale_mode=self.elliptical_scale_mode,
             elliptical_force_identity=(self.elliptical_override == "identity"),
             elliptical_manual_m=(self.elliptical_manual_m if self.elliptical_override == "manual" else None),
+            row_num_cls=getattr(self, "_row_num_cls", None),
+            exclude_cls_from_ea=bool(getattr(self, "_exclude_cls_from_ea", False)),
         )
         self._last_v = v_heads.detach() if isinstance(v_heads, torch.Tensor) else None
         return self.dropout1(attn_out)

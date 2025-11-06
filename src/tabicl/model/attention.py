@@ -14,6 +14,7 @@ def compute_elliptical_diag(
     delta: float = 1.0,
     scale_mode: str = "max",
     eps: float = 1e-12,
+    mask_keep: Optional[Tensor] = None,
 ) -> Tensor:
     """Compute per-head diagonal scaling from consecutive layers' values.
 
@@ -45,7 +46,22 @@ def compute_elliptical_diag(
         head_idx = nd - 3
         dim_idx = nd - 1
         reduce_dims = tuple(i for i in range(nd) if i not in (head_idx, dim_idx))
-        m = value_diff.abs().mean(dim=reduce_dims)  # (nh, Dh)
+        if mask_keep is not None:
+            # mask_keep expected to indicate which key positions to include
+            # Accept 1D (L,) mask; broadcast to (..., 1, L, 1)
+            if mask_keep.dim() == 1:
+                mk = mask_keep.view(*([1] * (nd - 2)), mask_keep.shape[0], 1).to(device=v.device, dtype=value_diff.dtype)
+            else:
+                # Best-effort: try to align to (..., L) then unsqueeze (-2 for head, -1 for dim)
+                mk = mask_keep.to(device=v.device, dtype=value_diff.dtype)
+                for _ in range(max(0, nd - mk.dim() - 1)):
+                    mk = mk.unsqueeze(0)
+                mk = mk.unsqueeze(-1)
+            abs_w = value_diff.abs() * mk
+            denom = mk.sum(dim=reduce_dims).clamp_min(eps)
+            m = abs_w.sum(dim=reduce_dims) / denom
+        else:
+            m = value_diff.abs().mean(dim=reduce_dims)  # (nh, Dh)
 
         if scale_mode == "mean":
             denom = m.mean(dim=-1, keepdim=True)
@@ -134,6 +150,9 @@ def multi_head_attention_forward(
     # Testing/override controls
     elliptical_force_identity: bool = False,
     elliptical_manual_m: Optional[Tensor] = None,
+    # TFrow-specific controls: exclude CLS tokens from EA
+    row_num_cls: Optional[int] = None,
+    exclude_cls_from_ea: bool = False,
 ) -> Tuple[Tensor, Tensor]:
     """Multi-head attention with support for rotary position embeddings
     as well as specialized processing when attn_mask is an integer.
@@ -225,9 +244,19 @@ def multi_head_attention_forward(
             raise ValueError(
                 f"elliptical_manual_m must have shape (num_heads={num_heads}, head_dim={head_dim}), got {elliptical_manual_m.shape}"
             )
-        m_bc = elliptical_manual_m.view(*([1] * (v.dim() - 2)), num_heads, 1, head_dim).to(dtype=q.dtype, device=q.device)
-        q = q * m_bc
-        k = k * m_bc
+        if exclude_cls_from_ea and (row_num_cls is not None) and (row_num_cls > 0):
+            # Per-time scaling: 1 for CLS positions, m for feature positions
+            scale = torch.ones_like(q)
+            m_bc = elliptical_manual_m.view(1, 1, num_heads, 1, head_dim).to(dtype=q.dtype, device=q.device)
+            if q.shape[-2] > row_num_cls:
+                tgt = scale[..., :, row_num_cls:, :]
+                scale[..., :, row_num_cls:, :] = m_bc.expand(tgt.shape)
+            q = q * scale
+            k = k * scale
+        else:
+            m_bc = elliptical_manual_m.view(*([1] * (v.dim() - 2)), num_heads, 1, head_dim).to(dtype=q.dtype, device=q.device)
+            q = q * m_bc
+            k = k * m_bc
     elif elliptical_force_identity:
         # Identity metric fallback: no scaling
         pass
@@ -259,11 +288,35 @@ def multi_head_attention_forward(
     elif elliptical and v_prev is not None:
         if v_prev.shape != v.shape:
             raise ValueError(f"v_prev shape {v_prev.shape} must match v shape {v.shape} for elliptical estimator")
-        m = compute_elliptical_diag(v, v_prev, delta=elliptical_delta, scale_mode=elliptical_scale_mode)
-        # Broadcast to (..., nh, 1, hs)
-        m_bc = m.view(*([1] * (v.dim() - 2)), m.shape[0], 1, m.shape[1])
-        q = q * m_bc
-        k = k * m_bc
+        if exclude_cls_from_ea and (row_num_cls is not None) and (row_num_cls > 0):
+            # Exclude CLS tokens from estimator and application
+            if v.shape[-2] > row_num_cls and v_prev.shape[-2] > row_num_cls:
+                v_feat = v[..., :, row_num_cls:, :]
+                v_prev_feat = v_prev[..., :, row_num_cls:, :]
+                m = compute_elliptical_diag(v_feat, v_prev_feat, delta=elliptical_delta, scale_mode=elliptical_scale_mode)
+            else:
+                m = compute_elliptical_diag(v, v_prev, delta=elliptical_delta, scale_mode=elliptical_scale_mode)
+            # Build per-time scale
+            scale = torch.ones_like(q)
+            m_bc = m.view(1, 1, m.shape[0], 1, m.shape[1]).to(dtype=q.dtype, device=q.device)
+            if q.shape[-2] > row_num_cls:
+                tgt = scale[..., :, row_num_cls:, :]
+                scale[..., :, row_num_cls:, :] = m_bc.expand(tgt.shape)
+            q = q * scale
+            k = k * scale
+        else:
+            # For ICL int mask: restrict estimator to allowed key set (train slice only)
+            if isinstance(attn_mask, int):
+                cut = int(attn_mask)
+                keep = torch.zeros(v.shape[-2], device=v.device, dtype=torch.float32)
+                keep[:cut] = 1.0
+                m = compute_elliptical_diag(v, v_prev, delta=elliptical_delta, scale_mode=elliptical_scale_mode, mask_keep=keep)
+            else:
+                m = compute_elliptical_diag(v, v_prev, delta=elliptical_delta, scale_mode=elliptical_scale_mode)
+            # Broadcast to (..., nh, 1, hs)
+            m_bc = m.view(*([1] * (v.dim() - 2)), m.shape[0], 1, m.shape[1])
+            q = q * m_bc
+            k = k * m_bc
 
     # Disable dropout during evaluation
     if not training:

@@ -85,6 +85,11 @@ class RowInteraction(nn.Module):
             elliptical_scale_mode=elliptical_scale_mode,
         )
 
+        # Inform TFrow blocks about CLS tokens for EA exclusion (per-head metric should ignore CLS)
+        for blk in self.tf_row.blocks:
+            setattr(blk, "_row_num_cls", num_cls)
+            setattr(blk, "_exclude_cls_from_ea", True)
+
         self.cls_tokens = nn.Parameter(torch.empty(num_cls, embed_dim))
         nn.init.trunc_normal_(self.cls_tokens, std=0.02)
 
