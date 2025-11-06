@@ -54,6 +54,9 @@ def compute_elliptical_diag(
         denom = denom.clamp_min(eps)
         m = m / denom
 
+        # Numerical guard: sanitize any accidental NaN/Inf that may arise from extreme inputs
+        m = torch.nan_to_num(m, nan=0.0, posinf=1.0, neginf=0.0)
+
     return m
 
 
@@ -102,6 +105,8 @@ def sdpa_with_flattened_batch(
     if attn_mask is not None:
         attn_mask = attn_mask.reshape(-1, *attn_mask.shape[-3:])
     out = F.scaled_dot_product_attention(q, k, v, attn_mask, dropout_p)
+    # Numerical guard: replace NaNs that can occur in pathological all-masked rows
+    out = torch.nan_to_num(out, nan=0.0)
 
     return out.view(q_shape)
 

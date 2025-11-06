@@ -758,6 +758,16 @@ class Trainer:
         # This guarantees valid slicing for all items and avoids shape mismatches.
         seq_len = int(micro_seq_len.min().item())
         train_size = int(micro_train_size.min().item())
+        # Guard against degenerate splits after per-micro-batch alignment:
+        # ensure at least one train token and one test token remain.
+        if seq_len <= 1:
+            # Fallback: force a minimal workable length
+            seq_len = 2
+        # Clamp train_size into [1, seq_len - 1]
+        if train_size < 1:
+            train_size = 1
+        elif train_size >= seq_len:
+            train_size = seq_len - 1
         return seq_len, train_size
 
     def align_micro_batch(self, micro_X, micro_y, micro_d, seq_len):
