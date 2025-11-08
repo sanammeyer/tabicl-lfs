@@ -368,8 +368,14 @@ class Trainer:
 
     @torch.no_grad()
     def materialize_probe_batch(self) -> None:
-        """Draw and freeze a small, deterministic probe batch (CPU tensors)."""
-        # Save and set seeds deterministically
+        """Draw and freeze a small, deterministic probe batch (CPU tensors).
+
+        Supports both on-the-fly generation (PriorDataset) and disk-based loading
+        (LoadPriorDataset) when --prior_dir is set. For the latter, a separate
+        one-shot loader reads the shard at --probe_from_prior_idx and keeps the
+        first --probe_batch_size datasets.
+        """
+        # Save and set seeds deterministically (only matters for on-the-fly)
         np_state = np.random.get_state()
         torch_state = torch.get_rng_state()
         np.random.seed(int(self.config.probe_seed))
@@ -377,7 +383,41 @@ class Trainer:
 
         try:
             ds = self.dataloader.dataset
-            X, y, d, seq_len, train_size = ds.get_batch(batch_size=int(self.config.probe_batch_size))
+            from tabicl.prior.genload import LoadPriorDataset as _LPD
+            if isinstance(ds, _LPD) or getattr(self.config, "prior_dir", None):
+                # Disk-based: load a single shard independently to avoid consuming training iterator
+                prior_dir = self.config.prior_dir
+                if not prior_dir:
+                    raise RuntimeError("prior_dir not set but dataset is LoadPriorDataset")
+                start_from = int(getattr(self.config, "probe_from_prior_idx", 0) or 0)
+                probe_ds = _LPD(
+                    data_dir=prior_dir,
+                    batch_size=max(1, int(self.config.probe_batch_size)),
+                    ddp_world_size=1,
+                    ddp_rank=0,
+                    start_from=start_from,
+                    max_batches=1,
+                    delete_after_load=False,
+                    device="cpu",
+                )
+                probe_loader = DataLoader(probe_ds, batch_size=None, shuffle=False, num_workers=0)
+                X, y, d, seq_len, train_size = next(iter(probe_loader))
+                # Subset to the requested probe batch size if the shard is larger
+                B = int(self.config.probe_batch_size)
+                if hasattr(X, "is_nested") and X.is_nested:
+                    # Nested tensors: slice first B items via wrapper
+                    X = X[:B]
+                    y = y[:B]
+                else:
+                    X = X[:B]
+                    y = y[:B]
+                    d = d[:B]
+                    seq_len = seq_len[:B]
+                    train_size = train_size[:B]
+            else:
+                # On-the-fly PriorDataset path
+                X, y, d, seq_len, train_size = ds.get_batch(batch_size=int(self.config.probe_batch_size))
+
             # Convert nested to padded tensors if needed
             tensors = [X, y]
             tensors = [t.to_padded_tensor(padding=0.0) if hasattr(t, "is_nested") and t.is_nested else t for t in tensors]
@@ -391,8 +431,12 @@ class Trainer:
                 "seed": int(self.config.probe_seed),
             }
             if self.master_process:
+                try:
+                    ts = int(self._probe_data["train_size"][0].item())
+                except Exception:
+                    ts = int(self._probe_data["train_size"][0]) if hasattr(self._probe_data["train_size"], "__getitem__") else -1
                 print(
-                    f"[probe] Materialized fixed batch: B={X.shape[0]}, T={X.shape[1]}, H={X.shape[2]}, train_size={int(self._probe_data['train_size'][0].item())}"
+                    f"[probe] Materialized fixed batch: B={X.shape[0]}, T={X.shape[1]}, H={X.shape[2]}, train_size={ts}"
                 )
         finally:
             np.random.set_state(np_state)

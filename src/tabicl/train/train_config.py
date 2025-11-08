@@ -267,6 +267,15 @@ def build_parser():
         default=1337,
         help="Random seed used to draw the fixed probe batch for reproducibility",
     )
+    parser.add_argument(
+        "--probe_from_prior_idx",
+        type=int,
+        default=0,
+        help=(
+            "When --prior_dir is set, load the probe batch from disk by reading the shard at this index. "
+            "If the shard batch_size exceeds --probe_batch_size, the first --probe_batch_size datasets are used."
+        ),
+    )
 
     ###########################################################################
     ###### Local Metrics Logging ##############################################
