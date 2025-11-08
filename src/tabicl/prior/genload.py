@@ -414,6 +414,62 @@ class LoadPriorDataset(IterableDataset):
 
         return X_out, y_out, d_out, seq_lens_out, train_sizes_out
 
+    # New: non-consuming batch reader for probes/diagnostics
+    def get_batch(self, idx: int | None = None, batch_size: int | None = None):
+        """Load a specific batch file without advancing iterator state.
+
+        Parameters
+        ----------
+        idx : int | None
+            Batch index to load (corresponds to batch_{idx:06d}.pt). If None,
+            uses the initial start index (the value of `start_from`).
+
+        batch_size : int | None
+            If provided and smaller than the stored batch size, returns only the
+            first `batch_size` datasets from the file.
+
+        Returns
+        -------
+        tuple
+            (X, y, d, seq_lens, train_sizes) on CPU, where X/y are dense Tensors
+            (not nested) of shape (B, T, H) and (B, T) when saved in dense form,
+            or reconstructed from sparse format used on disk.
+        """
+        # Resolve target index without mutating dataset state
+        start_from = self.current_idx - self.ddp_rank
+        target_idx = int(start_from if idx is None else idx)
+        batch_file = self.data_dir / f"batch_{target_idx:06d}.pt"
+        if not batch_file.exists():
+            raise FileNotFoundError(f"Probe batch file not found: {batch_file}")
+
+        batch = torch.load(batch_file, map_location="cpu", weights_only=True)
+        X = batch["X"]
+        y = batch["y"]
+        d = batch["d"].cpu()
+        seq_lens = batch["seq_lens"].cpu()
+        train_sizes = batch["train_sizes"].cpu()
+        B_file = int(batch["batch_size"]) if "batch_size" in batch else int(d.shape[0])
+
+        # Convert to dense tensors if stored sparsely; ensure CPU dtype
+        if hasattr(X, "is_nested") and X.is_nested:
+            # Convert nested to padded dense for probe usage
+            X = X.to_padded_tensor(0.0)
+            y = y.to_padded_tensor(0)
+        else:
+            X = sparse2dense(X, d.repeat_interleave(seq_lens[0]), dtype=torch.float32).view(B_file, seq_lens[0], -1)
+            y = y.to(dtype=torch.long)
+
+        # Slice to requested batch size if needed
+        if batch_size is not None:
+            b = int(batch_size)
+            X = X[:b].contiguous()
+            y = y[:b].contiguous()
+            d = d[:b].contiguous()
+            seq_lens = seq_lens[:b].contiguous()
+            train_sizes = train_sizes[:b].contiguous()
+
+        return X.cpu(), y.cpu(), d.cpu(), seq_lens.cpu(), train_sizes.cpu()
+
     def __repr__(self) -> str:
         """
         Returns a string representation of the LoadPriorDataset.
