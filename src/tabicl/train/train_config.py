@@ -270,7 +270,7 @@ def build_parser():
     parser.add_argument(
         "--probe_from_prior_idx",
         type=int,
-        default=0,
+        default=100000,
         help=(
             "When --prior_dir is set, load the probe batch from disk by reading the shard at this index. "
             "If the shard batch_size exceeds --probe_batch_size, the first --probe_batch_size datasets are used."

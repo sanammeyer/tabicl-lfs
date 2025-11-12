@@ -241,7 +241,11 @@ class LoadPriorDataset(IterableDataset):
         self.batch_size = batch_size
         self.ddp_world_size = ddp_world_size
         self.ddp_rank = ddp_rank
-        self.current_idx = ddp_rank + start_from
+        # Track both the start index and the current index. This allows
+        # interpreting max_batches as a relative count from start_from
+        # rather than an absolute batch index.
+        self.start_from = int(start_from)
+        self.current_idx = ddp_rank + self.start_from
         self.max_batches = max_batches
         self.timeout = timeout
         self.delete_after_load = delete_after_load
@@ -328,8 +332,13 @@ class LoadPriorDataset(IterableDataset):
             - seq_lens: Sequence length for each dataset
             - train_sizes: Position at which to split training and evaluation data
         """
-        # Check if we've reached the maximum number of batches and have no buffered data
-        if self.max_batches is not None and self.current_idx >= self.max_batches and (self.buffer_size == 0):
+        # Check if we've reached the maximum number of batches (relative to start_from)
+        # and have no buffered data left.
+        if (
+            self.max_batches is not None
+            and (self.current_idx - self.start_from) >= self.max_batches
+            and (self.buffer_size == 0)
+        ):
             raise StopIteration
 
         # Initialize or use existing buffer
@@ -346,7 +355,7 @@ class LoadPriorDataset(IterableDataset):
         # Keep loading files until we have enough data or no more files
         while self.buffer_size < self.batch_size:
             # Check if we've reached max_batches
-            if self.max_batches is not None and self.current_idx >= self.max_batches:
+            if self.max_batches is not None and (self.current_idx - self.start_from) >= self.max_batches:
                 # If we can't get a full batch, return what we have
                 break
 
