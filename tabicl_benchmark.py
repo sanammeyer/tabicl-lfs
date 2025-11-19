@@ -62,7 +62,7 @@ warnings.filterwarnings("ignore", category=RuntimeWarning)
 ALL_DATASET_IDS = sorted(list(set([
     475, 906, 909, 1100, 915, 1554, 23, 48, 714, 1475, 40663, 750, 41978, 45711
 ])))
-
+#909, 1100, 915, 1554, 23, 48, 714, 1475, 40663, 750, 41978, 45711
 def evaluate_dataset(did: int, task_id: int, device: str) -> Dict[str, Any]:
     """Evaluate TabICL on a single dataset using its official 10-fold CV task.
     Returns aggregated metrics + dataset metadata."""
@@ -113,7 +113,7 @@ def evaluate_dataset(did: int, task_id: int, device: str) -> Dict[str, Any]:
 
             clf = TabICLClassifier(
                 device=device,
-                model_path=str(ROOT / "checkpoints" / "tabicl-classifier-v1.1-0506.ckpt"),
+                model_path=str(ROOT / "checkpoints_mini_tabicl_stage1_sa" / "step-25000.ckpt"),
                 allow_auto_download=False,
                 use_hierarchical=True,
             )
@@ -149,7 +149,6 @@ def evaluate_dataset(did: int, task_id: int, device: str) -> Dict[str, Any]:
         for metric in results_df.columns:
             aggregated_results[f"{metric}_mean"] = float(results_df[metric].mean())
             aggregated_results[f"{metric}_std"]  = float(results_df[metric].std(ddof=1))
-
         return aggregated_results
 
     except Exception as e:
@@ -181,7 +180,7 @@ def main():
         all_results.append(dataset_result)
 
     results_df = pd.DataFrame(all_results)
-    output_path = "results/tabicl_benchmark_results.csv"
+    output_path = "results/tabicl_benchmark_results_test_25000.csv"
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     results_df.to_csv(output_path, index=False)
 
@@ -196,7 +195,14 @@ def main():
         # If the column doesn't exist, it means there were no errors.
         successful_runs = results_df
         
-    print(successful_runs.head(10).to_string())
+    #Print average accuracy and f1_score across successful runs
+    if not successful_runs.empty:
+        avg_accuracy = successful_runs['accuracy_mean'].mean()
+        avg_f1 = successful_runs['f1_macro_mean'].mean()
+        print(f"Average Accuracy across successful runs: {avg_accuracy:.4f}")
+        print(f"Average F1 Score across successful runs: {avg_f1:.4f}")
+    else:
+        print("No successful runs to report average metrics.")
 
 if __name__ == "__main__":
     main()
