@@ -896,6 +896,9 @@ def run_robustness_panel(
 
     rng = np.random.default_rng(seed)
 
+    # Collect rows for CSV logging
+    robustness_rows: List[Dict[str, Any]] = []
+
     # Shared numeric feature info
     num_cols = list(X_tr.select_dtypes(include="number").columns)
     col_stds = X_tr[num_cols].std().replace(0, 1.0) if num_cols else pd.Series(dtype=float)
@@ -907,6 +910,31 @@ def run_robustness_panel(
         f"  Clean test: "
         f"acc(SA)={base_sa.accuracy:.4f}, acc(EA)={base_ea.accuracy:.4f}; "
         f"NLL(SA)={base_sa.log_loss:.4f}, NLL(EA)={base_ea.log_loss:.4f}"
+    )
+
+    robustness_rows.append(
+        {
+            "dataset": ds_name,
+            "condition": "clean",
+            "param_type": "none",
+            "param_value": 0.0,
+            "n_test": len(X_te),
+            "acc_sa": base_sa.accuracy,
+            "acc_ea": base_ea.accuracy,
+            "f1_sa": base_sa.f1_macro,
+            "f1_ea": base_ea.f1_macro,
+            "nll_sa": base_sa.log_loss,
+            "nll_ea": base_ea.log_loss,
+            "brier_sa": base_sa.brier,
+            "brier_ea": base_ea.brier,
+            "ece_sa": base_sa.ece,
+            "ece_ea": base_ea.ece,
+            "seed": seed,
+            "n_estimators": n_estimators,
+            "use_hierarchical": bool(use_hierarchical),
+            "sa_checkpoint": str(model_sa),
+            "ea_checkpoint": str(model_ea),
+        }
     )
 
     # (a) Noise / outlier robustness
@@ -921,6 +949,30 @@ def run_robustness_panel(
                 f"acc(SA)={m_sa.accuracy:.4f}, acc(EA)={m_ea.accuracy:.4f}; "
                 f"NLL(SA)={m_sa.log_loss:.4f}, NLL(EA)={m_ea.log_loss:.4f}"
             )
+            robustness_rows.append(
+                {
+                    "dataset": ds_name,
+                    "condition": "noise",
+                    "param_type": "sigma",
+                    "param_value": float(sigma),
+                    "n_test": len(X_noisy),
+                    "acc_sa": m_sa.accuracy,
+                    "acc_ea": m_ea.accuracy,
+                    "f1_sa": m_sa.f1_macro,
+                    "f1_ea": m_ea.f1_macro,
+                    "nll_sa": m_sa.log_loss,
+                    "nll_ea": m_ea.log_loss,
+                    "brier_sa": m_sa.brier,
+                    "brier_ea": m_ea.brier,
+                    "ece_sa": m_sa.ece,
+                    "ece_ea": m_ea.ece,
+                    "seed": seed,
+                    "n_estimators": n_estimators,
+                    "use_hierarchical": bool(use_hierarchical),
+                    "sa_checkpoint": str(model_sa),
+                    "ea_checkpoint": str(model_ea),
+                }
+            )
 
     if outlier_fracs:
         print("  [a] Outlier rows (random features + labels):")
@@ -932,6 +984,30 @@ def run_robustness_panel(
                 f"    outlier_frac={frac:.3f}: "
                 f"acc(SA)={m_sa.accuracy:.4f}, acc(EA)={m_ea.accuracy:.4f}; "
                 f"NLL(SA)={m_sa.log_loss:.4f}, NLL(EA)={m_ea.log_loss:.4f}"
+            )
+            robustness_rows.append(
+                {
+                    "dataset": ds_name,
+                    "condition": "outliers",
+                    "param_type": "frac",
+                    "param_value": float(frac),
+                    "n_test": len(X_aug),
+                    "acc_sa": m_sa.accuracy,
+                    "acc_ea": m_ea.accuracy,
+                    "f1_sa": m_sa.f1_macro,
+                    "f1_ea": m_ea.f1_macro,
+                    "nll_sa": m_sa.log_loss,
+                    "nll_ea": m_ea.log_loss,
+                    "brier_sa": m_sa.brier,
+                    "brier_ea": m_ea.brier,
+                    "ece_sa": m_sa.ece,
+                    "ece_ea": m_ea.ece,
+                    "seed": seed,
+                    "n_estimators": n_estimators,
+                    "use_hierarchical": bool(use_hierarchical),
+                    "sa_checkpoint": str(model_sa),
+                    "ea_checkpoint": str(model_ea),
+                }
             )
 
     # (b) Feature rescaling / correlation (test-time transforms)
@@ -946,6 +1022,38 @@ def run_robustness_panel(
                 f"acc(SA)={m_sa.accuracy:.4f}, acc(EA)={m_ea.accuracy:.4f}; "
                 f"NLL(SA)={m_sa.log_loss:.4f}, NLL(EA)={m_ea.log_loss:.4f}"
             )
+            robustness_rows.append(
+                {
+                    "dataset": ds_name,
+                    "condition": "rescale",
+                    "param_type": "factor",
+                    "param_value": float(f),
+                    "n_test": len(X_trf),
+                    "acc_sa": m_sa.accuracy,
+                    "acc_ea": m_ea.accuracy,
+                    "f1_sa": m_sa.f1_macro,
+                    "f1_ea": m_ea.f1_macro,
+                    "nll_sa": m_sa.log_loss,
+                    "nll_ea": m_ea.log_loss,
+                    "brier_sa": m_sa.brier,
+                    "brier_ea": m_ea.brier,
+                    "ece_sa": m_sa.ece,
+                    "ece_ea": m_ea.ece,
+                    "seed": seed,
+                    "n_estimators": n_estimators,
+                    "use_hierarchical": bool(use_hierarchical),
+                    "sa_checkpoint": str(model_sa),
+                    "ea_checkpoint": str(model_ea),
+                }
+            )
+
+    # Persist robustness metrics to CSV
+    if robustness_rows:
+        out_path = REPO_ROOT / "results" / "compare_mini_tabicl_robustness.csv"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        df_out = pd.DataFrame(robustness_rows)
+        header = not out_path.exists()
+        df_out.to_csv(out_path, mode="a", index=False, header=header)
 
 
 # ---------------------------------------------------------------------------
