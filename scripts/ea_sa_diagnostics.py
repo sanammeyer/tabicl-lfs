@@ -422,10 +422,76 @@ def analyze_dataset(
         f"EA-icl={_safe_mean(top1_ea_icl):.3f}/{_safe_mean(pur_ea_icl):.3f}"
     )
 
+    # Save diagnostics to CSV for later analysis
+    out_path = ROOT / "results" / "ea_sa_diagnostics.csv"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    rows = []
+    n_eff_sa_global = _safe_mean(neff_sa)
+    n_eff_full_global = _safe_mean(neff_ea_full)
+    n_eff_row_global = _safe_mean(neff_ea_row)
+    n_eff_icl_global = _safe_mean(neff_ea_icl)
+    pur_sa_global = (_safe_mean(top1_sa), _safe_mean(pur_sa))
+    pur_full_global = (_safe_mean(top1_ea_full), _safe_mean(pur_ea_full))
+    pur_row_global = (_safe_mean(top1_ea_row), _safe_mean(pur_ea_row))
+    pur_icl_global = (_safe_mean(top1_ea_icl), _safe_mean(pur_ea_icl))
+
+    for name_g, idx in groups.items():
+        g = _group_stats(idx)
+        rows.append(
+            {
+                "dataset": name,
+                "group": name_g,
+                "n": g.n,
+                "acc_sa_global": acc_sa,
+                "acc_ea_global": acc_ea,
+                "nll_sa_global": nll_sa,
+                "nll_ea_global": nll_ea,
+                "mean_ptrue_sa": g.mean_ptrue_sa,
+                "mean_ptrue_ea": g.mean_ptrue_ea,
+                "mean_neff_sa": g.mean_neff_sa,
+                "mean_neff_ea": g.mean_neff_ea,
+                "mean_purity_sa": g.mean_purity_sa,
+                "mean_purity_ea": g.mean_purity_ea,
+                "n_eff_sa_global": n_eff_sa_global,
+                "n_eff_ea_full_global": n_eff_full_global,
+                "n_eff_ea_row_global": n_eff_row_global,
+                "n_eff_ea_icl_global": n_eff_icl_global,
+                "pur_sa_top1_global": pur_sa_global[0],
+                "pur_sa_topk_global": pur_sa_global[1],
+                "pur_ea_full_top1_global": pur_full_global[0],
+                "pur_ea_full_topk_global": pur_full_global[1],
+                "pur_ea_row_top1_global": pur_row_global[0],
+                "pur_ea_row_topk_global": pur_row_global[1],
+                "pur_ea_icl_top1_global": pur_icl_global[0],
+                "pur_ea_icl_topk_global": pur_icl_global[1],
+                "ea_strength": ea_strength,
+                "n_estimators": n_estimators,
+                "seed": seed,
+                "sa_checkpoint": str(sa_ckpt),
+                "ea_checkpoint": str(ea_ckpt),
+            }
+        )
+
+    df_out = pd.DataFrame(rows)
+    header = not out_path.exists()
+    df_out.to_csv(out_path, mode="a", index=False, header=header)
+
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(description="EA vs SA diagnostics on a single dataset.")
-    ap.add_argument("--dataset", type=str, required=True, help="OpenML dataset id or name (e.g. 23 or 'cmc').")
+    ap = argparse.ArgumentParser(description="EA vs SA diagnostics on one or more OpenML datasets.")
+    ap.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="Single OpenML dataset id or name (e.g. 23 or 'cmc').",
+    )
+    ap.add_argument(
+        "--datasets",
+        type=str,
+        default=None,
+        help="Comma-separated list of OpenML dataset ids/names (e.g. '23,48,750').",
+    )
     ap.add_argument(
         "--sa_checkpoint",
         type=str,
@@ -470,18 +536,28 @@ def main() -> None:
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    X, y, name = fetch_openml_dataset(args.dataset)
-    analyze_dataset(
-        X=X,
-        y=y,
-        name=name,
-        sa_ckpt=Path(args.sa_checkpoint),
-        ea_ckpt=Path(args.ea_checkpoint),
-        device=device,
-        n_estimators=args.n_estimators,
-        seed=args.seed,
-        ea_strength=args.ea_strength,
-    )
+    # Build list of dataset specs to process
+    specs = []
+    if args.datasets:
+        specs = [s.strip() for s in args.datasets.split(",") if s.strip()]
+    elif args.dataset:
+        specs = [args.dataset.strip()]
+    else:
+        raise SystemExit("Please provide --dataset ID/NAME or --datasets id1,id2,...")
+
+    for spec in specs:
+        X, y, name = fetch_openml_dataset(spec)
+        analyze_dataset(
+            X=X,
+            y=y,
+            name=name,
+            sa_ckpt=Path(args.sa_checkpoint),
+            ea_ckpt=Path(args.ea_checkpoint),
+            device=device,
+            n_estimators=args.n_estimators,
+            seed=args.seed,
+            ea_strength=args.ea_strength,
+        )
 
 
 if __name__ == "__main__":

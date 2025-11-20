@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 import csv
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -43,64 +43,51 @@ def load_metrics(csv_path: Path) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 
 def make_plot(
-    ea_means: Tuple[float, float, float],
-    ea_stds: Tuple[float, float, float],
-    sa_means: Tuple[float, float, float],
-    sa_stds: Tuple[float, float, float],
-    n_ea: int,
-    n_sa: int,
+    metric_name: str,
+    means: List[float],
+    stds: List[float],
+    labels: List[str],
+    ns: List[int],
     title: str,
     output_path: Path,
+    ylim: Optional[Tuple[float, float]] = None,
 ) -> None:
-    metrics = ["Accuracy", "Macro-F1", "Log loss"]
-    ea_vals = list(ea_means)
-    sa_vals = list(sa_means)
-    ea_err = list(ea_stds)
-    sa_err = list(sa_stds)
-
-    x = np.arange(len(metrics), dtype=float)
-    width = 0.32
+    x = np.arange(len(labels), dtype=float)
 
     plt.rcParams.update(
         {
             "figure.dpi": 150,
-            "font.size": 11,
-            "axes.labelsize": 11,
-            "axes.titlesize": 12,
-            "legend.fontsize": 10,
+            "font.size": 7,
+            "axes.labelsize": 7,
+            "axes.titlesize": 8,
+            "legend.fontsize": 7,
         }
     )
 
-    fig, ax = plt.subplots(figsize=(5.5, 3.5))
+    colors = ["#4C72B0", "#55A868", "#C44E52", "#8172B3"]
+
+    fig, ax = plt.subplots(figsize=(5, 3))
 
     ax.bar(
-        x - width / 2,
-        sa_vals,
-        width,
-        yerr=sa_err,
-        label="SA",
-        color="#4C72B0",
-        edgecolor="black",
-        linewidth=0.6,
-        capsize=4,
-    )
-    ax.bar(
-        x + width / 2,
-        ea_vals,
-        width,
-        yerr=ea_err,
-        label="EA",
-        color="#55A868",
+        x,
+        means,
+        yerr=stds,
+        color=colors[: len(labels)],
         edgecolor="black",
         linewidth=0.6,
         capsize=4,
     )
 
     ax.set_xticks(x)
-    ax.set_xticklabels(metrics)
-    ax.set_ylabel("Score")
-    ax.set_title(title + f" (EA n={n_ea}, SA n={n_sa})")
-    ax.legend(frameon=False)
+    ax.set_xticklabels(labels)
+    ax.set_ylabel(metric_name)
+
+    if ylim is not None:
+        ax.set_ylim(*ylim)
+
+    n_info = ", ".join(f"{lab}: n={n}" for lab, n in zip(labels, ns))
+    ax.set_title(f"{title} – {metric_name}\n({n_info})")
+
     ax.grid(axis="y", linestyle="--", alpha=0.3)
 
     for spine in ["top", "right"]:
@@ -132,16 +119,68 @@ def parse_args() -> argparse.Namespace:
         help="CSV with SA benchmark results.",
     )
     parser.add_argument(
-        "--output",
+        "--standard_csv",
         type=Path,
-        default=Path("figures/cc18_tabicl_sa_vs_ea_step-1000.png"),
-        help="Output path for the comparison plot.",
+        default=Path("results/cc18_tabicl_tabicl-classifier-v1.1-0506.csv"),
+        help="CSV with standard TabICL classifier benchmark results.",
+    )
+    parser.add_argument(
+        "--sa_label",
+        type=str,
+        default="mini-TabICL(SA)",
+        help="Label for the SA checkpoint.",
+    )
+    parser.add_argument(
+        "--ea_label",
+        type=str,
+        default="mini-TabICL(EA)",
+        help="Label for the EA checkpoint.",
+    )
+    parser.add_argument(
+        "--standard_label",
+        type=str,
+        default="TabICL",
+        help="Label for the standard checkpoint.",
+    )
+    parser.add_argument(
+        "--output_prefix",
+        type=Path,
+        default=Path("figures/cc18_tabicl_three_ckpts_step-1000"),
+        help=(
+            "Prefix for the output figures; "
+            "files '<prefix>_accuracy.png', '<prefix>_macro_f1.png', "
+            "and '<prefix>_logloss.png' will be created."
+        ),
     )
     parser.add_argument(
         "--title",
         type=str,
         default="cc18 TabICL SA vs EA (step-1000)",
         help="Title for the plot.",
+    )
+    parser.add_argument(
+        "--ylim_accuracy",
+        type=float,
+        nargs=2,
+        metavar=("YMIN", "YMAX"),
+        default=None,
+        help="Optional y-axis limits for the accuracy plot.",
+    )
+    parser.add_argument(
+        "--ylim_macro_f1",
+        type=float,
+        nargs=2,
+        metavar=("YMIN", "YMAX"),
+        default=None,
+        help="Optional y-axis limits for the macro-F1 plot.",
+    )
+    parser.add_argument(
+        "--ylim_logloss",
+        type=float,
+        nargs=2,
+        metavar=("YMIN", "YMAX"),
+        default=None,
+        help="Optional y-axis limits for the log-loss plot.",
     )
     return parser.parse_args()
 
@@ -153,27 +192,105 @@ def main() -> None:
         raise SystemExit(f"EA results file not found: {args.ea_csv}")
     if not args.sa_csv.is_file():
         raise SystemExit(f"SA results file not found: {args.sa_csv}")
+    if not args.standard_csv.is_file():
+        raise SystemExit(f"Standard results file not found: {args.standard_csv}")
 
     ea_acc_arr, ea_f1_arr, ea_ll_arr = load_metrics(args.ea_csv)
     sa_acc_arr, sa_f1_arr, sa_ll_arr = load_metrics(args.sa_csv)
+    std_acc_arr, std_f1_arr, std_ll_arr = load_metrics(args.standard_csv)
 
-    n_ea = ea_acc_arr.size
-    n_sa = sa_acc_arr.size
+    def mean_std(arr: np.ndarray) -> Tuple[float, float]:
+        if arr.size == 0:
+            return float("nan"), float("nan")
+        if arr.size == 1:
+            return float(arr.mean()), 0.0
+        return float(arr.mean()), float(arr.std(ddof=1))
 
-    ea_means = (ea_acc_arr.mean(), ea_f1_arr.mean(), ea_ll_arr.mean())
-    ea_stds = (ea_acc_arr.std(ddof=1), ea_f1_arr.std(ddof=1), ea_ll_arr.std(ddof=1))
-    sa_means = (sa_acc_arr.mean(), sa_f1_arr.mean(), sa_ll_arr.mean())
-    sa_stds = (sa_acc_arr.std(ddof=1), sa_f1_arr.std(ddof=1), sa_ll_arr.std(ddof=1))
+    ea_means = (
+        mean_std(ea_acc_arr)[0],
+        mean_std(ea_f1_arr)[0],
+        mean_std(ea_ll_arr)[0],
+    )
+    ea_stds = (
+        mean_std(ea_acc_arr)[1],
+        mean_std(ea_f1_arr)[1],
+        mean_std(ea_ll_arr)[1],
+    )
 
+    sa_means = (
+        mean_std(sa_acc_arr)[0],
+        mean_std(sa_f1_arr)[0],
+        mean_std(sa_ll_arr)[0],
+    )
+    sa_stds = (
+        mean_std(sa_acc_arr)[1],
+        mean_std(sa_f1_arr)[1],
+        mean_std(sa_ll_arr)[1],
+    )
+
+    std_means = (
+        mean_std(std_acc_arr)[0],
+        mean_std(std_f1_arr)[0],
+        mean_std(std_ll_arr)[0],
+    )
+    std_stds = (
+        mean_std(std_acc_arr)[1],
+        mean_std(std_f1_arr)[1],
+        mean_std(std_ll_arr)[1],
+    )
+
+    labels = [args.sa_label, args.ea_label, args.standard_label]
+    ns = [sa_acc_arr.size, ea_acc_arr.size, std_acc_arr.size]
+
+    # Print summary statistics to stdout
+    print("Summary statistics (mean ± std over datasets):")
+    metrics = ["Accuracy", "Macro-F1", "Log loss"]
+    all_means = [sa_means, ea_means, std_means]
+    all_stds = [sa_stds, ea_stds, std_stds]
+    for metric_idx, metric_name in enumerate(metrics):
+        print(f"\n{metric_name}:")
+        for label, n, means, stds in zip(labels, ns, all_means, all_stds):
+            m = means[metric_idx]
+            s = stds[metric_idx]
+            print(f"  {label:>16}: {m:.4f} ± {s:.4f} (n={n})")
+
+    output_prefix: Path = args.output_prefix
+    output_prefix.parent.mkdir(parents=True, exist_ok=True)
+
+    # Accuracy
     make_plot(
-        ea_means=ea_means,
-        ea_stds=ea_stds,
-        sa_means=sa_means,
-        sa_stds=sa_stds,
-        n_ea=n_ea,
-        n_sa=n_sa,
+        metric_name="Accuracy",
+        means=[sa_means[0], ea_means[0], std_means[0]],
+        stds=[sa_stds[0], ea_stds[0], std_stds[0]],
+        labels=labels,
+        ns=ns,
         title=args.title,
-        output_path=args.output,
+        output_path=output_prefix.with_name(output_prefix.name + "_accuracy.png"),
+        ylim=tuple(args.ylim_accuracy) if args.ylim_accuracy is not None else None,
+    )
+
+    # Macro-F1
+    make_plot(
+        metric_name="Macro-F1",
+        means=[sa_means[1], ea_means[1], std_means[1]],
+        stds=[sa_stds[1], ea_stds[1], std_stds[1]],
+        labels=labels,
+        ns=ns,
+        title=args.title,
+        output_path=output_prefix.with_name(output_prefix.name + "_macro_f1.png"),
+        ylim=tuple(args.ylim_macro_f1) if args.ylim_macro_f1 is not None else None,
+    )
+
+    # Log loss
+    make_plot(
+        metric_name="Log loss",
+        means=[sa_means[2], ea_means[2], std_means[2]],
+        stds=[sa_stds[2], ea_stds[2], std_stds[2]],
+        labels=labels,
+        ns=ns,
+        title=args.title,
+        output_path=output_prefix.with_name(output_prefix.name + "_logloss.png"),
+        ylim=tuple(args.ylim_logloss) if args.ylim_logloss is not None else None,
     )
 
 
