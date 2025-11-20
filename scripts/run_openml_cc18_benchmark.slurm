@@ -29,7 +29,8 @@ module load slurm_setup || true
 PROJECT_ROOT="${PROJECT_ROOT:-/dss/dsshome1/0E/ra63pux2/Documents/thesis/code/tabicl-lfs}"
 VENV_ACTIVATE="${VENV_ACTIVATE:-$PROJECT_ROOT/.tabicl/bin/activate}"   # path to your venv activate script
 PY_SRC_DIR="${PY_SRC_DIR:-$PROJECT_ROOT/src}"                          # so that `import tabicl` works
-CKPT_DIR="${CKPT_DIR:-$PROJECT_ROOT/checkpoints}"                     # where checkpoints live
+CKPT_DIR_SA="${CKPT_DIR_SA:-$PROJECT_ROOT/checkpoints_mini_tabicl_stage2_sa}"                     # where checkpoints live
+CKPT_DIR_EA="${CKPT_DIR_EA:-$PROJECT_ROOT/checkpoints_mini_tabicl_stage2_ea}"                     # where checkpoints live
 
 echo "[INFO] Working directory before cd: $(pwd)"
 cd "$PROJECT_ROOT"
@@ -63,12 +64,12 @@ export NCCL_IB_DISABLE=1
 export NCCL_P2P_DISABLE=0
 
 # Resolve checkpoints (absolute paths)
-CKPT_STEP_1800="$CKPT_DIR/step-1800.ckpt"
-CKPT_STEP_2000="$CKPT_DIR/step-2000.ckpt"
-CKPT_V110506="$CKPT_DIR/tabicl-classifier-v1.1-0506.ckpt"
+CKPT_EA="$CKPT_DIR_EA/step-1000_ea.ckpt"
+CKPT_SA="$CKPT_DIR_SA/step-1000.ckpt"
 
-echo "[INFO] Checkpoint dir: $CKPT_DIR"
-printf "[INFO] Looking for checkpoint files:\n  - %s\n  - %s\n  - %s\n" "$CKPT_STEP_1800" "$CKPT_STEP_2000" "$CKPT_V110506"
+
+echo "[INFO] Checkpoint dir: $CKPT_DIR_EA and $CKPT_DIR_SA"
+printf "[INFO] Looking for checkpoint files:\n  - %s\n  - %s\n" "$CKPT_EA" "$CKPT_SA"
 
 # Helper: run a single benchmark config
 run_benchmark() {
@@ -86,52 +87,27 @@ FAIL=0
 echo "[INFO] Starting OpenML-CC18 benchmark runs"
 
 # 1) TabICL @ step-1800.ckpt
-if [[ -f "$CKPT_STEP_1800" ]]; then
+if [[ -f "$CKPT_EA" ]]; then
   run_benchmark tabicl \
-    --checkpoint "$CKPT_STEP_1800" \
+    --checkpoint "$CKPT_EA" \
     --device cuda \
     --n_rows "$NO_LIMIT_ROWS" \
     --max_features 500 \
     --seed 42 || FAIL=1
 else
-  echo "[WARN] Missing checkpoint: $CKPT_STEP_1800 — skipping this run"
+  echo "[WARN] Missing checkpoint: $CKPT_EA — skipping this run"
 fi
 
 # 2) TabICL @ step-2000.ckpt
-if [[ -f "$CKPT_STEP_2000" ]]; then
+if [[ -f "$CKPT_SA" ]]; then
   run_benchmark tabicl \
-    --checkpoint "$CKPT_STEP_2000" \
+    --checkpoint "$CKPT_SA" \
     --device cuda \
     --n_rows "$NO_LIMIT_ROWS" \
     --max_features 500 \
     --seed 42 || FAIL=1
 else
-  echo "[WARN] Missing checkpoint: $CKPT_STEP_2000 — skipping this run"
-fi
-
-# 3) TabICL @ tabicl-classifier-v1.1-0506.ckpt
-if [[ -f "$CKPT_V110506" ]]; then
-  run_benchmark tabicl \
-    --checkpoint "$CKPT_V110506" \
-    --device cuda \
-    --n_rows "$NO_LIMIT_ROWS" \
-    --max_features 500 \
-    --seed 42 || FAIL=1
-else
-  echo "[WARN] Missing checkpoint: $CKPT_V110506 — skipping this run"
-fi
-
-# 4) TabPFN baseline
-run_benchmark tabpfn \
-  --device cuda \
-  --n_rows 10000 \
-  --max_features 500 \
-  --seed 42 || FAIL=1
-
-if [[ $FAIL -eq 0 ]]; then
-  echo "[INFO] All benchmark runs finished successfully at $(date)"
-else
-  echo "[WARN] One or more benchmark runs failed at $(date)" >&2
+  echo "[WARN] Missing checkpoint: $CKPT_SA — skipping this run"
 fi
 
 # Be tidy

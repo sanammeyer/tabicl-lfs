@@ -98,13 +98,26 @@ def fetch_openml_dataset(name_or_id: str | int) -> Tuple[pd.DataFrame, pd.Series
 
 
 @torch.no_grad()
-def _compute_rank_matrices(
+def _compute_test_to_train_weights(
     model,
     R_cond: torch.Tensor,
     train_size: int,
     ea_strength: float = 1.0,
+    chunk_test: int = 4096,
+    use_fp16: bool = True,
 ) -> torch.Tensor:
-    """Return mean-head attention weights for TFicl last block (T,T)."""
+    """Return mean-head attention weights for TFicl last block, restricted to test→train.
+
+    Computes per-head weights for test rows attending to training rows only, then
+    averages over heads and batch. This avoids constructing the full (T,T) matrix
+    which is O(T^2) memory and can easily exceed GPU RAM on large datasets.
+
+    Returns
+    -------
+    torch.Tensor
+        Averaged weights of shape (T_test, T_train), where T_train=train_size and
+        T_test=T-train_size. Softmax is taken over the key dimension (train rows).
+    """
 
     device = R_cond.device
     enc: ICLearning = model.icl_predictor
@@ -147,35 +160,47 @@ def _compute_rank_matrices(
         q = q * m_bc
         k = k * m_bc
 
-    scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(hs)  # (B, nh, T, T)
-    allowed = torch.zeros(T, T, dtype=torch.bool, device=device)
-    if train_size > 0:
-        allowed[:train_size, :train_size] = True
-        allowed[train_size:, :train_size] = True
-    scores = scores.masked_fill(~allowed.view(1, 1, T, T), float("-inf"))
-    weights = torch.softmax(scores, dim=-1)  # (B, nh, T, T)
+    # Restrict to test (queries) attending to train (keys) to reduce memory
+    q_test = q[..., train_size:, :]   # (B, nh, T_test, hs)
+    k_train = k[..., :train_size, :] # (B, nh, T_train, hs)
 
-    # Average over batch and heads to get (T,T)
-    while weights.dim() > 2:
-        weights = weights.mean(dim=0)
-    return weights  # (T, T)
+    T_test = q_test.shape[-2]
+    T_train = k_train.shape[-2]
+
+    # Accumulate mean over (batch, heads) progressively to reduce peak memory
+    out = torch.zeros(T_test, T_train, device=device, dtype=torch.float32)
+    scale = 1.0 / math.sqrt(hs)
+
+    # Reshape to merge (B, nh) into a single batch for efficient bmm
+    Bnh = B * nh
+    q_test_b = q_test.reshape(Bnh, T_test, hs)
+    k_train_b = k_train.reshape(Bnh, T_train, hs)
+    if use_fp16:
+        q_test_b = q_test_b.to(torch.float16)
+        k_train_b = k_train_b.to(torch.float16)
+
+    for start in range(0, T_test, chunk_test):
+        end = min(T_test, start + chunk_test)
+        t = end - start
+        q_chunk = q_test_b[:, start:end, :]  # (Bnh, t, hs)
+        # (Bnh, t, hs) @ (Bnh, hs, T_train) -> (Bnh, t, T_train)
+        scores = torch.bmm(q_chunk, k_train_b.transpose(1, 2)) * scale
+        w = torch.softmax(scores.to(torch.float32), dim=-1)  # (Bnh, t, T_train)
+        # Average over merged (batch, heads)
+        w_mean = w.mean(dim=0)  # (t, T_train)
+        out[start:end, :] += w_mean
+    return out  # (T_test, T_train)
 
 
-def per_row_neff(weights_avg: torch.Tensor, train_size: int) -> np.ndarray:
-    """Per-test-row N_eff from attention weights."""
-    if train_size <= 0 or weights_avg.ndim != 2:
+def per_row_neff(W_tt: torch.Tensor) -> np.ndarray:
+    """Per-test-row N_eff from attention weights (T_test, T_train)."""
+    if W_tt.ndim != 2 or W_tt.numel() == 0:
         return np.full(0, np.nan)
-    T = weights_avg.shape[0]
-    if T <= train_size:
-        return np.full(0, np.nan)
-    W = weights_avg[train_size:, :train_size].clone()  # (T_test, J)
-    if W.numel() == 0:
-        return np.full(0, np.nan)
-    finite = torch.isfinite(W)
+    finite = torch.isfinite(W_tt)
     any_finite = finite.any(dim=1)
     if not any_finite.any():
         return np.full(0, np.nan)
-    W = W[any_finite]
+    W = W_tt[any_finite]
     finite = finite[any_finite]
     W_clean = torch.where(finite, W, torch.zeros_like(W))
     row_sums = W_clean.sum(dim=1, keepdim=True).clamp_min(1e-12)
@@ -189,31 +214,26 @@ def per_row_neff(weights_avg: torch.Tensor, train_size: int) -> np.ndarray:
 
 
 def per_row_purity(
-    weights_avg: torch.Tensor,
+    W_tt: torch.Tensor,
     y_train: np.ndarray,
     y_test: np.ndarray,
-    train_size: int,
     topk: int = 5,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Per-test-row top-1 hit and top-k purity."""
-    if train_size <= 0 or weights_avg.ndim != 2:
-        return np.full(0, np.nan), np.full(0, np.nan)
-    T = weights_avg.shape[0]
-    n_test = T - train_size
-    if n_test <= 0:
+    """Per-test-row top-1 hit and top-k purity from (T_test, T_train) weights."""
+    if W_tt.ndim != 2 or W_tt.numel() == 0:
         return np.full(0, np.nan), np.full(0, np.nan)
 
-    W = weights_avg.detach().cpu().numpy()
-    assert y_train.shape[0] == train_size
-    assert y_test.shape[0] == n_test
+    W = W_tt.detach().cpu().numpy()
+    T_test, T_train = W.shape
+    assert y_train.shape[0] == T_train
+    assert y_test.shape[0] == T_test
 
-    k = max(1, min(topk, train_size))
-    top1 = np.full(n_test, np.nan, dtype=float)
-    purity = np.full(n_test, np.nan, dtype=float)
+    k = max(1, min(topk, T_train))
+    top1 = np.full(T_test, np.nan, dtype=float)
+    purity = np.full(T_test, np.nan, dtype=float)
 
-    for t_idx in range(n_test):
-        row_idx = train_size + t_idx
-        alpha = W[row_idx, :train_size]
+    for t_idx in range(T_test):
+        alpha = W[t_idx]
         if not np.isfinite(alpha).any():
             continue
         top_idx = np.argsort(-alpha)[:k]
@@ -323,13 +343,13 @@ def analyze_dataset(
             R_cond = row_reps.clone()
             R_cond[:, :train_size] = R_cond[:, :train_size] + model.icl_predictor.y_encoder(yt)
 
-        weights = _compute_rank_matrices(model, R_cond, train_size, ea_strength=ea_strength)  # (T,T)
-        neff = per_row_neff(weights, train_size)
+        W_tt = _compute_test_to_train_weights(model, R_cond, train_size, ea_strength=ea_strength)
+        neff = per_row_neff(W_tt)
 
         # Mapping: first train_size rows -> X_tr, remaining -> X_te in order
         y_tr_np = np.asarray(y_tr)
         y_te_np = np.asarray(y_te)
-        top1, pur = per_row_purity(weights, y_tr_np, y_te_np, train_size, topk=5)
+        top1, pur = per_row_purity(W_tt, y_tr_np, y_te_np, topk=5)
         return neff, top1, pur
 
     # SA baseline: identity metric in both TFrow and TFicl (strength unused)
