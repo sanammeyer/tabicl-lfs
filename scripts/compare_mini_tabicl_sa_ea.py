@@ -80,7 +80,7 @@ def set_seed(seed: int = 42) -> None:
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.manual_seed_all(seed)
+        torch.cuda.manual_seed_all(seed)
 
 
 def fetch_openml_dataset(name_or_id: str | int) -> Tuple[pd.DataFrame, pd.Series, str]:
@@ -218,22 +218,19 @@ def linear_cka(X: np.ndarray, Y: np.ndarray) -> float:
 
 
 @torch.no_grad()
-def _compute_rank_matrices(
+@torch.no_grad()
+def _compute_test_to_train_weights(
     model,
     R_cond: torch.Tensor,
     train_size: int,
-    avg_last2: bool = False,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Return batched ranking matrices for all test rows (adapted from extract_row_embed_icl_topk.py).
+    ea_strength: float = 1.0,
+    chunk_test: int = 4096,
+    use_fp16: bool = True,
+) -> torch.Tensor:
+    """Compute mean-head test->train attention weights with low memory footprint.
 
-    Returns
-    -------
-    weights_avg : Tensor (T, T)
-        Mean-head attention of the selected layer (last or avg of last two).
-
-    scores_axv_all : Tensor (T_test, J)
-        Mean-head attention × ||W_out v|| from last layer, over (test, train).
-        (Kept for completeness; not used directly here.)
+    Returns a (T_test, T_train) matrix (averaged over batch and heads) with softmax
+    taken over keys (train rows). Avoids constructing full (T,T) attention.
     """
     from tabicl.model.learning import ICLearning  # local import to avoid cycles
 
@@ -257,9 +254,10 @@ def _compute_rank_matrices(
     nh = last.attn.num_heads
     hs = E // nh
     q, k, v = F._in_projection_packed(q_in, q_in, q_in, last.attn.in_proj_weight, last.attn.in_proj_bias)
-    q = q.view(B, T, nh, hs).transpose(-3, -2)
+    q = q.view(B, T, nh, hs).transpose(-3, -2)  # (B, nh, T, hs)
     k = k.view(B, T, nh, hs).transpose(-3, -2)
     v = v.view(B, T, nh, hs).transpose(-3, -2)
+
     if last.elliptical and (v_prev is not None) and (len(blocks) - 1 >= 1):
         keep = torch.zeros(T, device=device, dtype=torch.float32)
         keep[:train_size] = 1.0
@@ -270,94 +268,48 @@ def _compute_rank_matrices(
             scale_mode=last.elliptical_scale_mode,
             mask_keep=keep,
         )
+        if ea_strength != 1.0:
+            m = 1.0 + ea_strength * (m - 1.0)
         m_bc = m.view(1, 1, nh, 1, hs)
         q = q * m_bc
         k = k * m_bc
-    scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(hs)
-    allowed = torch.zeros(T, T, dtype=torch.bool, device=device)
-    if train_size > 0:
-        allowed[:train_size, :train_size] = True
-        allowed[train_size:, :train_size] = True
-    # Broadcast mask over any leading batch/head dims
-    scores = scores.masked_fill(~allowed.view(*([1] * (scores.dim() - 2)), T, T), float("-inf"))
-    weights_last = torch.softmax(scores, dim=-1)  # (..., T, T)
 
-    # Optional average with N-2
-    if avg_last2 and len(blocks) >= 2:
-        x2 = R_cond
-        v_prev2 = None
-        for i, blk in enumerate(blocks[:-2]):
-            x2 = blk(x2, key_padding_mask=None, attn_mask=train_size, rope=tf_icl.rope, v_prev=v_prev2, block_index=i)
-            v_prev2 = getattr(blk, "_last_v", None)
-        prev_blk = blocks[-2]
-        if prev_blk.norm_first:
-            q_in2 = prev_blk.norm1(x2)
-        else:
-            q_in2 = x2
-        B2, T2, E2 = q_in2.shape
-        nh2 = prev_blk.attn.num_heads
-        hs2 = E2 // nh2
-        q2, k2, v2 = F._in_projection_packed(
-            q_in2, q_in2, q_in2, prev_blk.attn.in_proj_weight, prev_blk.attn.in_proj_bias
-        )
-        q2 = q2.view(B2, T2, nh2, hs2).transpose(-3, -2)
-        k2 = k2.view(B2, T2, nh2, hs2).transpose(-3, -2)
-        if prev_blk.elliptical and (v_prev2 is not None) and (len(blocks) - 2 >= 1):
-            keep2 = torch.zeros(T2, device=device, dtype=torch.float32)
-            keep2[:train_size] = 1.0
-            m2 = compute_elliptical_diag(
-                v2,
-                v_prev2,
-                delta=prev_blk.elliptical_delta,
-                scale_mode=prev_blk.elliptical_scale_mode,
-                mask_keep=keep2,
-            )
-            m2_bc = m2.view(1, 1, nh2, 1, hs2)
-            q2 = q2 * m2_bc
-            k2 = k2 * m2_bc
-        scores2 = torch.matmul(q2, k2.transpose(-1, -2)) / math.sqrt(hs2)
-        scores2 = scores2.masked_fill(~allowed.view(*([1] * (scores2.dim() - 2)), T2, T2), float("-inf"))
-        weights_prev = torch.softmax(scores2, dim=-1)  # (..., T, T)
-        weights_sel = 0.5 * (weights_last + weights_prev)
-    else:
-        weights_sel = weights_last
+    # Restrict to test queries and train keys
+    q_test = q[..., train_size:, :]   # (B, nh, T_test, hs)
+    k_train = k[..., :train_size, :]  # (B, nh, T_train, hs)
+    T_test = q_test.shape[-2]
+    T_train = k_train.shape[-2]
 
-    # Average over all leading dims (batch + heads), keep (T, T)
-    if weights_sel.dim() > 2:
-        lead_dims = tuple(range(weights_sel.dim() - 2))
-        weights_avg = weights_sel.mean(dim=lead_dims)
-    else:
-        weights_avg = weights_sel
+    # Merge batch and heads -> (B*nh, T, hs) for efficient bmm
+    Bnh = B * nh
+    q_test_b = q_test.reshape(Bnh, T_test, hs)
+    k_train_b = k_train.reshape(Bnh, T_train, hs)
+    if use_fp16:
+        q_test_b = q_test_b.to(torch.float16)
+        k_train_b = k_train_b.to(torch.float16)
 
-    # For this script, downstream code only uses `weights_avg` (for N_eff).
-    # We return an empty placeholder for scores_axv_all to keep the signature
-    # compatible with callers but avoid potential shape mismatches here.
-    scores_axv_all = torch.empty(0, train_size, device=device)
+    out = torch.zeros(T_test, T_train, device=device, dtype=torch.float32)
+    scale = 1.0 / math.sqrt(hs)
 
-    return weights_avg, scores_axv_all
+    for start in range(0, T_test, chunk_test):
+        end = min(T_test, start + chunk_test)
+        q_chunk = q_test_b[:, start:end, :]  # (Bnh, t, hs)
+        scores = torch.bmm(q_chunk, k_train_b.transpose(1, 2)) * scale  # (Bnh, t, T_train)
+        w = torch.softmax(scores.to(torch.float32), dim=-1)
+        w_mean = w.mean(dim=0)  # (t, T_train) averaged over (batch*heads)
+        out[start:end, :] += w_mean
+
+    return out  # (T_test, T_train)
 
 
-def effective_num_neighbors(weights_avg: torch.Tensor, train_size: int) -> Tuple[float, float]:
-    """Return mean and std of N_eff over test rows given attention weights.
-
-    This implementation is robust to non-finite attention weights:
-    - restricts to the (test_rows, train_rows) slice
-    - zeroes out non-finite entries and renormalizes rows to sum to 1
-    - computes N_eff = 1 / sum_i alpha_i^2 per test row
-    """
-    if train_size <= 0 or weights_avg.ndim != 2:
+def effective_num_neighbors(weights_tt: torch.Tensor, train_size: int) -> Tuple[float, float]:
+    """Return mean/std N_eff over test rows given (T_test, T_train) weights."""
+    if train_size <= 0 or weights_tt.ndim != 2:
+        return float("nan"), float("nan")
+    if weights_tt.numel() == 0:
         return float("nan"), float("nan")
 
-    T = weights_avg.shape[0]
-    if T <= train_size:
-        return float("nan"), float("nan")
-
-    # Slice to test->train block: (T_test, J)
-    W = weights_avg[train_size:, :train_size].clone()
-    if W.numel() == 0:
-        return float("nan"), float("nan")
-
-    # Zero-out non-finite values and renormalize each row to sum 1
+    W = weights_tt
     finite = torch.isfinite(W)
     any_finite = finite.any(dim=1)
     if not any_finite.any():
@@ -368,10 +320,9 @@ def effective_num_neighbors(weights_avg: torch.Tensor, train_size: int) -> Tuple
 
     W_clean = torch.where(finite, W, torch.zeros_like(W))
     row_sums = W_clean.sum(dim=1, keepdim=True).clamp_min(1e-12)
-    alpha = W_clean / row_sums  # (T_eff, J), rows now sum to 1
+    alpha = W_clean / row_sums  # (T_eff, T_train), rows sum to 1
 
-    s2 = (alpha**2).sum(dim=1)  # (T_eff,)
-    # Guard against any numerical issues
+    s2 = (alpha**2).sum(dim=1)
     mask = (s2 > 0) & torch.isfinite(s2)
     if not mask.any():
         return float("nan"), float("nan")
@@ -382,10 +333,9 @@ def effective_num_neighbors(weights_avg: torch.Tensor, train_size: int) -> Tuple
 
 
 def neighbor_label_purity(
-    weights_avg: torch.Tensor,
+    weights_tt: torch.Tensor,
     y_train: pd.Series,
     y_test: pd.Series,
-    train_size: int,
     topk: int = 5,
 ) -> Tuple[float, float]:
     """Compute neighbour label purity for test rows.
@@ -398,28 +348,23 @@ def neighbor_label_purity(
     topk_purity : float
         Average fraction of top-k neighbours sharing the test row's label.
     """
-    if train_size <= 0 or weights_avg.ndim != 2:
+    if weights_tt.ndim != 2 or weights_tt.numel() == 0:
         return float("nan"), float("nan")
 
-    T = weights_avg.shape[0]
-    n_test = T - train_size
-    if n_test <= 0:
-        return float("nan"), float("nan")
-
-    W = weights_avg.detach().cpu().numpy()
+    T_test, T_train = weights_tt.shape
+    W = weights_tt.detach().cpu().numpy()
     y_tr = np.asarray(y_train)
     y_te = np.asarray(y_test)
 
-    if y_tr.shape[0] != train_size or y_te.shape[0] != n_test:
+    if y_tr.shape[0] != T_train or y_te.shape[0] != T_test:
         return float("nan"), float("nan")
 
     top1_hits: List[float] = []
     purities: List[float] = []
-    k = max(1, min(topk, train_size))
+    k = max(1, min(topk, T_train))
 
-    for t_idx in range(n_test):
-        row_idx = train_size + t_idx
-        alpha = W[row_idx, :train_size]
+    for t_idx in range(T_test):
+        alpha = W[t_idx]
         if not np.isfinite(alpha).any():
             continue
         # Top-k neighbour indices by attention
@@ -734,10 +679,10 @@ def run_geometry_panel(
     R_sa, train_size = _build_episode(clf_sa)
     R_ea, _ = _build_episode(clf_ea)
 
-    w_sa, _ = _compute_rank_matrices(clf_sa.model_, R_sa, train_size, avg_last2=False)
-    w_ea, _ = _compute_rank_matrices(clf_ea.model_, R_ea, train_size, avg_last2=False)
-    neff_sa_mean, neff_sa_std = effective_num_neighbors(w_sa, train_size)
-    neff_ea_mean, neff_ea_std = effective_num_neighbors(w_ea, train_size)
+    w_sa_tt = _compute_test_to_train_weights(clf_sa.model_, R_sa, train_size, ea_strength=1.0, chunk_test=2048)
+    w_ea_tt = _compute_test_to_train_weights(clf_ea.model_, R_ea, train_size, ea_strength=1.0, chunk_test=2048)
+    neff_sa_mean, neff_sa_std = effective_num_neighbors(w_sa_tt, train_size)
+    neff_ea_mean, neff_ea_std = effective_num_neighbors(w_ea_tt, train_size)
 
     print(
         f"  N_eff (ICL attention over train rows): "
@@ -746,8 +691,8 @@ def run_geometry_panel(
     )
 
     # Neighbour label purity (soft k-NN behaviour under attention)
-    top1_sa, purity_sa = neighbor_label_purity(w_sa, y_tr, y_te, train_size, topk=5)
-    top1_ea, purity_ea = neighbor_label_purity(w_ea, y_tr, y_te, train_size, topk=5)
+    top1_sa, purity_sa = neighbor_label_purity(w_sa_tt, y_tr, y_te, topk=5)
+    top1_ea, purity_ea = neighbor_label_purity(w_ea_tt, y_tr, y_te, topk=5)
     print(
         f"  Neighbour label purity (top-1 / top-5): "
         f"SA={top1_sa:.3f}/{purity_sa:.3f}, "
