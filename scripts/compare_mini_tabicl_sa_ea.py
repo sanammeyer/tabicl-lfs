@@ -543,6 +543,12 @@ def run_behavioural_panel(
             f"ECE(SA)={row['ece_sa']:.4f}, ECE(EA)={row['ece_ea']:.4f}"
         )
 
+    # Persist behavioural metrics
+    out_path = REPO_ROOT / "results" / "compare_mini_tabicl_behaviour.csv"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    header = not out_path.exists()
+    df.to_csv(out_path, mode="a", index=False, header=header)
+
 
 # ---------------------------------------------------------------------------
 # Representation geometry evaluation
@@ -698,6 +704,30 @@ def run_geometry_panel(
         f"SA={top1_sa:.3f}/{purity_sa:.3f}, "
         f"EA={top1_ea:.3f}/{purity_ea:.3f}"
     )
+
+    # Persist geometry metrics
+    geom_row = {
+        "dataset": ds_name,
+        "collapse_sa_top1": geom_sa.collapse_top1,
+        "collapse_ea_top1": geom_ea.collapse_top1,
+        "collapse_sa_top5": geom_sa.collapse_top5,
+        "collapse_ea_top5": geom_ea.collapse_top5,
+        "mean_cos_sa": geom_sa.mean_cosine,
+        "mean_cos_ea": geom_ea.mean_cosine,
+        "cka_sa_ea": cka if emb_test_sa.shape == emb_test_ea.shape else float("nan"),
+        "neff_sa_mean": neff_sa_mean,
+        "neff_sa_std": neff_sa_std,
+        "neff_ea_mean": neff_ea_mean,
+        "neff_ea_std": neff_ea_std,
+        "purity_sa_top1": top1_sa,
+        "purity_sa_topk": purity_sa,
+        "purity_ea_top1": top1_ea,
+        "purity_ea_topk": purity_ea,
+    }
+    out_path = REPO_ROOT / "results" / "compare_mini_tabicl_geometry.csv"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    header = not out_path.exists()
+    pd.DataFrame([geom_row]).to_csv(out_path, mode="a", index=False, header=header)
 
 
 # ---------------------------------------------------------------------------
