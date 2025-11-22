@@ -561,7 +561,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--ea_checkpoint",
         type=str,
-        default=str(REPO_ROOT / "checkpoints_mini_tabicl_stage2_ea" / "step-1000.ckpt"),
+        default=str(REPO_ROOT / "checkpoints_mini_tabicl_stage2_ea" / "step-1000_ea.ckpt"),
         help="Stage-2 EA checkpoint path.",
     )
     ap.add_argument(
