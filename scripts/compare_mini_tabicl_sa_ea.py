@@ -1068,7 +1068,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--n_estimators",
         type=int,
-        default=8,
+        default=32,
         help="Number of ensemble estimators for TabICLClassifier.",
     )
     ap.add_argument(

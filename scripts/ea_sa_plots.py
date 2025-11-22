@@ -2,11 +2,12 @@
 """Generate EA vs SA plots suggested in the results discussion.
 
 Plots produced (saved to figures/ea_sa_plots by default):
-1) behaviour_tradeoff.png       : ΔF1 vs ΔNLL per dataset (behaviour file)
-2) delta_ece_box.png            : distribution of ΔECE per dataset
-3) geometry_pairs.png           : paired SA vs EA values for mean cosine and purity@k
-4) robustness_deltas.png        : mean Δacc and ΔNLL by corruption type
-5) cc18_delta_logloss_hist.png  : histogram of per-dataset Δlog-loss on CC18
+1) behaviour_tradeoff.pdf         : ΔF1 vs ΔNLL per dataset (behaviour file)
+2) delta_ece_box.pdf              : distribution of ΔECE per dataset
+3) geometry_pairs_cosine.pdf      : paired SA vs EA values for mean cosine
+4) geometry_pairs_purity.pdf      : paired SA vs EA values for purity@k
+5) robustness_deltas.pdf          : mean Δacc and ΔNLL by corruption type
+6) cc18_delta_logloss_hist.pdf    : histogram of per-dataset Δlog-loss on CC18
 """
 
 from __future__ import annotations
@@ -117,24 +118,75 @@ def delta_ece_boxplot(df: pd.DataFrame, out_path: Path) -> None:
     plt.close()
 
 
-def geometry_pairs_plot(df: pd.DataFrame, out_path: Path) -> None:
-    fig, axes = plt.subplots(1, 2, figsize=(10, 4), sharey=False)
+def geometry_pairs_plots(df: pd.DataFrame, out_dir: Path) -> None:
+    # Identify datasets with the largest decrease and increase
+    # in cosine and purity (EA - SA).
+    df = df.copy()
+    df["delta_cos"] = df["mean_cos_ea"] - df["mean_cos_sa"]
+    df["delta_purity"] = df["purity_ea_topk"] - df["purity_sa_topk"]
 
-    def _paired_lines(ax, sa_col: str, ea_col: str, ylabel: str):
+    cos_decrease_dataset = df.loc[df["delta_cos"].idxmin(), "dataset"]
+    cos_increase_dataset = df.loc[df["delta_cos"].idxmax(), "dataset"]
+    purity_decrease_dataset = df.loc[df["delta_purity"].idxmin(), "dataset"]
+    purity_increase_dataset = df.loc[df["delta_purity"].idxmax(), "dataset"]
+
+    def _paired_lines(
+        ax,
+        sa_col: str,
+        ea_col: str,
+        ylabel: str,
+        highlight_labels: dict[str, str],
+    ) -> None:
         for _, row in df.iterrows():
-            ax.plot(["SA", "EA"], [row[sa_col], row[ea_col]], marker="o", alpha=0.6)
+            dataset_name = row["dataset"]
+            is_highlight = dataset_name in highlight_labels
+            ax.plot(
+                ["SA", "EA"],
+                [row[sa_col], row[ea_col]],
+                marker="o",
+                alpha=0.9 if is_highlight else 0.3,
+                linewidth=2.5 if is_highlight else 1.0,
+                label=highlight_labels.get(dataset_name),
+            )
         ax.set_ylabel(ylabel)
 
-    _paired_lines(axes[0], "mean_cos_sa", "mean_cos_ea", "Mean cosine similarity")
-    axes[0].set_title("Representation tightness")
+    out_dir.mkdir(parents=True, exist_ok=True)
 
-    _paired_lines(axes[1], "purity_sa_topk", "purity_ea_topk", "Purity@k")
-    axes[1].set_title("Label purity of neighborhoods")
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
+    # Cosine plot with two highlighted datasets (largest decrease & increase)
+    fig_cos, ax_cos = plt.subplots(figsize=(5, 4))
+    _paired_lines(
+        ax_cos,
+        "mean_cos_sa",
+        "mean_cos_ea",
+        "Mean cosine similarity",
+        highlight_labels={
+            cos_decrease_dataset: f"{cos_decrease_dataset} (max cosine decrease)",
+            cos_increase_dataset: f"{cos_increase_dataset} (max cosine increase)",
+        },
+    )
+    ax_cos.set_title("Representation tightness (cosine)")
+    ax_cos.legend()
     plt.tight_layout()
-    plt.savefig(out_path, dpi=300)
-    plt.close()
+    fig_cos.savefig(out_dir / "geometry_pairs_cosine.pdf", dpi=300)
+    plt.close(fig_cos)
+
+    # Purity plot with two highlighted datasets (largest decrease & increase)
+    fig_pur, ax_pur = plt.subplots(figsize=(5, 4))
+    _paired_lines(
+        ax_pur,
+        "purity_sa_topk",
+        "purity_ea_topk",
+        "Purity@k",
+        highlight_labels={
+            purity_decrease_dataset: f"{purity_decrease_dataset} (max purity decrease)",
+            purity_increase_dataset: f"{purity_increase_dataset} (max purity increase)",
+        },
+    )
+    ax_pur.set_title("Label purity of neighbourhoods")
+    ax_pur.legend()
+    plt.tight_layout()
+    fig_pur.savefig(out_dir / "geometry_pairs_purity.pdf", dpi=300)
+    plt.close(fig_pur)
 
 
 def robustness_deltas_plot(df: pd.DataFrame, out_path: Path) -> None:
@@ -194,11 +246,11 @@ def main():
     rob = load_robustness()
     cc18 = load_cc18()
 
-    behaviour_tradeoff_plot(beh, out_dir / "behaviour_tradeoff.png")
-    delta_ece_boxplot(beh, out_dir / "delta_ece_box.png")
-    geometry_pairs_plot(geom, out_dir / "geometry_pairs.png")
-    robustness_deltas_plot(rob, out_dir / "robustness_deltas.png")
-    cc18_delta_logloss_hist(cc18, out_dir / "cc18_delta_logloss_hist.png")
+    behaviour_tradeoff_plot(beh, out_dir / "behaviour_tradeoff.pdf")
+    delta_ece_boxplot(beh, out_dir / "delta_ece_box.pdf")
+    geometry_pairs_plots(geom, out_dir)
+    robustness_deltas_plot(rob, out_dir / "robustness_deltas.pdf")
+    cc18_delta_logloss_hist(cc18, out_dir / "cc18_delta_logloss_hist.pdf")
     print(f"Saved plots to {out_dir}")
 
 
