@@ -258,7 +258,7 @@ def _compute_test_to_train_weights(
     model,
     R_cond: torch.Tensor,
     train_size: int,
-    chunk_test: int = 4096,
+    chunk_test: int = 1024,
     use_fp16: bool = True,
 ) -> torch.Tensor:
     """Mean-head test→train attention weights (T_test, T_train) with low memory."""
@@ -492,8 +492,8 @@ def analyze_dataset(
     # Attention collapse via N_eff from TFicl attention over train rows
     R_sa, train_size = _build_episode(clf_sa, X_te)
     R_ea, _ = _build_episode(clf_ea, X_te)
-    w_sa_tt = _compute_test_to_train_weights(clf_sa.model_, R_sa, train_size, chunk_test=2048)
-    w_ea_tt = _compute_test_to_train_weights(clf_ea.model_, R_ea, train_size, chunk_test=2048)
+    w_sa_tt = _compute_test_to_train_weights(clf_sa.model_, R_sa, train_size, chunk_test=1024)
+    w_ea_tt = _compute_test_to_train_weights(clf_ea.model_, R_ea, train_size, chunk_test=1024)
     neff_sa_mean, neff_sa_std = attention_neff_summary(w_sa_tt)
     neff_ea_mean, neff_ea_std = attention_neff_summary(w_ea_tt)
 
