@@ -250,6 +250,26 @@ class Trainer:
             for param in model.icl_predictor.parameters():
                 param.requires_grad = False
 
+        # Optional: train only the TabPDL head (when enabled)
+        if getattr(self.config, "train_pdlc_only", False) and getattr(self.config, "icl_head", "tabicl") == "tabpdl":
+            # Freeze all modules first
+            model.col_embedder.eval()
+            for p in model.col_embedder.parameters():
+                p.requires_grad = False
+            model.row_interactor.eval()
+            for p in model.row_interactor.parameters():
+                p.requires_grad = False
+            model.icl_predictor.eval()
+            for p in model.icl_predictor.parameters():
+                p.requires_grad = False
+
+            # Then unfreeze only the TabPDL head parameters
+            pdlc_head = getattr(model.icl_predictor, "pdlc_head", None)
+            if pdlc_head is not None:
+                pdlc_head.train()
+                for p in pdlc_head.parameters():
+                    p.requires_grad = True
+
         # Compile model if requested
         if self.config.model_compile:
             model = torch.compile(model, dynamic=True)
@@ -258,7 +278,15 @@ class Trainer:
 
         # Wrap model into DDP container if using distributed training
         if self.ddp:
-            self.model = DDP(model, device_ids=[self.ddp_local_rank], broadcast_buffers=False)
+            # Enable find_unused_parameters to support optional components
+            # such as the TabPDL head, which may not contribute gradients
+            # on every rank / step (e.g., due to data-dependent control flow).
+            self.model = DDP(
+                model,
+                device_ids=[self.ddp_local_rank],
+                broadcast_buffers=False,
+                find_unused_parameters=True,
+            )
             self.raw_model = self.model.module
         else:
             self.model = model

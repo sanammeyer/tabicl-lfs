@@ -193,6 +193,15 @@ def build_parser():
     parser.add_argument("--icl_nhead", type=int, default=4, help="Number of attention heads in ICL predictor")
     parser.add_argument("--freeze_icl", default=False, type=str2bool, help="Whether to freeze the ICL predictor")
     parser.add_argument(
+        "--train_pdlc_only",
+        default=False,
+        type=str2bool,
+        help=(
+            "If True and icl_head='tabpdl', train only the TabPDL head parameters "
+            "while freezing all other modules (COL, ROW, and the rest of ICL)."
+        ),
+    )
+    parser.add_argument(
         "--icl_elliptical",
         default=False,
         type=str2bool,
