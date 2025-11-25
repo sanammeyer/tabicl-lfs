@@ -213,6 +213,18 @@ class Trainer:
             "dropout": self.config.dropout,
             "activation": self.config.activation,
             "norm_first": self.config.norm_first,
+            "icl_head": getattr(self.config, "icl_head", "tabicl"),
+            "pdlc_config": {
+                "topk": getattr(self.config, "pdlc_topk", None),
+                "mlp_width": getattr(self.config, "pdlc_mlp_width", 512),
+                "mlp_depth": getattr(self.config, "pdlc_mlp_depth", 2),
+                "agg": getattr(self.config, "pdlc_agg", "posterior_avg"),
+                "embed_norm": getattr(self.config, "pdlc_embed_norm", "none"),
+                "dropout": getattr(self.config, "pdlc_dropout", 0.1),
+                "activation": getattr(self.config, "pdlc_activation", "silu"),
+                "layernorm_after_first": getattr(self.config, "pdlc_layernorm_after_first", True),
+                "feature_map": getattr(self.config, "pdlc_feature_map", "sym"),
+            },
         }
 
         model = TabICL(**self.model_config)

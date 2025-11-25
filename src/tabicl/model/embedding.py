@@ -246,6 +246,11 @@ class ColEmbedding(nn.Module):
                 use_amp=True,
                 verbose=False,
             )
+        # Ensure the inference manager runs on the same device as the
+        # embedding inputs/model so that parameters and inputs stay aligned.
+        # If the caller already set a device explicitly, we respect it.
+        if mgr_config.get("device", None) is None:
+            mgr_config.update({"device": X.device})
         self.inference_mgr.configure(**mgr_config)
 
         if feature_shuffles is None:

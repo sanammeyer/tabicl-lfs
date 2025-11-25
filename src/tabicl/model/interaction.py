@@ -201,6 +201,10 @@ class RowInteraction(nn.Module):
                 use_amp=True,
                 verbose=False,
             )
+        # Align inference device with the embeddings/model device unless
+        # the caller explicitly overrides it.
+        if mgr_config.get("device", None) is None:
+            mgr_config.update({"device": embeddings.device})
         self.inference_mgr.configure(**mgr_config)
 
         B, T = embeddings.shape[:2]

@@ -218,7 +218,72 @@ def build_parser():
         choices=["max", "mean"],
         help="Normalization of per-head scales: max (default) or mean",
     )
-    
+
+    # TabPDL-ICL head config
+    parser.add_argument(
+        "--icl_head",
+        type=str,
+        default="tabicl",
+        choices=["tabicl", "tabpdl"],
+        help="ICL prediction head: 'tabicl' (original MLP) or 'tabpdl' (pairwise PDLC-style head).",
+    )
+    parser.add_argument(
+        "--pdlc_topk",
+        type=int,
+        default=None,
+        help="If set and >0, use top-k gating in TabPDL head; 0 or None disables gating.",
+    )
+    parser.add_argument(
+        "--pdlc_mlp_width",
+        type=int,
+        default=512,
+        help="Hidden width of the TabPDL comparator MLP.",
+    )
+    parser.add_argument(
+        "--pdlc_mlp_depth",
+        type=int,
+        default=2,
+        help="Number of hidden layers in the TabPDL comparator MLP.",
+    )
+    parser.add_argument(
+        "--pdlc_agg",
+        type=str,
+        default="posterior_avg",
+        choices=["posterior_avg", "class_pool"],
+        help="Aggregation mode from pairwise scores to class posteriors for TabPDL head.",
+    )
+    parser.add_argument(
+        "--pdlc_embed_norm",
+        type=str,
+        default="none",
+        choices=["none", "l2", "layernorm"],
+        help="Embedding normalization applied before the TabPDL comparator.",
+    )
+    parser.add_argument(
+        "--pdlc_dropout",
+        type=float,
+        default=0.1,
+        help="Dropout probability in the TabPDL comparator MLP.",
+    )
+    parser.add_argument(
+        "--pdlc_activation",
+        type=str,
+        default="silu",
+        help="Activation function for the TabPDL comparator MLP (silu, gelu, relu).",
+    )
+    parser.add_argument(
+        "--pdlc_layernorm_after_first",
+        type=str2bool,
+        default=True,
+        help="Whether to apply LayerNorm after the first hidden layer in the TabPDL comparator MLP.",
+    )
+    parser.add_argument(
+        "--pdlc_feature_map",
+        type=str,
+        default="sym",
+        choices=["sym", "concat"],
+        help="Feature map for TabPDL comparator: 'sym' = [|hq-hs|, hq*hs], 'concat' = [hq, hs].",
+    )
 
     # Shared Architecture Config
     parser.add_argument("--ff_factor", type=int, default=2, help="Expansion factor for feedforward dimensions")

@@ -9,6 +9,7 @@ from .layers import ClassNode, OneHotAndLinear
 from .encoders import Encoder
 from .inference import InferenceManager
 from .inference_config import MgrConfig
+from tabicl.pdlc.head import TabPDLHead, TabPDLHeadConfig
 
 
 class ICLearning(nn.Module):
@@ -35,18 +36,28 @@ class ICLearning(nn.Module):
     nhead : int
         Number of attention heads of the ICL encoder
 
-    dim_feedforward : int
-        Dimension of the feedforward network of the ICL encoder
+        dim_feedforward : int
+            Dimension of the feedforward network of the ICL encoder
 
-    dropout : float, default=0.0
-        Dropout probability
+        dropout : float, default=0.0
+            Dropout probability
 
-    activation : str or unary callable, default="gelu"
-        The activation function used in the feedforward network, can be
-        either string ("relu" or "gelu") or unary callable
+        activation : str or unary callable, default="gelu"
+            The activation function used in the feedforward network, can be
+            either string ("relu" or "gelu") or unary callable
 
-    norm_first : bool, default=True
-        If True, uses pre-norm architecture (LayerNorm before attention and feedforward)
+        norm_first : bool, default=True
+            If True, uses pre-norm architecture (LayerNorm before attention and feedforward)
+
+        head : str, default="tabicl"
+            Prediction head used on top of the ICL encoder.
+            - "tabicl": original MLP head
+            - "tabpdl": pairwise-decomposition (PDLC-style) head
+
+        pdlc_config : Optional[TabPDLHeadConfig or dict], default=None
+            Optional configuration for the TabPDL head. When None and head="tabpdl",
+            a default configuration is used. When a dict is provided, its keys are
+            passed as keyword arguments to TabPDLHeadConfig.
     """
 
     def __init__(
@@ -62,11 +73,16 @@ class ICLearning(nn.Module):
         elliptical: bool = False,
         elliptical_delta: float = 1.0,
         elliptical_scale_mode: str = "max",
+        head: str = "tabicl",
+        pdlc_config: TabPDLHeadConfig | dict | None = None,
     ):
         super().__init__()
         self.max_classes = max_classes
         self.norm_first = norm_first
         self.elliptical = elliptical
+        self.head = head
+        if self.head not in {"tabicl", "tabpdl"}:
+            raise ValueError(f"Unknown ICL head '{self.head}'. Expected 'tabicl' or 'tabpdl'.")
 
         self.tf_icl = Encoder(
             num_blocks=num_blocks,
@@ -84,7 +100,24 @@ class ICLearning(nn.Module):
             self.ln = nn.LayerNorm(d_model)
 
         self.y_encoder = OneHotAndLinear(max_classes, d_model)
-        self.decoder = nn.Sequential(nn.Linear(d_model, d_model * 2), nn.GELU(), nn.Linear(d_model * 2, max_classes))
+        self.decoder = nn.Sequential(
+            nn.Linear(d_model, d_model * 2),
+            nn.GELU(),
+            nn.Linear(d_model * 2, max_classes),
+        )
+
+        # Optional TabPDL head (instantiated only when requested to keep checkpoints compatible)
+        if self.head == "tabpdl":
+            if pdlc_config is None:
+                cfg = TabPDLHeadConfig()
+            elif isinstance(pdlc_config, TabPDLHeadConfig):
+                cfg = pdlc_config
+            else:
+                cfg = TabPDLHeadConfig(**pdlc_config)
+            self.pdlc_head = TabPDLHead(d_model=d_model, cfg=cfg, max_classes=max_classes)
+        else:
+            self.pdlc_head = None
+        self.last_pdlc_aux: dict | None = None
 
         self.inference_mgr = InferenceManager(enc_name="tf_icl", out_dim=max_classes)
 
@@ -209,7 +242,7 @@ class ICLearning(nn.Module):
         return indices[torch.searchsorted(unique_vals, y)]
 
     def _icl_predictions(self, R: Tensor, y_train: Tensor) -> Tensor:
-        """In-context learning predictions.
+        """In-context learning predictions (train + test positions).
 
         Parameters
         ----------
@@ -225,11 +258,39 @@ class ICLearning(nn.Module):
         """
 
         train_size = y_train.shape[1]
+        # Label-condition support rows
+        R = R.clone()
         R[:, :train_size] = R[:, :train_size] + self.y_encoder(y_train.float())
+
+        # ICL encoder
         src = self.tf_icl(R, attn_mask=train_size)
         if self.norm_first:
             src = self.ln(src)
-        out = self.decoder(src)  # (B, T, max_classes)
+
+        # Head selection
+        if self.head == "tabicl" or self.pdlc_head is None:
+            out = self.decoder(src)  # (B, T, max_classes)
+        else:
+            # TabPDL head operates only on (support, query) embeddings and returns
+            # log-probabilities for query positions. We pack them back into a
+            # (B, T, max_classes) tensor to preserve existing interfaces.
+            B, T, _ = src.shape
+            H_support = src[:, :train_size, :]
+            H_query = src[:, train_size:, :]
+            # No padding in current training setup; mask all supports as valid.
+            support_mask = torch.ones_like(y_train, dtype=torch.bool)
+
+            logP_query, aux = self.pdlc_head(
+                H_support=H_support,
+                H_query=H_query,
+                y_support=y_train,
+                support_mask=support_mask,
+            )
+            self.last_pdlc_aux = aux
+
+            out = src.new_zeros((B, T, self.max_classes))
+            num_classes = logP_query.shape[-1]
+            out[:, train_size:, :num_classes] = logP_query
 
         return out
 
@@ -378,7 +439,7 @@ class ICLearning(nn.Module):
         softmax_temperature : float, default=0.9
             Temperature for the softmax function
 
-        mgr_config : MgrConfig, default=None
+            mgr_config : MgrConfig, default=None
             Configuration for InferenceManager
 
         Returns
@@ -397,6 +458,10 @@ class ICLearning(nn.Module):
                 use_amp=True,
                 verbose=False,
             )
+        # Make sure InferenceManager uses the same device as the row
+        # representations/model unless a device was explicitly set.
+        if mgr_config.get("device", None) is None:
+            mgr_config.update({"device": R.device})
         self.inference_mgr.configure(**mgr_config)
 
         num_classes = len(torch.unique(y_train[0]))

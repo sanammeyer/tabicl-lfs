@@ -95,6 +95,8 @@ class TabICL(nn.Module):
         dropout: float = 0.0,
         activation: str | callable = "gelu",
         norm_first: bool = True,
+        icl_head: str = "tabicl",
+        pdlc_config: dict | None = None,
     ):
         super().__init__()
         self.max_classes = max_classes
@@ -110,6 +112,8 @@ class TabICL(nn.Module):
         self.icl_num_blocks = icl_num_blocks
         self.icl_nhead = icl_nhead
         self.icl_elliptical = icl_elliptical
+        self.icl_head = icl_head
+        self.pdlc_config = pdlc_config
         self.elliptical_delta = elliptical_delta
         self.elliptical_scale_mode = elliptical_scale_mode
         self.ff_factor = ff_factor
@@ -159,6 +163,8 @@ class TabICL(nn.Module):
             elliptical=icl_elliptical,
             elliptical_delta=self.elliptical_delta,
             elliptical_scale_mode=self.elliptical_scale_mode,
+            head=self.icl_head,
+            pdlc_config=self.pdlc_config,
         )
 
     def _train_forward(

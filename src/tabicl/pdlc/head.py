@@ -415,3 +415,344 @@ def nll_accuracy(posteriors: np.ndarray, true_labels: np.ndarray, classes: np.nd
     nll = -np.log(np.take_along_axis(P, idx[:, None], axis=1) + eps).mean() if P.size else float("nan")
     acc = (P.argmax(axis=1) == idx).mean() if P.size else float("nan")
     return float(nll), float(acc)
+
+
+@dataclass
+class TabPDLHeadConfig:
+    """Configuration for the integrated TabPDL-ICL head.
+
+    This is intentionally lightweight so it can be passed around or
+    serialized in checkpoints without pulling in training-specific knobs.
+    """
+
+    topk: Optional[int] = None
+    mlp_width: int = 512
+    mlp_depth: int = 2
+    agg: str = "posterior_avg"  # or "class_pool"
+    embed_norm: str = "none"  # "none", "l2", "layernorm"
+    dropout: float = 0.1
+    activation: str = "silu"
+    layernorm_after_first: bool = True
+    feature_map: str = "sym"  # "sym" (|hq-hs| & hq*hs) or "concat" ([hq, hs])
+
+
+class TabPDLHead(nn.Module):
+    """Pairwise-decomposition head operating on ICL embeddings.
+
+    Given:
+        - H_support: (B, N, D)
+        - H_query:   (B, M, D)
+        - y_support: (B, N) with integer class ids
+        - support_mask: (B, N) boolean, True for valid anchors
+
+    it produces:
+        - logits_query: (B, M, C) where C is the number of unique
+          classes in y_support (padded by caller if needed)
+        - aux: dict with diagnostics (pair logits/probs, optional indices)
+    """
+
+    def __init__(self, d_model: int, cfg: TabPDLHeadConfig, max_classes: int):
+        super().__init__()
+        self.d_model = d_model
+        self.max_classes = max_classes
+        self.cfg = cfg
+
+        # Optional embedding normalization
+        if cfg.embed_norm not in {"none", "l2", "layernorm"}:
+            raise ValueError(f"embed_norm must be one of 'none', 'l2', 'layernorm', got {cfg.embed_norm}")
+        self.ln_emb = nn.LayerNorm(d_model) if cfg.embed_norm == "layernorm" else None
+
+        # Comparator MLP on feature map Phi(q,i)
+        # - sym:    Phi = [|hq - hs|, hq * hs]  -> R^{2D}
+        # - concat: Phi = [hq, hs]              -> R^{2D}
+        if cfg.feature_map not in {"sym", "concat"}:
+            raise ValueError(f"feature_map must be 'sym' or 'concat', got {cfg.feature_map}")
+        in_dim = 2 * d_model
+        layers: list[nn.Module] = []
+        hidden = cfg.mlp_width
+        act_name = cfg.activation.lower()
+        if act_name == "silu":
+            act_cls = nn.SiLU
+        elif act_name == "gelu":
+            act_cls = nn.GELU
+        elif act_name == "relu":
+            act_cls = nn.ReLU
+        else:
+            raise ValueError(f"Unsupported activation '{cfg.activation}' for TabPDLHead.")
+
+        for i in range(cfg.mlp_depth):
+            layers.append(nn.Linear(in_dim if i == 0 else hidden, hidden))
+            layers.append(act_cls())
+            if cfg.layernorm_after_first and i == 0:
+                layers.append(nn.LayerNorm(hidden))
+            if cfg.dropout and cfg.dropout > 0:
+                layers.append(nn.Dropout(cfg.dropout))
+        layers.append(nn.Linear(hidden, 1))
+        self.comparator = nn.Sequential(*layers)
+
+        # Calibration: global temperature tau > 0 and bias b
+        # Initialize tau ~ 1.0 via inverse softplus
+        init_tau = 1.0
+        self._tau_param = nn.Parameter(torch.log(torch.expm1(torch.tensor(init_tau, dtype=torch.float32))))
+        self.bias = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+
+    @property
+    def tau(self) -> torch.Tensor:
+        # Ensure strictly positive temperature
+        return torch.nn.functional.softplus(self._tau_param) + 1e-6
+
+    def _normalize_embeddings(self, H: torch.Tensor) -> torch.Tensor:
+        if self.cfg.embed_norm == "none":
+            return H
+        if self.cfg.embed_norm == "l2":
+            return torch.nn.functional.normalize(H, p=2.0, dim=-1, eps=1e-12)
+        # layernorm
+        return self.ln_emb(H) if self.ln_emb is not None else H
+
+    def _pair_logits(
+        self,
+        H_query: torch.Tensor,
+        H_support: torch.Tensor,
+        support_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute pairwise logits ell(q, i) for all query-support pairs.
+
+        Shapes
+        ------
+        H_query : (B, M, D)
+        H_support : (B, N, D)
+        support_mask : (B, N) boolean
+
+        Returns
+        -------
+        Tensor
+            Pairwise logits of shape (B, M, N)
+        """
+
+        B, M, D = H_query.shape
+        _, N, _ = H_support.shape
+
+        # Optional top-k gating: preselect anchors per query using dot product
+        if self.cfg.topk is not None and self.cfg.topk > 0 and self.cfg.topk < N:
+            # Normalize for cosine-like scores regardless of embed_norm
+            Hq_norm = torch.nn.functional.normalize(H_query, p=2.0, dim=-1, eps=1e-12)
+            Hs_norm = torch.nn.functional.normalize(H_support, p=2.0, dim=-1, eps=1e-12)
+        else:
+            Hq_norm = H_query
+            Hs_norm = H_support
+
+        logits = H_query.new_zeros((B, M, N))
+
+        for b in range(B):
+            hq = H_query[b]  # (M, D)
+            hs = H_support[b]  # (N, D)
+            mask_b = support_mask[b]  # (N,)
+
+            if self.cfg.topk is not None and self.cfg.topk > 0 and self.cfg.topk < N:
+                # Cheap pre-score on normalized embeddings
+                sims = Hq_norm[b] @ Hs_norm[b].t()  # (M, N)
+                k = min(self.cfg.topk, int(mask_b.sum().item())) if mask_b.any() else 0
+                if k <= 0:
+                    continue
+                # We only consider valid anchors when selecting top-k
+                sims_masked = sims.masked_fill(~mask_b.unsqueeze(0), float("-inf"))
+                topk_vals, topk_idx = torch.topk(sims_masked, k=k, dim=-1)
+                # Gather selected supports per query: (M, k, D)
+                hs_sel = hs[topk_idx]  # (M, k, D)
+                hq_exp = hq.unsqueeze(1)  # (M, 1, D)
+                if self.cfg.feature_map == "sym":
+                    diff = (hq_exp - hs_sel).abs()
+                    prod = hq_exp * hs_sel
+                    phi = torch.cat([diff, prod], dim=-1)  # (M, k, 2D)
+                else:  # "concat"
+                    # Query first, then support
+                    phi = torch.cat([hq_exp.expand_as(hs_sel), hs_sel], dim=-1)  # (M, k, 2D)
+                pair_logits = self.comparator(phi).squeeze(-1)  # (M, k)
+                # Scatter back into full (M, N)
+                logits_b = logits[b]
+                logits_b.scatter_(1, topk_idx, pair_logits)
+                # Non-selected anchors stay at 0; mask will handle them downstream
+            else:
+                # Fully dense pairs
+                hq_exp = hq.unsqueeze(1)  # (M, 1, D)
+                hs_exp = hs.unsqueeze(0)  # (1, N, D)
+                if self.cfg.feature_map == "sym":
+                    diff = (hq_exp - hs_exp).abs()
+                    prod = hq_exp * hs_exp
+                    phi = torch.cat([diff, prod], dim=-1)  # (M, N, 2D)
+                else:  # "concat"
+                    phi = torch.cat([hq_exp.expand_as(hs_exp), hs_exp], dim=-1)  # (M, N, 2D)
+                logits[b] = self.comparator(phi).squeeze(-1)
+
+        # Apply mask: ignore padded anchors by setting logits to a large negative value
+        mask = support_mask.unsqueeze(1)  # (B, 1, N)
+        logits = logits.masked_fill(~mask, float("-inf"))
+        return logits
+
+    def _aggregate_posterior_avg(
+        self,
+        gamma: torch.Tensor,
+        y_support: torch.Tensor,
+        support_mask: torch.Tensor,
+        num_classes: int,
+    ) -> torch.Tensor:
+        """Posterior-average aggregation (primary PDLC-style aggregator).
+
+        For each anchor i with label c:
+            p_c^{(i)}   = gamma(q, i)
+            p_{c'}^{(i)} = (1 - gamma(q, i)) / (C-1) for c' != c
+
+        Then average over anchors (respecting masks) and renormalize.
+        """
+        B, M, N = gamma.shape
+        C = num_classes
+        eps = 1e-12
+        out = gamma.new_zeros((B, M, C))
+
+        for b in range(B):
+            g = gamma[b]  # (M, N)
+            y = y_support[b].long()  # (N,)
+            mask = support_mask[b]  # (N,)
+
+            if not mask.any():
+                continue
+
+            g = g[:, mask]  # (M, N_eff)
+            y = y[mask]  # (N_eff,)
+            N_eff = g.shape[1]
+
+            # Empirical episode prior over classes from supports
+            prior = torch.bincount(y, minlength=C).to(g.dtype)  # (C,)
+            prior = prior / torch.clamp(prior.sum(), min=eps)   # (C,)
+
+            # Positive vote for own class: sum_i gamma(q,i) * 1_{y_i}
+            oh = torch.nn.functional.one_hot(y, num_classes=C).to(g.dtype)  # (N_eff, C)
+            oh_exp = oh.unsqueeze(0).expand(M, -1, -1)  # (M, N_eff, C)
+            g_exp = g.unsqueeze(-1)  # (M, N_eff, 1)
+            pos_contrib = (g_exp * oh_exp).sum(dim=1)  # (M, C)
+
+            # Negative vote: distribute (1 - gamma(q,i)) to other classes ∝ prior
+            one_minus_g = 1.0 - g  # (M, N_eff)
+            denom = 1.0 - prior[y]  # (N_eff,)
+            denom = torch.clamp(denom, min=eps)
+            scale = one_minus_g / denom.unsqueeze(0)  # (M, N_eff)
+            scale_exp = scale.unsqueeze(-1)  # (M, N_eff, 1)
+            prior_exp = prior.view(1, 1, C)  # (1, 1, C)
+            neg_contrib = scale_exp * prior_exp  # (M, N_eff, C)
+            # Zero out own-class component in the negative vote
+            mask_other = (1.0 - oh).unsqueeze(0)  # (1, N_eff, C)
+            neg_contrib = neg_contrib * mask_other  # (M, N_eff, C)
+            neg_contrib = neg_contrib.sum(dim=1)  # (M, C)
+
+            # Average over anchors and renormalize
+            accum = (pos_contrib + neg_contrib) / float(N_eff)  # (M, C)
+            s = accum.sum(dim=-1, keepdim=True)  # (M, 1)
+            out[b] = accum / torch.clamp(s, min=eps)
+
+        return out
+
+    def _aggregate_class_pool(
+        self,
+        gamma: torch.Tensor,
+        y_support: torch.Tensor,
+        support_mask: torch.Tensor,
+        num_classes: int,
+    ) -> torch.Tensor:
+        """Simpler class-pooling aggregation for ablations.
+
+        p(y=c | q) ∝ ∑_{i: y_i=c} gamma(q, i)
+        """
+        B, M, N = gamma.shape
+        C = num_classes
+        eps = 1e-12
+        out = gamma.new_zeros((B, M, C))
+
+        for b in range(B):
+            g = gamma[b]  # (M, N)
+            y = y_support[b].long()  # (N,)
+            mask = support_mask[b]  # (N,)
+
+            if not mask.any():
+                continue
+
+            g = g[:, mask]  # (M, N_eff)
+            y = y[mask]  # (N_eff,)
+
+            # Scatter-add over classes
+            idx = y.unsqueeze(0).expand(g.shape[0], -1)  # (M, N_eff)
+            P = torch.zeros((g.shape[0], C), device=g.device, dtype=g.dtype)
+            P.scatter_add_(1, idx, g)
+
+            s = P.sum(dim=-1, keepdim=True)
+            out[b] = P / torch.clamp(s, min=eps)
+
+        return out
+
+    def forward(
+        self,
+        H_support: torch.Tensor,
+        H_query: torch.Tensor,
+        y_support: torch.Tensor,
+        support_mask: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, dict]:
+        """Compute query logits and auxiliary diagnostics.
+
+        Parameters
+        ----------
+        H_support : Tensor
+            Support embeddings of shape (B, N, D)
+
+        H_query : Tensor
+            Query embeddings of shape (B, M, D)
+
+        y_support : Tensor
+            Support labels of shape (B, N)
+
+        support_mask : Optional[Tensor], default=None
+            Boolean mask of shape (B, N) where True marks valid supports.
+
+        Returns
+        -------
+        logits_query : Tensor
+            Log-probabilities over classes for each query, shape (B, M, C)
+
+        aux : dict
+            Auxiliary diagnostics (pair logits, gammas, etc.)
+        """
+        if support_mask is None:
+            support_mask = torch.ones_like(y_support, dtype=torch.bool)
+
+        B, N, D = H_support.shape
+        _, M, _ = H_query.shape
+        assert D == self.d_model, f"Expected d_model={self.d_model}, got {D}"
+
+        # Normalize embeddings (optional, symmetric)
+        H_support = self._normalize_embeddings(H_support)
+        H_query = self._normalize_embeddings(H_query)
+
+        # Pairwise logits and calibrated probabilities
+        pair_logits = self._pair_logits(H_query, H_support, support_mask)  # (B, M, N)
+        tau = self.tau
+        gamma = torch.sigmoid((pair_logits - self.bias) / tau)  # (B, M, N)
+
+        # Determine number of classes present
+        # Assumes y_support are already encoded as contiguous ints per episode
+        num_classes = int(y_support.max().item()) + 1
+
+        if self.cfg.agg == "posterior_avg":
+            P = self._aggregate_posterior_avg(gamma, y_support, support_mask, num_classes)
+        elif self.cfg.agg == "class_pool":
+            P = self._aggregate_class_pool(gamma, y_support, support_mask, num_classes)
+        else:
+            raise ValueError(f"Unknown aggregation mode '{self.cfg.agg}' for TabPDLHead.")
+
+        eps = 1e-12
+        P = torch.clamp(P, min=eps)
+        logP = torch.log(P)
+
+        aux = {
+            "pair_logits": pair_logits.detach(),
+            "gamma": gamma.detach(),
+            "support_mask": support_mask.detach(),
+        }
+        return logP, aux
