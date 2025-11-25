@@ -931,6 +931,63 @@ class Trainer:
         if self.ddp:
             self.model.require_backward_grad_sync = micro_batch_idx == num_micro_batches - 1
 
+        # Choose loss based on ICL head type
+        icl_head = getattr(self.raw_model, "icl_head", "tabicl")
+
+        if icl_head == "tabpdl":
+            # Pairwise PDLC training: optimize a weighted BCE over query-support pairs.
+            with self.amp_ctx:
+                # Forward pass through full model to build representations and PDLC aux
+                pred = self.model(micro_X, y_train, micro_d)  # aggregated logits for metrics
+
+                # Retrieve pairwise logits S from PDLC head (shape: B, M, N)
+                enc = self.raw_model.icl_predictor
+                aux = getattr(enc, "last_pdlc_aux", None)
+                if aux is None or "pair_logits" not in aux:
+                    raise RuntimeError("PDLC head did not populate pair_logits in last_pdlc_aux.")
+                pair_logits = aux["pair_logits"]  # (B, M, N)
+
+                B, M, N = pair_logits.shape
+                # Build binary targets T_{ij} = 1 iff y_q == y_s
+                y_s = y_train  # (B, N)
+                y_q = y_test   # (B, M)
+                # Broadcast equality across query and support positions
+                T = (y_q.unsqueeze(-1) == y_s.unsqueeze(1)).float()  # (B, M, N)
+
+                # Optional support mask (currently all valid in training setup)
+                support_mask = aux.get("support_mask", torch.ones_like(y_s, dtype=torch.bool))
+                M_mask = support_mask.unsqueeze(1).expand_as(pair_logits)  # (B, M, N)
+
+                # Select valid pairs
+                S_flat = pair_logits[M_mask]
+                T_flat = T[M_mask]
+
+                # Dynamic positive class weight
+                eps = 1e-6
+                n_pos = T_flat.sum()
+                n_total = T_flat.numel()
+                n_neg = n_total - n_pos
+                pos_weight = n_neg / (n_pos + eps)
+                criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+                loss = criterion(S_flat, T_flat)
+
+            # Scale loss for gradient accumulation and backpropagate
+            scaled_loss = loss / num_micro_batches
+            self.scaler.scale(scaled_loss).backward()
+
+            # Metrics (classification CE/accuracy on aggregated logits, no grad)
+            with torch.no_grad():
+                micro_results = {}
+                pred_flat = pred.flatten(end_dim=-2)
+                true_flat = y_test.long().flatten()
+                ce_val = F.cross_entropy(pred_flat, true_flat)
+                micro_results["ce"] = (ce_val.item() / num_micro_batches)
+                accuracy = (pred_flat.argmax(dim=1) == true_flat).sum() / len(true_flat)
+                micro_results["accuracy"] = accuracy.item() / num_micro_batches
+
+            return micro_results
+
+        # Default: standard TabICL training with cross-entropy on query logits
         with self.amp_ctx:
             pred = self.model(micro_X, y_train, micro_d)  # (B, test_size, max_classes)
             pred = pred.flatten(end_dim=-2)

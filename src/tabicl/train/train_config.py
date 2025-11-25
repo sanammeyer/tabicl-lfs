@@ -257,7 +257,7 @@ def build_parser():
     parser.add_argument(
         "--pdlc_agg",
         type=str,
-        default="posterior_avg",
+        default="class_pool",
         choices=["posterior_avg", "class_pool"],
         help="Aggregation mode from pairwise scores to class posteriors for TabPDL head.",
     )

@@ -428,7 +428,7 @@ class TabPDLHeadConfig:
     topk: Optional[int] = None
     mlp_width: int = 512
     mlp_depth: int = 2
-    agg: str = "posterior_avg"  # or "class_pool"
+    agg: str = "class_pool"  # or "posterior_avg"
     embed_norm: str = "none"  # "none", "l2", "layernorm"
     dropout: float = 0.1
     activation: str = "silu"
@@ -457,38 +457,12 @@ class TabPDLHead(nn.Module):
         self.max_classes = max_classes
         self.cfg = cfg
 
-        # Optional embedding normalization
-        if cfg.embed_norm not in {"none", "l2", "layernorm"}:
-            raise ValueError(f"embed_norm must be one of 'none', 'l2', 'layernorm', got {cfg.embed_norm}")
-        self.ln_emb = nn.LayerNorm(d_model) if cfg.embed_norm == "layernorm" else None
+        # Mandatory LayerNorm to operate on semantic direction rather than magnitude
+        self.ln_emb = nn.LayerNorm(d_model)
 
-        # Comparator MLP on feature map Phi(q,i)
-        # - sym:    Phi = [|hq - hs|, hq * hs]  -> R^{2D}
-        # - concat: Phi = [hq, hs]              -> R^{2D}
-        if cfg.feature_map not in {"sym", "concat"}:
-            raise ValueError(f"feature_map must be 'sym' or 'concat', got {cfg.feature_map}")
-        in_dim = 2 * d_model
-        layers: list[nn.Module] = []
-        hidden = cfg.mlp_width
-        act_name = cfg.activation.lower()
-        if act_name == "silu":
-            act_cls = nn.SiLU
-        elif act_name == "gelu":
-            act_cls = nn.GELU
-        elif act_name == "relu":
-            act_cls = nn.ReLU
-        else:
-            raise ValueError(f"Unsupported activation '{cfg.activation}' for TabPDLHead.")
-
-        for i in range(cfg.mlp_depth):
-            layers.append(nn.Linear(in_dim if i == 0 else hidden, hidden))
-            layers.append(act_cls())
-            if cfg.layernorm_after_first and i == 0:
-                layers.append(nn.LayerNorm(hidden))
-            if cfg.dropout and cfg.dropout > 0:
-                layers.append(nn.Dropout(cfg.dropout))
-        layers.append(nn.Linear(hidden, 1))
-        self.comparator = nn.Sequential(*layers)
+        # Bilinear projections for query and support embeddings
+        self.W_Q = nn.Linear(d_model, d_model, bias=False)
+        self.W_K = nn.Linear(d_model, d_model, bias=False)
 
         # Calibration: global temperature tau > 0 and bias b
         # Initialize tau ~ 1.0 via inverse softplus
@@ -502,12 +476,12 @@ class TabPDLHead(nn.Module):
         return torch.nn.functional.softplus(self._tau_param) + 1e-6
 
     def _normalize_embeddings(self, H: torch.Tensor) -> torch.Tensor:
-        if self.cfg.embed_norm == "none":
-            return H
+        # Always apply LayerNorm as the primary normalization step
+        H = self.ln_emb(H)
+        # Optional additional L2 normalization on top of LayerNorm
         if self.cfg.embed_norm == "l2":
-            return torch.nn.functional.normalize(H, p=2.0, dim=-1, eps=1e-12)
-        # layernorm
-        return self.ln_emb(H) if self.ln_emb is not None else H
+            H = torch.nn.functional.normalize(H, p=2.0, dim=-1, eps=1e-12)
+        return H
 
     def _pair_logits(
         self,
@@ -532,61 +506,37 @@ class TabPDLHead(nn.Module):
         B, M, D = H_query.shape
         _, N, _ = H_support.shape
 
-        # Optional top-k gating: preselect anchors per query using dot product
+        # Normalize embeddings first (LayerNorm + optional L2)
+        H_query = self._normalize_embeddings(H_query)   # (B, M, D)
+        H_support = self._normalize_embeddings(H_support)  # (B, N, D)
+
+        # Project queries and supports
+        Q = self.W_Q(H_query)   # (B, M, D)
+        K = self.W_K(H_support)  # (B, N, D)
+
+        # Bilinear similarity via batched matrix multiplication
+        # s_{ij} = tau * ( (h_q W_Q) · (h_s W_K)^T ) + b
+        logits = torch.matmul(Q, K.transpose(-1, -2))  # (B, M, N)
+        tau = self.tau
+        logits = tau * logits + self.bias
+
+        # Optional top-k gating: keep only top-k supports per query (others get large negative logits)
         if self.cfg.topk is not None and self.cfg.topk > 0 and self.cfg.topk < N:
-            # Normalize for cosine-like scores regardless of embed_norm
-            Hq_norm = torch.nn.functional.normalize(H_query, p=2.0, dim=-1, eps=1e-12)
-            Hs_norm = torch.nn.functional.normalize(H_support, p=2.0, dim=-1, eps=1e-12)
+            B, M, N = logits.shape
+            k = self.cfg.topk
+            # Respect support mask when selecting top-k
+            mask = support_mask.unsqueeze(1)  # (B, 1, N)
+            logits_masked = logits.masked_fill(~mask, float("-inf"))
+            _, topk_idx = torch.topk(logits_masked, k=min(k, N), dim=-1)
+            keep = torch.zeros_like(logits, dtype=torch.bool)
+            keep.scatter_(2, topk_idx, True)
+            # Positions not in top-k get strongly negative logits
+            logits = logits.masked_fill(~keep, float("-inf"))
         else:
-            Hq_norm = H_query
-            Hs_norm = H_support
+            # Apply support mask directly
+            mask = support_mask.unsqueeze(1)  # (B, 1, N)
+            logits = logits.masked_fill(~mask, float("-inf"))
 
-        logits = H_query.new_zeros((B, M, N))
-
-        for b in range(B):
-            hq = H_query[b]  # (M, D)
-            hs = H_support[b]  # (N, D)
-            mask_b = support_mask[b]  # (N,)
-
-            if self.cfg.topk is not None and self.cfg.topk > 0 and self.cfg.topk < N:
-                # Cheap pre-score on normalized embeddings
-                sims = Hq_norm[b] @ Hs_norm[b].t()  # (M, N)
-                k = min(self.cfg.topk, int(mask_b.sum().item())) if mask_b.any() else 0
-                if k <= 0:
-                    continue
-                # We only consider valid anchors when selecting top-k
-                sims_masked = sims.masked_fill(~mask_b.unsqueeze(0), float("-inf"))
-                topk_vals, topk_idx = torch.topk(sims_masked, k=k, dim=-1)
-                # Gather selected supports per query: (M, k, D)
-                hs_sel = hs[topk_idx]  # (M, k, D)
-                hq_exp = hq.unsqueeze(1)  # (M, 1, D)
-                if self.cfg.feature_map == "sym":
-                    diff = (hq_exp - hs_sel).abs()
-                    prod = hq_exp * hs_sel
-                    phi = torch.cat([diff, prod], dim=-1)  # (M, k, 2D)
-                else:  # "concat"
-                    # Query first, then support
-                    phi = torch.cat([hq_exp.expand_as(hs_sel), hs_sel], dim=-1)  # (M, k, 2D)
-                pair_logits = self.comparator(phi).squeeze(-1)  # (M, k)
-                # Scatter back into full (M, N)
-                logits_b = logits[b]
-                logits_b.scatter_(1, topk_idx, pair_logits)
-                # Non-selected anchors stay at 0; mask will handle them downstream
-            else:
-                # Fully dense pairs
-                hq_exp = hq.unsqueeze(1)  # (M, 1, D)
-                hs_exp = hs.unsqueeze(0)  # (1, N, D)
-                if self.cfg.feature_map == "sym":
-                    diff = (hq_exp - hs_exp).abs()
-                    prod = hq_exp * hs_exp
-                    phi = torch.cat([diff, prod], dim=-1)  # (M, N, 2D)
-                else:  # "concat"
-                    phi = torch.cat([hq_exp.expand_as(hs_exp), hs_exp], dim=-1)  # (M, N, 2D)
-                logits[b] = self.comparator(phi).squeeze(-1)
-
-        # Apply mask: ignore padded anchors by setting logits to a large negative value
-        mask = support_mask.unsqueeze(1)  # (B, 1, N)
-        logits = logits.masked_fill(~mask, float("-inf"))
         return logits
 
     def _aggregate_posterior_avg(
@@ -726,14 +676,9 @@ class TabPDLHead(nn.Module):
         _, M, _ = H_query.shape
         assert D == self.d_model, f"Expected d_model={self.d_model}, got {D}"
 
-        # Normalize embeddings (optional, symmetric)
-        H_support = self._normalize_embeddings(H_support)
-        H_query = self._normalize_embeddings(H_query)
-
-        # Pairwise logits and calibrated probabilities
+        # Pairwise logits via bilinear similarity and probabilities via sigmoid
         pair_logits = self._pair_logits(H_query, H_support, support_mask)  # (B, M, N)
-        tau = self.tau
-        gamma = torch.sigmoid((pair_logits - self.bias) / tau)  # (B, M, N)
+        gamma = torch.sigmoid(pair_logits)  # (B, M, N)
 
         # Determine number of classes present
         # Assumes y_support are already encoded as contiguous ints per episode
@@ -751,8 +696,8 @@ class TabPDLHead(nn.Module):
         logP = torch.log(P)
 
         aux = {
-            "pair_logits": pair_logits.detach(),
-            "gamma": gamma.detach(),
-            "support_mask": support_mask.detach(),
+            "pair_logits": pair_logits,
+            "gamma": gamma,
+            "support_mask": support_mask,
         }
         return logP, aux
