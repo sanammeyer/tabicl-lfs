@@ -447,9 +447,9 @@ class TabPDLHead(nn.Module):
 
     def __init__(self, d_model: int, cfg: TabPDLHeadConfig, max_classes: int):
         super().__init__()
-        self.d_model = d_model
-        self.max_classes = max_classes
-        self.cfg = cfg
+        self.d_model = d_model # embedding dimension
+        self.max_classes = max_classes # max number of classes supported
+        self.cfg = cfg # configuration for the head
 
         # Mandatory LayerNorm to operate on semantic direction rather than magnitude
         self.ln_emb = nn.LayerNorm(d_model)
@@ -548,7 +548,7 @@ class TabPDLHead(nn.Module):
 
         Then average over anchors (respecting masks) and renormalize.
         """
-        B, M, N = gamma.shape
+        B, M, N = gamma.shape # (batch, num queries, num supports)
         C = num_classes
         eps = 1e-12
         out = gamma.new_zeros((B, M, C))
