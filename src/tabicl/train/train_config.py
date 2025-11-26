@@ -243,18 +243,6 @@ def build_parser():
         help="If set and >0, use top-k gating in TabPDL head; 0 or None disables gating.",
     )
     parser.add_argument(
-        "--pdlc_mlp_width",
-        type=int,
-        default=512,
-        help="Hidden width of the TabPDL comparator MLP.",
-    )
-    parser.add_argument(
-        "--pdlc_mlp_depth",
-        type=int,
-        default=2,
-        help="Number of hidden layers in the TabPDL comparator MLP.",
-    )
-    parser.add_argument(
         "--pdlc_agg",
         type=str,
         default="class_pool",
@@ -267,31 +255,6 @@ def build_parser():
         default="none",
         choices=["none", "l2", "layernorm"],
         help="Embedding normalization applied before the TabPDL comparator.",
-    )
-    parser.add_argument(
-        "--pdlc_dropout",
-        type=float,
-        default=0.1,
-        help="Dropout probability in the TabPDL comparator MLP.",
-    )
-    parser.add_argument(
-        "--pdlc_activation",
-        type=str,
-        default="silu",
-        help="Activation function for the TabPDL comparator MLP (silu, gelu, relu).",
-    )
-    parser.add_argument(
-        "--pdlc_layernorm_after_first",
-        type=str2bool,
-        default=True,
-        help="Whether to apply LayerNorm after the first hidden layer in the TabPDL comparator MLP.",
-    )
-    parser.add_argument(
-        "--pdlc_feature_map",
-        type=str,
-        default="sym",
-        choices=["sym", "concat"],
-        help="Feature map for TabPDL comparator: 'sym' = [|hq-hs|, hq*hs], 'concat' = [hq, hs].",
     )
 
     # Shared Architecture Config

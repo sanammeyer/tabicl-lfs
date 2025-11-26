@@ -426,14 +426,8 @@ class TabPDLHeadConfig:
     """
 
     topk: Optional[int] = None
-    mlp_width: int = 512
-    mlp_depth: int = 2
     agg: str = "class_pool"  # or "posterior_avg"
     embed_norm: str = "none"  # "none", "l2", "layernorm"
-    dropout: float = 0.1
-    activation: str = "silu"
-    layernorm_after_first: bool = True
-    feature_map: str = "sym"  # "sym" (|hq-hs| & hq*hs) or "concat" ([hq, hs])
 
 
 class TabPDLHead(nn.Module):
