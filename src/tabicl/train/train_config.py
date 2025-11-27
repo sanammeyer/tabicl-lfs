@@ -256,6 +256,20 @@ def build_parser():
         choices=["none", "l2", "layernorm"],
         help="Embedding normalization applied before the TabPDL comparator.",
     )
+    parser.add_argument(
+        "--pdlc_tau_lr",
+        type=float,
+        default=None,
+        help="Optional learning rate override for the TabPDL temperature parameter tau; "
+        "when None, falls back to the global --lr.",
+    )
+    parser.add_argument(
+        "--pdlc_bias_lr",
+        type=float,
+        default=None,
+        help="Optional learning rate override for the TabPDL bias parameter; "
+        "when None, falls back to the global --lr.",
+    )
 
     # Shared Architecture Config
     parser.add_argument("--ff_factor", type=int, default=2, help="Expansion factor for feedforward dimensions")

@@ -101,6 +101,8 @@ class Trainer:
         self.csv_fields = [
             "step",
             "ce",
+            "bce",
+            "pdlc_tau",
             "accuracy",
             "lr",
             "prior_time",
@@ -338,13 +340,90 @@ class Trainer:
         )
 
     def configure_optimizer(self):
-        """Configure optimizer and scheduler (single parameter group)."""
-        params = [p for p in self.raw_model.parameters() if p.requires_grad]
-        self.optimizer = optim.AdamW(
-            params,
-            lr=float(self.config.lr),
-            weight_decay=float(self.config.weight_decay),
-        )
+        """Configure optimizer and scheduler.
+
+        Uses a single parameter group by default. When icl_head='tabpdl',
+        optionally separates the TabPDL temperature (tau) and bias into
+        their own parameter groups so they can use different learning rates.
+        """
+
+        base_lr = float(self.config.lr)
+        weight_decay = float(self.config.weight_decay)
+
+        # Special handling for TabPDL head: allow different LRs for tau / bias
+        icl_head = getattr(self.raw_model, "icl_head", "tabicl")
+        if icl_head == "tabpdl":
+            try:
+                pdlc_head = self.raw_model.icl_predictor.pdlc_head
+            except Exception:
+                pdlc_head = None
+
+            if pdlc_head is not None:
+                tau_param = getattr(pdlc_head, "_tau_param", None)
+                bias_param = getattr(pdlc_head, "bias", None)
+
+                # Separate parameters: everything except tau/bias goes into "other"
+                other_params = []
+                for p in self.raw_model.parameters():
+                    if not p.requires_grad:
+                        continue
+                    if tau_param is not None and p is tau_param:
+                        continue
+                    if bias_param is not None and p is bias_param:
+                        continue
+                    other_params.append(p)
+
+                param_groups = []
+                if other_params:
+                    param_groups.append(
+                        {"params": other_params, "lr": base_lr, "weight_decay": weight_decay}
+                    )
+
+                # Tau group (optional override LR)
+                if tau_param is not None and tau_param.requires_grad:
+                    tau_lr = getattr(self.config, "pdlc_tau_lr", None)
+                    if tau_lr is None or tau_lr <= 0:
+                        tau_lr = base_lr
+                    param_groups.append(
+                        {"params": [tau_param], "lr": float(tau_lr), "weight_decay": weight_decay}
+                    )
+
+                # Bias group (optional override LR)
+                if bias_param is not None and bias_param.requires_grad:
+                    bias_lr = getattr(self.config, "pdlc_bias_lr", None)
+                    if bias_lr is None or bias_lr <= 0:
+                        bias_lr = base_lr
+                    param_groups.append(
+                        {"params": [bias_param], "lr": float(bias_lr), "weight_decay": weight_decay}
+                    )
+
+                if param_groups:
+                    self.optimizer = optim.AdamW(param_groups)
+                else:
+                    # Fallback to uniform group if nothing was collected
+                    params = [p for p in self.raw_model.parameters() if p.requires_grad]
+                    self.optimizer = optim.AdamW(
+                        params,
+                        lr=base_lr,
+                        weight_decay=weight_decay,
+                    )
+            else:
+                # No PDLC head found; fall back to single group
+                params = [p for p in self.raw_model.parameters() if p.requires_grad]
+                self.optimizer = optim.AdamW(
+                    params,
+                    lr=base_lr,
+                    weight_decay=weight_decay,
+                )
+        else:
+            # Standard single-group optimizer
+            params = [p for p in self.raw_model.parameters() if p.requires_grad]
+            self.optimizer = optim.AdamW(
+                params,
+                lr=base_lr,
+                weight_decay=weight_decay,
+            )
+
         self.scheduler = get_scheduler(config=self.config, optimizer=self.optimizer)
 
     def _set_icl_qk_requires_grad(self, requires_grad: bool):
@@ -976,6 +1055,15 @@ class Trainer:
                 true_flat = y_test.long().flatten()
                 ce_val = F.cross_entropy(pred_flat, true_flat)
                 micro_results["ce"] = (ce_val.item() / num_micro_batches)
+                 # Log PDLC pairwise BCE (already scaled above)
+                micro_results["bce"] = (scaled_loss.item())
+                # Optional: log current PDLC temperature tau if available from aux
+                try:
+                    tau_val = aux.get("tau", None)
+                    if tau_val is not None:
+                        micro_results["pdlc_tau"] = float(tau_val) / num_micro_batches
+                except Exception:
+                    pass
                 accuracy = (pred_flat.argmax(dim=1) == true_flat).sum() / len(true_flat)
                 micro_results["accuracy"] = accuracy.item() / num_micro_batches
 
@@ -1036,7 +1124,8 @@ class Trainer:
         micro_batches = [torch.split(t, self.config.micro_batch_size, dim=0) for t in batch]
         micro_batches = list(zip(*micro_batches))
 
-        results = {"ce": 0.0, "accuracy": 0.0}
+        # Accumulate metrics across micro-batches; include optional BCE slot
+        results = {"ce": 0.0, "bce": 0.0, "pdlc_tau": 0.0, "accuracy": 0.0}
         failed_batches = 0
 
         for idx, micro_batch in enumerate(micro_batches):

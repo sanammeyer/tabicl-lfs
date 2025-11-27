@@ -459,7 +459,7 @@ class TabPDLHead(nn.Module):
         self.W_K = nn.Linear(d_model, d_model, bias=False)
 
         # Calibration: global temperature tau > 0 and bias b
-        # Initialize tau ~ 1.0 via inverse softplus
+        # Initialize tau > 1.0 via inverse softplus to sharpen pairwise decisions
         init_tau = 1.0
         self._tau_param = nn.Parameter(torch.log(torch.expm1(torch.tensor(init_tau, dtype=torch.float32))))
         self.bias = nn.Parameter(torch.zeros(1, dtype=torch.float32))
@@ -467,7 +467,8 @@ class TabPDLHead(nn.Module):
     @property
     def tau(self) -> torch.Tensor:
         # Ensure strictly positive temperature
-        return torch.nn.functional.softplus(self._tau_param) + 1e-6
+        val = torch.nn.functional.softplus(self._tau_param) + 1e-6
+        return torch.clamp(val, min=1.0)
 
     def _normalize_embeddings(self, H: torch.Tensor) -> torch.Tensor:
         # Always apply LayerNorm as the primary normalization step
@@ -622,13 +623,19 @@ class TabPDLHead(nn.Module):
             g = g[:, mask]  # (M, N_eff)
             y = y[mask]  # (N_eff,)
 
-            # Scatter-add over classes
+            # Scatter-add over classes (sum of gamma per class)
             idx = y.unsqueeze(0).expand(g.shape[0], -1)  # (M, N_eff)
-            P = torch.zeros((g.shape[0], C), device=g.device, dtype=g.dtype)
-            P.scatter_add_(1, idx, g)
+            P_sum = torch.zeros((g.shape[0], C), device=g.device, dtype=g.dtype)
+            P_sum.scatter_add_(1, idx, g)
 
-            s = P.sum(dim=-1, keepdim=True)
-            out[b] = P / torch.clamp(s, min=eps)
+            # Normalize by support count per class to obtain mean gamma
+            counts = torch.bincount(y, minlength=C).to(g.dtype)  # (C,)
+            counts = counts.clamp_min(1.0)  # avoid division by zero
+            P_mean = P_sum / counts.unsqueeze(0)  # (M, C)
+
+            # Renormalize across classes to obtain probabilities
+            s = P_mean.sum(dim=-1, keepdim=True)
+            out[b] = P_mean / torch.clamp(s, min=eps)
 
         return out
 
@@ -674,6 +681,11 @@ class TabPDLHead(nn.Module):
         pair_logits = self._pair_logits(H_query, H_support, support_mask)  # (B, M, N)
         gamma = torch.sigmoid(pair_logits)  # (B, M, N)
 
+        # Inference-only gating: drop low-confidence pair votes.
+        # Training stays dense to preserve gradient signal.
+        if not self.training:
+            gamma = gamma * (gamma > 0.5).to(gamma.dtype)
+
         # Determine number of classes present
         # Assumes y_support are already encoded as contiguous ints per episode
         num_classes = int(y_support.max().item()) + 1
@@ -693,5 +705,6 @@ class TabPDLHead(nn.Module):
             "pair_logits": pair_logits,
             "gamma": gamma,
             "support_mask": support_mask,
+            "tau": self.tau,
         }
         return logP, aux
