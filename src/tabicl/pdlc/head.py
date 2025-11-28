@@ -460,7 +460,7 @@ class TabPDLHead(nn.Module):
 
         # Calibration: global temperature tau > 0 and bias b
         # Initialize tau > 1.0 via inverse softplus to sharpen pairwise decisions
-        init_tau = 1.0
+        init_tau = 0.1
         self._tau_param = nn.Parameter(torch.log(torch.expm1(torch.tensor(init_tau, dtype=torch.float32))))
         self.bias = nn.Parameter(torch.zeros(1, dtype=torch.float32))
 
@@ -468,7 +468,7 @@ class TabPDLHead(nn.Module):
     def tau(self) -> torch.Tensor:
         # Ensure strictly positive temperature
         val = torch.nn.functional.softplus(self._tau_param) + 1e-6
-        return torch.clamp(val, min=1.0)
+        return val + 1e-6
 
     def _normalize_embeddings(self, H: torch.Tensor) -> torch.Tensor:
         # Always apply LayerNorm as the primary normalization step

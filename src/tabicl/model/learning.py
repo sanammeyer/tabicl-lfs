@@ -288,7 +288,10 @@ class ICLearning(nn.Module):
             )
             self.last_pdlc_aux = aux
 
-            out = src.new_zeros((B, T, self.max_classes))
+            # Initialize with -inf so that only valid PDLC logits can win
+            # when taking argmax over classes. Using zeros would bias
+            # towards unused classes since log-probabilities are <= 0.
+            out = src.new_full((B, T, self.max_classes), float("-inf"))
             num_classes = logP_query.shape[-1]
             out[:, train_size:, :num_classes] = logP_query
 
