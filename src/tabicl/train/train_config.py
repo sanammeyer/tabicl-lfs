@@ -270,6 +270,17 @@ def build_parser():
         help="Optional learning rate override for the TabPDL bias parameter; "
         "when None, falls back to the global --lr.",
     )
+    parser.add_argument(
+        "--pdlc_ce_weight",
+        type=float,
+        default=0.2,
+        help=(
+            "Optional weight for an auxiliary cross-entropy loss on TabPDL class "
+            "predictions. When >0 and icl_head='tabpdl', the total loss becomes "
+            "BCE(pairwise) + pdlc_ce_weight * CE(class), with CE gradients "
+            "restricted to the TabPDL head via detached embeddings."
+        ),
+    )
 
     # Shared Architecture Config
     parser.add_argument("--ff_factor", type=int, default=2, help="Expansion factor for feedforward dimensions")

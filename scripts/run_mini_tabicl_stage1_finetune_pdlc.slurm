@@ -1,40 +1,43 @@
 #!/bin/bash
 
-# SLURM job: Stage-1 end-to-end TabICL training (from pre-generated priors ONLY)
-# - Loads priors from a fixed directory; aborts if unavailable
-# - Enables elliptical attention in TFrow and TFicl
-# - Uses 4x A100 GPUs on a single node via torchrun
-# - Saves checkpoints every 5000 steps, keeping only the latest 3
+# SLURM job: PDLC-head fine-tuning for mini-TabICL Stage-1
+# - Uses withheld Stage-1 priors (indices >=100000)
+# - Starts from the Stage-2 SA checkpoint and adapts TFicl + PDLC head
 
 # SLURM Directives
-# Adjust cluster/partition to your environment if needed
-#SBATCH -J TabICL_S1_E2E           # Job name
-#SBATCH -o ./%x.%j.%N.out          # STDOUT log
-#SBATCH -e ./%x.%j.%N.err          # STDERR log
-#SBATCH --get-user-env             # Load user env
-#SBATCH --export=NONE              # Don't inherit submit shell env
+# Adjust cluster/partition if needed for your environment.
+#SBATCH -J mini-TabICL_S1_PDL_FT      # Job name
+#SBATCH -o ./%x.%j.%N.out             # STDOUT log
+#SBATCH -e ./%x.%j.%N.err             # STDERR log
+#SBATCH --get-user-env                # Load user env
+#SBATCH --export=NONE                 # Don't inherit submit shell env
 #SBATCH --clusters=hlai
-#SBATCH --partition=hlai_std       # Partition/queue
-#SBATCH --nodes=1                  # Single node
-#SBATCH --gpus-per-node=4          # GPUs per node (A100 80GB x4)
-#SBATCH --ntasks=1                 # One task
-#SBATCH --cpus-per-task=36         # CPU cores
-#SBATCH --mem=128G                 # RAM
-#SBATCH --time=168:00:00           # Max runtime
+#SBATCH --partition=hlai_std          # Partition/queue
+#SBATCH --nodes=1                     # Single node
+#SBATCH --gpus-per-node=4             # GPUs per node (A100 80GB x4)
+#SBATCH --ntasks=1                    # One task
+#SBATCH --cpus-per-task=36            # CPU cores
+#SBATCH --mem=128G                    # RAM
+#SBATCH --time=168:00:00              # Max runtime
 #SBATCH --mail-type=BEGIN,END,FAIL,TIME_LIMIT
 #SBATCH --mail-user=sanamjeet.meyer@campus.lmu.de
 set -euo pipefail
 
 module load slurm_setup || true
 
-# --- Paths (hard-coded) ---
+# --- Paths (hard-coded, adjust if needed) ---
 PROJECT_ROOT="/dss/dsshome1/0E/ra63pux2/Documents/thesis/code/tabicl-lfs"
 VENV_ACTIVATE="$PROJECT_ROOT/.tabicl/bin/activate"
 PY_SRC_DIR="$PROJECT_ROOT/src"
-# Checkpoints saved here
-CKPT_DIR="$PROJECT_ROOT/checkpoints_mini_tabicl_stage1_sa"
-# REQUIRED: Pre-generated priors directory (must exist and be readable)
+
+# Withheld Stage-1 priors (we start from index 100000)
 PRIOR_DIR="/dss/lxclscratch/0E/ra63pux2/ra63pux2/tabicl_s1_priors"
+LOAD_PRIOR_START=100000
+
+# Base checkpoint: mini-TabICL Stage-2 SA (self-attention)
+BASE_CKPT_PATH="$PROJECT_ROOT/checkpoints_mini_tabicl_stage2_sa/step-1000.ckpt"
+# Fine-tuning checkpoint directory (used by both phases)
+CKPT_DIR="$PROJECT_ROOT/checkpoints_mini_tabicl_stage1_pdlc"
 
 cd "$PROJECT_ROOT"
 if [[ -f "$VENV_ACTIVATE" ]]; then
@@ -55,8 +58,9 @@ export NCCL_IB_DISABLE=1
 export NCCL_P2P_DISABLE=0
 
 mkdir -p "$CKPT_DIR" || true
+mkdir -p "$PROJECT_ROOT/training_metrics" || true
 
-# --- Validate prior directory strictly (abort if not usable) ---
+# --- Sanity checks ---
 if [[ ! -d "$PRIOR_DIR" ]]; then
   echo "[ERROR] PRIOR_DIR does not exist: $PRIOR_DIR" >&2
   exit 1
@@ -73,20 +77,24 @@ fi
 if [[ ! -r "$PRIOR_DIR/metadata.json" ]]; then
   echo "[WARN] metadata.json not found in PRIOR_DIR; proceeding anyway" >&2
 fi
-echo "[INFO] Using pre-generated priors from: $PRIOR_DIR (files: $BATCH_COUNT)"
+if [[ ! -f "$BASE_CKPT_PATH" ]]; then
+  echo "[ERROR] Base checkpoint not found: $BASE_CKPT_PATH" >&2
+  exit 1
+fi
 
-echo "[INFO] Launching Stage-1 end-to-end training (elliptical in TFrow+TFicl, from disk)"
+echo "[INFO] Using Stage-1 priors from:   $PRIOR_DIR (files: $BATCH_COUNT, start_index=$LOAD_PRIOR_START)"
+echo "[INFO] Base Stage-2 SA checkpoint:  $BASE_CKPT_PATH"
+echo "[INFO] Fine-tune checkpoints will be saved to: $CKPT_DIR"
 
-# Checkpointing policy:
-#  - Save every 5000 steps via --save_temp_every 5000
-#  - Disable permanent checkpoints by setting --save_perm_every >> max_steps
-#  - Keep only the latest 3 temporary checkpoints via --max_checkpoints 3
+TRAIN_MODULE="tabicl.train.run"
+
+echo "[INFO] ===== PDLC fine-tuning on withheld Stage-1 priors (TFcol/TFrow frozen, TFicl+PDLC head trainable) ====="
 
 srun torchrun --standalone --nproc_per_node=4 \
-  -m tabicl.train.run \
+  -m "$TRAIN_MODULE" \
   --wandb_log False \
   --wandb_project mini-TabICL \
-  --wandb_name Stage1-E2E \
+  --wandb_name mini-S1-PDL-Finetune \
   --wandb_dir "$PROJECT_ROOT/wandb" \
   --wandb_mode disabled \
   --device cuda \
@@ -94,24 +102,19 @@ srun torchrun --standalone --nproc_per_node=4 \
   --amp True \
   --np_seed 42 \
   --torch_seed 42 \
-  --max_steps 25000 \
+  --max_steps 2000 \
   --batch_size 512 \
   --micro_batch_size 4 \
-  --lr 1e-4 \
+  --lr 2e-5 \
   --scheduler cosine_warmup \
-  --warmup_proportion 0.02 \
+  --warmup_proportion 0.1 \
   --gradient_clipping 1.0 \
   --prior_dir "$PRIOR_DIR" \
-  --load_prior_start 0 \
+  --load_prior_start "$LOAD_PRIOR_START" \
   --delete_after_load False \
   --prior_device cpu \
-  --batch_size_per_gp 4 \
-  --min_features 2 \
-  --max_features 100 \
-  --max_classes 10 \
-  --max_seq_len 1024 \
-  --min_train_size 0.1 \
-  --max_train_size 0.9 \
+  --checkpoint_path "$BASE_CKPT_PATH" \
+  --only_load_model True \
   --embed_dim 128 \
   --col_num_blocks 3 \
   --col_nhead 4 \
@@ -124,22 +127,24 @@ srun torchrun --standalone --nproc_per_node=4 \
   --icl_nhead 4 \
   --ff_factor 2 \
   --norm_first True \
-  --freeze_col False \
-  --freeze_row False \
+  --freeze_col True \
+  --freeze_row True \
   --freeze_icl False \
   --row_elliptical False \
   --icl_elliptical False \
+  --icl_head tabpdl \
   --checkpoint_dir "$CKPT_DIR" \
-  --save_temp_every 5000 \
-  --save_perm_every 25000 \
-  --max_checkpoints 3 \
-  --metrics_csv "$PROJECT_ROOT/training_metrics/mini_tabicl_stage1.csv" \
-  --probe_every 5000
+  --save_temp_every 500 \
+  --save_perm_every 2000 \
+  --metrics_csv "$PROJECT_ROOT/training_metrics/mini_tabicl_stage1_finetune.csv"
 
 EXIT_CODE=$?
 if [[ $EXIT_CODE -ne 0 ]]; then
-  echo "[ERROR] Training failed with exit code $EXIT_CODE" >&2
+  echo "[ERROR] PDLC head-only fine-tuning failed with exit code $EXIT_CODE" >&2
+else
+  echo "[INFO] PDLC head-only fine-tuning finished successfully at $(date)"
 fi
+
 if [[ -n "${VIRTUAL_ENV:-}" ]]; then
   deactivate || true
 fi

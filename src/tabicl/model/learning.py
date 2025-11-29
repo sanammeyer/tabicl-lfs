@@ -272,7 +272,7 @@ class ICLearning(nn.Module):
             out = self.decoder(src)  # (B, T, max_classes)
         else:
             # TabPDL head operates only on (support, query) embeddings and returns
-            # log-probabilities for query positions. We pack them back into a
+            # class scores (logits) for query positions. We pack them back into a
             # (B, T, max_classes) tensor to preserve existing interfaces.
             B, T, _ = src.shape
             H_support = src[:, :train_size, :]
@@ -280,7 +280,7 @@ class ICLearning(nn.Module):
             # No padding in current training setup; mask all supports as valid.
             support_mask = torch.ones_like(y_train, dtype=torch.bool)
 
-            logP_query, aux = self.pdlc_head(
+            logits_query, aux = self.pdlc_head(
                 H_support=H_support,
                 H_query=H_query,
                 y_support=y_train,
@@ -289,11 +289,10 @@ class ICLearning(nn.Module):
             self.last_pdlc_aux = aux
 
             # Initialize with -inf so that only valid PDLC logits can win
-            # when taking argmax over classes. Using zeros would bias
-            # towards unused classes since log-probabilities are <= 0.
+            # when taking argmax over classes.
             out = src.new_full((B, T, self.max_classes), float("-inf"))
-            num_classes = logP_query.shape[-1]
-            out[:, train_size:, :num_classes] = logP_query
+            num_classes = logits_query.shape[-1]
+            out[:, train_size:, :num_classes] = logits_query
 
         return out
 

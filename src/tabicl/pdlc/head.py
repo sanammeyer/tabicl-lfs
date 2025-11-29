@@ -428,6 +428,7 @@ class TabPDLHeadConfig:
     topk: Optional[int] = None
     agg: str = "class_pool"  # or "posterior_avg"
     embed_norm: str = "none"  # "none", "l2", "layernorm"
+    Inference_temperature: float = 0.1 # counter-acts the voting average
 
 
 class TabPDLHead(nn.Module):
@@ -547,9 +548,10 @@ class TabPDLHead(nn.Module):
             p_c^{(i)}   = gamma(q, i)
             p_{c'}^{(i)} = (1 - gamma(q, i)) / (C-1) for c' != c
 
-        Then average over anchors (respecting masks) and renormalize.
+        Returns unnormalized class scores (one per query and class).
+        A softmax over these scores is applied downstream.
         """
-        B, M, N = gamma.shape # (batch, num queries, num supports)
+        B, M, N = gamma.shape  # (batch, num queries, num supports)
         C = num_classes
         eps = 1e-12
         out = gamma.new_zeros((B, M, C))
@@ -568,7 +570,7 @@ class TabPDLHead(nn.Module):
 
             # Empirical episode prior over classes from supports
             prior = torch.bincount(y, minlength=C).to(g.dtype)  # (C,)
-            prior = prior / torch.clamp(prior.sum(), min=eps)   # (C,)
+            prior = prior / torch.clamp(prior.sum(), min=eps)  # (C,)
 
             # Positive vote for own class: sum_i gamma(q,i) * 1_{y_i}
             oh = torch.nn.functional.one_hot(y, num_classes=C).to(g.dtype)  # (N_eff, C)
@@ -589,10 +591,9 @@ class TabPDLHead(nn.Module):
             neg_contrib = neg_contrib * mask_other  # (M, N_eff, C)
             neg_contrib = neg_contrib.sum(dim=1)  # (M, C)
 
-            # Average over anchors and renormalize
+            # Average over anchors (respecting masks); keep as raw scores
             accum = (pos_contrib + neg_contrib) / float(N_eff)  # (M, C)
-            s = accum.sum(dim=-1, keepdim=True)  # (M, 1)
-            out[b] = accum / torch.clamp(s, min=eps)
+            out[b] = accum
 
         return out
 
@@ -633,9 +634,8 @@ class TabPDLHead(nn.Module):
             counts = counts.clamp_min(1.0)  # avoid division by zero
             P_mean = P_sum / counts.unsqueeze(0)  # (M, C)
 
-            # Renormalize across classes to obtain probabilities
-            s = P_mean.sum(dim=-1, keepdim=True)
-            out[b] = P_mean / torch.clamp(s, min=eps)
+            # Keep mean gamma as unnormalized class scores; softmax is applied later
+            out[b] = P_mean
 
         return out
 
@@ -646,7 +646,7 @@ class TabPDLHead(nn.Module):
         y_support: torch.Tensor,
         support_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, dict]:
-        """Compute query logits and auxiliary diagnostics.
+        """Compute query class log-scores and auxiliary diagnostics.
 
         Parameters
         ----------
@@ -665,10 +665,12 @@ class TabPDLHead(nn.Module):
         Returns
         -------
         logits_query : Tensor
-            Log-probabilities over classes for each query, shape (B, M, C)
+            Class log-scores over classes for each query, shape (B, M, C).
+            Downstream callers (ICLearning / TabICLClassifier) treat these as
+            logits: a softmax over logits_query yields normalized probabilities.
 
         aux : dict
-            Auxiliary diagnostics (pair logits, gammas, etc.)
+            Auxiliary diagnostics (pairwise logits for structure loss, gammas, etc.).
         """
         if support_mask is None:
             support_mask = torch.ones_like(y_support, dtype=torch.bool)
@@ -677,9 +679,27 @@ class TabPDLHead(nn.Module):
         _, M, _ = H_query.shape
         assert D == self.d_model, f"Expected d_model={self.d_model}, got {D}"
 
-        # Pairwise logits via bilinear similarity and probabilities via sigmoid
-        pair_logits = self._pair_logits(H_query, H_support, support_mask)  # (B, M, N)
-        gamma = torch.sigmoid(pair_logits)  # (B, M, N)
+        # ------------------------------------------------------------------
+        # Two-path design:
+        #  - pair_logits_structure: full gradient path (backbone + head), used for BCE.
+        #  - pair_logits_calib: detached-embedding path (head only), used to build
+        #    class-level scores for CE / NLL calibration.
+        # ------------------------------------------------------------------
+        if self.training:
+            # Structure path: gradients flow into backbone + head
+            pair_logits_structure = self._pair_logits(H_query, H_support, support_mask)  # (B, M, N)
+            # Calibration path: stop gradients at embeddings so CE only tunes the head
+            pair_logits_calib = self._pair_logits(
+                H_query.detach(),
+                H_support.detach(),
+                support_mask,
+            )
+        else:
+            # In eval, detaching does not matter; reuse a single pass
+            pair_logits_structure = self._pair_logits(H_query, H_support, support_mask)
+            pair_logits_calib = pair_logits_structure
+
+        gamma = torch.sigmoid(pair_logits_calib)  # (B, M, N)
 
         # Inference-only gating: drop low-confidence pair votes.
         # Training stays dense to preserve gradient signal.
@@ -691,20 +711,32 @@ class TabPDLHead(nn.Module):
         num_classes = int(y_support.max().item()) + 1
 
         if self.cfg.agg == "posterior_avg":
-            P = self._aggregate_posterior_avg(gamma, y_support, support_mask, num_classes)
+            scores = self._aggregate_posterior_avg(gamma, y_support, support_mask, num_classes)
         elif self.cfg.agg == "class_pool":
-            P = self._aggregate_class_pool(gamma, y_support, support_mask, num_classes)
+            scores = self._aggregate_class_pool(gamma, y_support, support_mask, num_classes)
         else:
             raise ValueError(f"Unknown aggregation mode '{self.cfg.agg}' for TabPDLHead.")
 
+        # scores are bounded in [0, 1]; convert to log-space so that downstream
+        # cross-entropy / softmax can achieve near-zero loss for confident
+        # predictions. Softmax(log(scores)) ∝ scores, i.e. final probabilities
+        # are scores normalized across classes.
         eps = 1e-12
-        P = torch.clamp(P, min=eps)
-        logP = torch.log(P)
+        logits_query = torch.log(torch.clamp(scores, min=eps))
+
+        # Optional inference-time temperature scaling on class logits.
+        # Training always uses raw log-scores; calibration is applied only at eval.
+        if (
+            not self.training
+            and getattr(self.cfg, "Inference_temperature", 0.0) is not None
+            and self.cfg.Inference_temperature > 0
+        ):
+            logits_query = logits_query / float(self.cfg.Inference_temperature)
 
         aux = {
-            "pair_logits": pair_logits,
+            "pair_logits": pair_logits_structure,
             "gamma": gamma,
             "support_mask": support_mask,
             "tau": self.tau,
         }
-        return logP, aux
+        return logits_query, aux

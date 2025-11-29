@@ -29,9 +29,9 @@ module load slurm_setup || true
 PROJECT_ROOT="${PROJECT_ROOT:-/dss/dsshome1/0E/ra63pux2/Documents/thesis/code/tabicl-lfs}"
 VENV_ACTIVATE="${VENV_ACTIVATE:-$PROJECT_ROOT/.tabicl/bin/activate}"   # path to your venv activate script
 PY_SRC_DIR="${PY_SRC_DIR:-$PROJECT_ROOT/src}"                          # so that `import tabicl` works
-CKPT_DIR_SA="${CKPT_DIR_SA:-$PROJECT_ROOT/checkpoints_mini_tabicl_stage2_sa}"                     # where checkpoints live
-CKPT_DIR_EA="${CKPT_DIR_EA:-$PROJECT_ROOT/checkpoints_mini_tabicl_stage2_ea}"                     # where checkpoints live
-
+#CKPT_DIR_SA="${CKPT_DIR_SA:-$PROJECT_ROOT/checkpoints_mini_tabicl_stage2_sa}"                     # where checkpoints live
+#CKPT_DIR_EA="${CKPT_DIR_EA:-$PROJECT_ROOT/checkpoints_mini_tabicl_stage2_ea}"                     # where checkpoints live
+CKPT_DIR_PDLC="${CKPT_DIR_PDLC:-$PROJECT_ROOT/checkpoints_mini_tabicl_stage2_pdlc}"                     # where checkpoints live
 echo "[INFO] Working directory before cd: $(pwd)"
 cd "$PROJECT_ROOT"
 echo "[INFO] Project root: $(pwd)"
@@ -64,12 +64,12 @@ export NCCL_IB_DISABLE=1
 export NCCL_P2P_DISABLE=0
 
 # Resolve checkpoints (absolute paths)
-CKPT_EA="$CKPT_DIR_EA/step-1000_ea.ckpt"
-CKPT_SA="$CKPT_DIR_SA/step-1000.ckpt"
+CKPT_PDLC="$CKPT_DIR_PDLC/step-1000-pdl.ckpt"
+#CKPT_SA="$CKPT_DIR_SA/step-1000.ckpt"
 
 
-echo "[INFO] Checkpoint dir: $CKPT_DIR_EA and $CKPT_DIR_SA"
-printf "[INFO] Looking for checkpoint files:\n  - %s\n  - %s\n" "$CKPT_EA" "$CKPT_SA"
+echo "[INFO] Checkpoint dir: $CKPT_DIR_PDLC"
+printf "[INFO] Looking for checkpoint files:\n  - %s\n" "$CKPT_PDLC"
 
 # Helper: run a single benchmark config
 run_benchmark() {
@@ -87,27 +87,15 @@ FAIL=0
 echo "[INFO] Starting OpenML-CC18 benchmark runs"
 
 # 1) TabICL @ step-1800.ckpt
-if [[ -f "$CKPT_EA" ]]; then
+if [[ -f "$CKPT_PDLC" ]]; then
   run_benchmark tabicl \
-    --checkpoint "$CKPT_EA" \
+    --checkpoint "$CKPT_PDLC" \
     --device cuda \
     --n_rows "$NO_LIMIT_ROWS" \
     --max_features 500 \
     --seed 42 || FAIL=1
 else
-  echo "[WARN] Missing checkpoint: $CKPT_EA — skipping this run"
-fi
-
-# 2) TabICL @ step-2000.ckpt
-if [[ -f "$CKPT_SA" ]]; then
-  run_benchmark tabicl \
-    --checkpoint "$CKPT_SA" \
-    --device cuda \
-    --n_rows "$NO_LIMIT_ROWS" \
-    --max_features 500 \
-    --seed 42 || FAIL=1
-else
-  echo "[WARN] Missing checkpoint: $CKPT_SA — skipping this run"
+  echo "[WARN] Missing checkpoint: $CKPT_PDLC — skipping this run"
 fi
 
 # Be tidy

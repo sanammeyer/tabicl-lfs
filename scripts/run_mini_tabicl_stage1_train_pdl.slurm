@@ -8,7 +8,7 @@
 
 # SLURM Directives
 # Adjust cluster/partition to your environment if needed
-#SBATCH -J TabICL_S1_E2E           # Job name
+#SBATCH -J TabPDL-ICL_S1_E2E           # Job name
 #SBATCH -o ./%x.%j.%N.out          # STDOUT log
 #SBATCH -e ./%x.%j.%N.err          # STDERR log
 #SBATCH --get-user-env             # Load user env
@@ -32,7 +32,7 @@ PROJECT_ROOT="/dss/dsshome1/0E/ra63pux2/Documents/thesis/code/tabicl-lfs"
 VENV_ACTIVATE="$PROJECT_ROOT/.tabicl/bin/activate"
 PY_SRC_DIR="$PROJECT_ROOT/src"
 # Checkpoints saved here
-CKPT_DIR="$PROJECT_ROOT/checkpoints_mini_tabicl_stage1_sa"
+CKPT_DIR="$PROJECT_ROOT/checkpoints_mini_tabicl_stage1_pdl"
 # REQUIRED: Pre-generated priors directory (must exist and be readable)
 PRIOR_DIR="/dss/lxclscratch/0E/ra63pux2/ra63pux2/tabicl_s1_priors"
 
@@ -133,7 +133,8 @@ srun torchrun --standalone --nproc_per_node=4 \
   --save_temp_every 5000 \
   --save_perm_every 25000 \
   --max_checkpoints 3 \
-  --metrics_csv "$PROJECT_ROOT/training_metrics/mini_tabicl_stage1.csv" \
+  --icl_head tabpdl \
+  --metrics_csv "$PROJECT_ROOT/training_metrics/mini_tabicl_stage1_pdl.csv" \
   --probe_every 5000
 
 EXIT_CODE=$?

@@ -1008,10 +1008,11 @@ class Trainer:
         icl_head = getattr(self.raw_model, "icl_head", "tabicl")
 
         if icl_head == "tabpdl":
-            # Pairwise PDLC training: optimize a weighted BCE over query-support pairs.
+            # Pairwise PDLC training: optimize a BCE over query-support pairs,
+            # optionally combined with an auxiliary CE term on class predictions.
             with self.amp_ctx:
                 # Forward pass through full model to build representations and PDLC aux
-                pred = self.model(micro_X, y_train, micro_d)  # aggregated logits for metrics
+                pred = self.model(micro_X, y_train, micro_d)  # class log-scores for queries
 
                 # Retrieve pairwise logits S from PDLC head (shape: B, M, N)
                 enc = self.raw_model.icl_predictor
@@ -1035,14 +1036,24 @@ class Trainer:
                 S_flat = pair_logits[M_mask]
                 T_flat = T[M_mask]
 
-                # Dynamic positive class weight
+                # Dynamic positive class weight for pairwise BCE
                 eps = 1e-6
                 n_pos = T_flat.sum()
                 n_total = T_flat.numel()
                 n_neg = n_total - n_pos
                 pos_weight = n_neg / (n_pos + eps)
                 criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-                loss = criterion(S_flat, T_flat)
+                loss_bce = criterion(S_flat, T_flat)
+
+                # Optional auxiliary CE on class predictions (head only via detach path)
+                lambda_ce = float(getattr(self.config, "pdlc_ce_weight", 0.0) or 0.0)
+                if lambda_ce > 0.0:
+                    pred_flat = pred.flatten(end_dim=-2)
+                    true_flat = y_test.long().flatten()
+                    loss_ce = F.cross_entropy(pred_flat, true_flat)
+                    loss = loss_bce + lambda_ce * loss_ce
+                else:
+                    loss = loss_bce
 
             # Scale loss for gradient accumulation and backpropagate
             scaled_loss = loss / num_micro_batches
@@ -1054,9 +1065,9 @@ class Trainer:
                 pred_flat = pred.flatten(end_dim=-2)
                 true_flat = y_test.long().flatten()
                 ce_val = F.cross_entropy(pred_flat, true_flat)
-                micro_results["ce"] = (ce_val.item() / num_micro_batches)
-                 # Log PDLC pairwise BCE (already scaled above)
-                micro_results["bce"] = (scaled_loss.item())
+                micro_results["ce"] = ce_val.item() / num_micro_batches
+                # Log PDLC pairwise BCE component (unscaled by CE weight)
+                micro_results["bce"] = (loss_bce.item() / num_micro_batches)
                 # Optional: log current PDLC temperature tau if available from aux
                 try:
                     tau_val = aux.get("tau", None)
