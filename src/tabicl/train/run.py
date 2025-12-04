@@ -1045,12 +1045,14 @@ class Trainer:
                 criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
                 loss_bce = criterion(S_flat, T_flat)
 
-                # Optional auxiliary CE on class predictions (head only via detach path)
+                # Optional auxiliary CE on class predictions (uses log-scores from head)
                 lambda_ce = float(getattr(self.config, "pdlc_ce_weight", 0.0) or 0.0)
                 if lambda_ce > 0.0:
                     pred_flat = pred.flatten(end_dim=-2)
                     true_flat = y_test.long().flatten()
-                    loss_ce = F.cross_entropy(pred_flat, true_flat)
+                    # pred contains log-scores; treat them as log-probabilities
+                    # for the calibration term via NLL loss.
+                    loss_ce = F.nll_loss(pred_flat, true_flat)
                     loss = loss_bce + lambda_ce * loss_ce
                 else:
                     loss = loss_bce

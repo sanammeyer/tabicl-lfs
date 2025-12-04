@@ -646,7 +646,7 @@ class TabPDLHead(nn.Module):
         y_support: torch.Tensor,
         support_mask: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, dict]:
-        """Compute query class log-scores and auxiliary diagnostics.
+        """Compute query class log-scores and auxiliary diagnostics (single path).
 
         Parameters
         ----------
@@ -679,32 +679,16 @@ class TabPDLHead(nn.Module):
         _, M, _ = H_query.shape
         assert D == self.d_model, f"Expected d_model={self.d_model}, got {D}"
 
-        # ------------------------------------------------------------------
-        # Two-path design:
-        #  - pair_logits_structure: full gradient path (backbone + head), used for BCE.
-        #  - pair_logits_calib: detached-embedding path (head only), used to build
-        #    class-level scores for CE / NLL calibration.
-        # ------------------------------------------------------------------
-        if self.training:
-            # Structure path: gradients flow into backbone + head
-            pair_logits_structure = self._pair_logits(H_query, H_support, support_mask)  # (B, M, N)
-            # Calibration path: stop gradients at embeddings so CE only tunes the head
-            pair_logits_calib = self._pair_logits(
-                H_query.detach(),
-                H_support.detach(),
-                support_mask,
-            )
-        else:
-            # In eval, detaching does not matter; reuse a single pass
-            pair_logits_structure = self._pair_logits(H_query, H_support, support_mask)
-            pair_logits_calib = pair_logits_structure
-
-        gamma = torch.sigmoid(pair_logits_calib)  # (B, M, N)
+        # Single-path design: run the comparator once on attached embeddings.
+        # The resulting pair_logits are used both for the pairwise BCE loss
+        # (structure learning) and, after aggregation, for the calibration loss.
+        pair_logits = self._pair_logits(H_query, H_support, support_mask)  # (B, M, N)
+        gamma = torch.sigmoid(pair_logits)  # (B, M, N)
 
         # Inference-only gating: drop low-confidence pair votes.
         # Training stays dense to preserve gradient signal.
-        if not self.training:
-            gamma = gamma * (gamma > 0.5).to(gamma.dtype)
+        #if not self.training:
+            #gamma = gamma * (gamma > 0.5).to(gamma.dtype)
 
         # Determine number of classes present
         # Assumes y_support are already encoded as contiguous ints per episode
@@ -734,7 +718,7 @@ class TabPDLHead(nn.Module):
             logits_query = logits_query / float(self.cfg.Inference_temperature)
 
         aux = {
-            "pair_logits": pair_logits_structure,
+            "pair_logits": pair_logits,
             "gamma": gamma,
             "support_mask": support_mask,
             "tau": self.tau,
