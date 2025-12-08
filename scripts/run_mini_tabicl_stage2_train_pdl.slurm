@@ -8,7 +8,7 @@
 
 # SLURM Directives
 # Adjust cluster/partition to your environment if needed
-#SBATCH -J TabPDL-ICL_S1_E2E           # Job name
+#SBATCH -J TabICL_S2_E2E           # Job name
 #SBATCH -o ./%x.%j.%N.out          # STDOUT log
 #SBATCH -e ./%x.%j.%N.err          # STDERR log
 #SBATCH --get-user-env             # Load user env
@@ -32,9 +32,13 @@ PROJECT_ROOT="/dss/dsshome1/0E/ra63pux2/Documents/thesis/code/tabicl-lfs"
 VENV_ACTIVATE="$PROJECT_ROOT/.tabicl/bin/activate"
 PY_SRC_DIR="$PROJECT_ROOT/src"
 # Checkpoints saved here
-CKPT_DIR="$PROJECT_ROOT/checkpoints_mini_tabicl_stage1_pdl"
+CKPT_DIR="$PROJECT_ROOT/checkpoints_mini_tabicl_stage2_pdl"
 # REQUIRED: Pre-generated priors directory (must exist and be readable)
-PRIOR_DIR="/dss/lxclscratch/0E/ra63pux2/ra63pux2/tabicl_s1_priors"
+PRIOR_DIR="/dss/lxclscratch/0E/ra63pux2/ra63pux2/mini_tabicl_s2_priors"
+# REQUIRED: Stage-1 checkpoint directory (used to initialize Stage-2)
+STAGE1_CKPT_DIR="${STAGE1_CKPT_DIR:-$PROJECT_ROOT/checkpoints_mini_tabicl_stage1_pdl}"
+# Optional: exact Stage-1 checkpoint file to load (overrides auto-detect latest)
+STAGE1_CKPT_PATH="${STAGE1_CKPT_PATH:-$PROJECT_ROOT/checkpoints_mini_tabicl_stage1_pdl/step-25000.ckpt}"
 
 cd "$PROJECT_ROOT"
 if [[ -f "$VENV_ACTIVATE" ]]; then
@@ -75,7 +79,28 @@ if [[ ! -r "$PRIOR_DIR/metadata.json" ]]; then
 fi
 echo "[INFO] Using pre-generated priors from: $PRIOR_DIR (files: $BATCH_COUNT)"
 
-echo "[INFO] Launching Stage-1 end-to-end training (elliptical in TFrow+TFicl, from disk)"
+# --- Resolve Stage-1 checkpoint (prefer explicit path) ---
+if [[ -n "$STAGE1_CKPT_PATH" ]]; then
+  if [[ ! -f "$STAGE1_CKPT_PATH" ]]; then
+    echo "[ERROR] STAGE1_CKPT_PATH does not exist: $STAGE1_CKPT_PATH" >&2
+    exit 1
+  fi
+  CHECKPOINT_PATH="$STAGE1_CKPT_PATH"
+else
+  if [[ ! -d "$STAGE1_CKPT_DIR" ]]; then
+    echo "[ERROR] STAGE1_CKPT_DIR does not exist: $STAGE1_CKPT_DIR" >&2
+    exit 1
+  fi
+  mapfile -t __s1_ckpts < <(find "$STAGE1_CKPT_DIR" -maxdepth 1 -type f -name 'step-*.ckpt')
+  if [[ ${#__s1_ckpts[@]} -eq 0 ]]; then
+    echo "[ERROR] No step-*.ckpt files found in $STAGE1_CKPT_DIR" >&2
+    exit 1
+  fi
+  CHECKPOINT_PATH=$(printf '%s\n' "${__s1_ckpts[@]}" | awk 'match($0,/step-([0-9]+)\.ckpt$/,a){print a[1]" "$0}' | sort -n | tail -n1 | cut -d' ' -f2)
+fi
+echo "[INFO] Loading Stage-1 weights from: $CHECKPOINT_PATH"
+
+echo "[INFO] Launching Stage-2 training (from disk priors, init from Stage-1)"
 
 # Checkpointing policy:
 #  - Save every 5000 steps via --save_temp_every 5000
@@ -94,26 +119,23 @@ srun torchrun --standalone --nproc_per_node=4 \
   --amp True \
   --np_seed 42 \
   --torch_seed 42 \
-  --max_steps 25000 \
-  --batch_size 512 \
-  --micro_batch_size 4 \
-  --lr 1e-4 \ 
+  --max_steps 1000 \
+  --batch_size 256 \
+  --micro_batch_size 1 \
+  --lr 1e-5 \
+  --scheduler polynomial_decay_warmup \
+  --warmup_proportion 0 \
+  --poly_decay_lr_end 5e-6 \
+  --poly_decay_power 2.0 \
   --pdlc_tau_lr 1e-2 \
   --pdlc_bias_lr 1e-3 \
-  --scheduler cosine_warmup \
-  --warmup_proportion 0.02 \
   --gradient_clipping 1.0 \
   --prior_dir "$PRIOR_DIR" \
   --load_prior_start 0 \
   --delete_after_load False \
   --prior_device cpu \
-  --batch_size_per_gp 4 \
-  --min_features 2 \
-  --max_features 100 \
-  --max_classes 10 \
-  --max_seq_len 1024 \
-  --min_train_size 0.1 \
-  --max_train_size 0.9 \
+  --checkpoint_path "$CHECKPOINT_PATH" \
+  --only_load_model True \
   --embed_dim 128 \
   --col_num_blocks 3 \
   --col_nhead 4 \
@@ -131,14 +153,12 @@ srun torchrun --standalone --nproc_per_node=4 \
   --freeze_icl False \
   --row_elliptical False \
   --icl_elliptical False \
-  --checkpoint_dir "$CKPT_DIR" \
-  --save_temp_every 5000 \
-  --save_perm_every 25000 \
-  --max_checkpoints 3 \
   --icl_head tabpdl \
   --pdlc_ce_weight 0.2 \
-  --metrics_csv "$PROJECT_ROOT/training_metrics/mini_tabicl_stage1_pdl.csv" \
-  --probe_every 5000
+  --checkpoint_dir "$CKPT_DIR" \
+  --save_temp_every 200 \
+  --save_perm_every 1000 \
+  --metrics_csv "$PROJECT_ROOT/training_metrics/mini_tabicl_stage2_pdl.csv" 
 
 EXIT_CODE=$?
 if [[ $EXIT_CODE -ne 0 ]]; then

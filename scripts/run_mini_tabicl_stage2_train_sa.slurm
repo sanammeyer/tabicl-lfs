@@ -153,7 +153,7 @@ srun torchrun --standalone --nproc_per_node=4 \
   --icl_elliptical False \
   --checkpoint_dir "$CKPT_DIR" \
   --save_temp_every 200 \
-  --save_perm_every 5000 \
+  --save_perm_every 1000 \
   --metrics_csv "$PROJECT_ROOT/training_metrics/mini_tabicl_stage2.csv" 
 
 EXIT_CODE=$?

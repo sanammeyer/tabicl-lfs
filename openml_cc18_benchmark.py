@@ -54,6 +54,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Output CSV path (default: results/cc18_<model>[_<ckptstem>].csv)",
     )
+    p.add_argument(
+        "--csv_postfix",
+        type=str,
+        default="",
+        help="String appended to default CSV filename after checkpoint stem (e.g. '_run1')",
+    )
     p.add_argument("--n_rows", type=int, default=10000, help="Skip datasets with more than this many rows")
     p.add_argument("--max_features", type=int, default=500, help="Skip datasets with more than this many features")
     p.add_argument("--max_classes", type=int, default=10, help="Skip datasets with more than this many classes")
@@ -424,7 +430,8 @@ def main():
     else:
         if args.model == "tabicl":
             ckptstem = Path(args.checkpoint).stem
-            out_path = out_dir / f"cc18_tabicl_{ckptstem}.csv"
+            postfix = args.csv_postfix or ""
+            out_path = out_dir / f"cc18_tabicl_{ckptstem}{postfix}.csv"
         else:
             out_path = out_dir / "cc18_tabpfn.csv"
 
