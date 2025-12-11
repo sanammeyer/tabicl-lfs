@@ -47,6 +47,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", type=str, default="auto", help="Device: auto|cpu|cuda")
     p.add_argument("--n_estimators", type=int, default=32, help="TabICL ensemble size")
     p.add_argument("--elliptical_scale_boost", type=float, default=1.0, help="Extra multiplicative factor for elliptical scale (ICL)")
+    p.add_argument(
+        "--pdlc_agg",
+        type=str,
+        default="class_pool",
+        choices=[None, "posterior_avg", "class_pool", "sum"],
+        help=(
+            "Optional override for PDLC aggregation mode at inference when using "
+            "a checkpoint trained with the TabPDL head. Ignored for standard TabICL."
+        ),
+    )
     p.add_argument("--limit", type=int, default=None, help="Limit number of tasks for quick runs")
     p.add_argument(
         "--output",
@@ -97,6 +107,7 @@ def evaluate_task_tabicl(
     checkpoint: str,
     n_estimators: int,
     elliptical_scale_boost: float,
+    pdlc_agg: Optional[str],
     n_rows: int,
     max_features: int,
     max_classes: int,
@@ -179,6 +190,7 @@ def evaluate_task_tabicl(
                 n_estimators=n_estimators,
                 elliptical_scale_boost=elliptical_scale_boost,
                 random_state=seed,
+                pdlc_agg=pdlc_agg,
             )
             t0 = time.perf_counter()
             clf.fit(X_train, y_train)
@@ -403,6 +415,7 @@ def main():
                     checkpoint=args.checkpoint,
                     n_estimators=args.n_estimators,
                     elliptical_scale_boost=args.elliptical_scale_boost,
+                    pdlc_agg=args.pdlc_agg,
                     n_rows=args.n_rows,
                     max_features=args.max_features,
                     max_classes=args.max_classes,

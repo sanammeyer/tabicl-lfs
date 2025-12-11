@@ -19,7 +19,7 @@ class TabPDLHeadConfig:
     """
 
     topk: Optional[int] = None
-    agg: str = "class_pool"  # or "posterior_avg"
+    agg: str = "class_pool"  # "class_pool", "posterior_avg", or "sum"
     embed_norm: str = "none"  # "none", "l2", "layernorm"
     Inference_temperature: float = 1.0 # counter-acts the voting average
 
@@ -231,6 +231,46 @@ class TabPDLHead(nn.Module):
             out[b] = P_mean
 
         return out
+    
+    def _aggregate_sum(
+        self,
+        gamma: torch.Tensor,
+        y_support: torch.Tensor,
+        support_mask: torch.Tensor,
+        num_classes: int,
+    ) -> torch.Tensor:
+        """Sum aggregation (Kernel Density / Evidence Mass).
+
+        Score(c) = Sum_{i: y_i=c} gamma(q, i)
+        
+        Unlike class_pool, this does NOT divide by the class count.
+        This allows the density of the support set to act as a prior:
+        dense clusters have more 'voting mass' than sparse outliers.
+        """
+        B, M, N = gamma.shape
+        C = num_classes
+        out = gamma.new_zeros((B, M, C))
+
+        for b in range(B):
+            g = gamma[b]  # (M, N)
+            y = y_support[b].long()  # (N,)
+            mask = support_mask[b]  # (N,)
+
+            if not mask.any():
+                continue
+
+            g = g[:, mask]  # (M, N_eff)
+            y = y[mask]  # (N_eff,)
+
+            # Scatter-add over classes (sum of gamma per class)
+            idx = y.unsqueeze(0).expand(g.shape[0], -1)  # (M, N_eff)
+            P_sum = torch.zeros((g.shape[0], C), device=g.device, dtype=g.dtype)
+            P_sum.scatter_add_(1, idx, g)
+
+            # CRITICAL: No division by counts. Return total mass.
+            out[b] = P_sum
+
+        return out
 
 
     def forward(
@@ -273,6 +313,8 @@ class TabPDLHead(nn.Module):
                     scores = self._aggregate_posterior_avg(gamma, y_support, support_mask, num_classes)
                 elif self.cfg.agg == "class_pool":
                     scores = self._aggregate_class_pool(gamma, y_support, support_mask, num_classes)
+                elif self.cfg.agg == "sum":
+                    scores = self._aggregate_sum(gamma, y_support, support_mask, num_classes)
                 else:
                     raise ValueError(f"Unknown aggregation mode '{self.cfg.agg}'")
 
@@ -288,12 +330,19 @@ class TabPDLHead(nn.Module):
             logits_query = torch.log(torch.clamp(scores, min=eps))
 
             # Optional inference-time temperature scaling
-            if (
-                not self.training
-                and getattr(self.cfg, "Inference_temperature", 0.0) is not None
-                and self.cfg.Inference_temperature > 0
-            ):
-                logits_query = logits_query / float(self.cfg.Inference_temperature)
+            if not self.training:
+                if self.cfg.agg == "sum":
+                    # For sum aggregation, scale by sqrt(N_eff) where N_eff is the
+                    # number of valid supports per table. This counteracts the
+                    # growth of evidence with support set size.
+                    N_eff = support_mask.sum(dim=1).clamp_min(1).to(logits_query.dtype)  # (B,)
+                    scale = torch.sqrt(N_eff).view(B, 1, 1)
+                    logits_query = logits_query / scale
+                elif (
+                    getattr(self.cfg, "Inference_temperature", 0.0) is not None
+                    and self.cfg.Inference_temperature > 0
+                ):
+                    logits_query = logits_query / float(self.cfg.Inference_temperature)
 
             return logits_query, aux
 
@@ -360,8 +409,10 @@ class TabPDLHead(nn.Module):
                 chunk_scores = self._aggregate_posterior_avg(chunk_gamma, y_support, support_mask, num_classes)
             elif self.cfg.agg == "class_pool":
                 chunk_scores = self._aggregate_class_pool(chunk_gamma, y_support, support_mask, num_classes)
+            elif self.cfg.agg == "sum":
+                chunk_scores = self._aggregate_sum(chunk_gamma, y_support, support_mask, num_classes)
             else:
-                raise ValueError(f"Unknown aggregation mode")
+                raise ValueError(f"Unknown aggregation mode '{self.cfg.agg}' for TabPDLHead.")
                 
             scores_list.append(chunk_scores)
             

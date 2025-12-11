@@ -200,6 +200,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         verbose: bool = False,
         inference_config: Optional[InferenceConfig | Dict] = None,
         elliptical_scale_boost: float = 1.0,
+        pdlc_agg: Optional[str] = None,
     ):
         self.n_estimators = n_estimators
         self.norm_methods = norm_methods
@@ -220,6 +221,8 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         self.verbose = verbose
         self.inference_config = inference_config
         self.elliptical_scale_boost = elliptical_scale_boost
+        # Optional override for PDLC aggregation at inference (for PDL head checkpoints)
+        self.pdlc_agg: Optional[str] = pdlc_agg
 
     # Compatibility shim for scikit-learn >=1.7 where BaseEstimator._validate_data was removed.
     # This method maintains the expected behavior used within this class, in particular preserving
@@ -353,8 +356,20 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         assert "config" in checkpoint, "The checkpoint doesn't contain the model configuration."
         assert "state_dict" in checkpoint, "The checkpoint doesn't contain the model state."
 
+        cfg = checkpoint["config"]
+        # Optional: override PDLC aggregation mode at inference when using a PDL head
+        try:
+            if getattr(self, "pdlc_agg", None) is not None:
+                if isinstance(cfg, dict) and cfg.get("icl_head", "tabicl") == "tabpdl":
+                    pdlc_conf = dict(cfg.get("pdlc_config") or {})
+                    pdlc_conf["agg"] = self.pdlc_agg
+                    cfg = dict(cfg)
+                    cfg["pdlc_config"] = pdlc_conf
+        except Exception:
+            pass
+
         self.model_path_ = model_path_
-        self.model_ = TabICL(**checkpoint["config"])
+        self.model_ = TabICL(**cfg)
         self.model_.load_state_dict(checkpoint["state_dict"])
         self.model_.eval()
         # Optional: set an extra multiplicative factor for elliptical scaling (diagnostics)
