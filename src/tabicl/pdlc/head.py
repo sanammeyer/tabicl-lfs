@@ -232,91 +232,144 @@ class TabPDLHead(nn.Module):
 
         return out
 
+
     def forward(
+            self,
+            H_support: torch.Tensor,
+            H_query: torch.Tensor,
+            y_support: torch.Tensor,
+            support_mask: Optional[torch.Tensor] = None,
+        ) -> tuple[torch.Tensor, dict]:
+            if support_mask is None:
+                support_mask = torch.ones_like(y_support, dtype=torch.bool)
+
+            B, N, D = H_support.shape
+            _, M, _ = H_query.shape
+            assert D == self.d_model, f"Expected d_model={self.d_model}, got {D}"
+
+            # Determine number of classes present
+            num_classes = int(y_support.max().item()) + 1
+            
+            # --- Memory Heuristic for Chunking ---
+            # If matrix size > 100 Million elements (approx 400MB float32), use chunking.
+            # This prevents OOM on Connect-4 (60k*4k) or Numerai (90k*9k).
+            # Only apply during inference to keep training graph simple.
+            matrix_size = B * M * N
+            should_chunk = (not self.training) and (matrix_size > 100_000_000)
+
+            if should_chunk:
+                # Run memory-efficient path
+                # Note: We return empty 'aux' because we didn't keep the full pairwise matrix.
+                scores = self._forward_chunked(
+                    H_support, H_query, y_support, support_mask, num_classes, chunk_size=1024
+                )
+                aux = {} # No diagnostics available in chunked mode
+            else:
+                # Run standard path (fastest for small/medium data)
+                pair_logits = self._pair_logits(H_query, H_support, support_mask)  # (B, M, N)
+                gamma = torch.sigmoid(pair_logits)  # (B, M, N)
+
+                if self.cfg.agg == "posterior_avg":
+                    scores = self._aggregate_posterior_avg(gamma, y_support, support_mask, num_classes)
+                elif self.cfg.agg == "class_pool":
+                    scores = self._aggregate_class_pool(gamma, y_support, support_mask, num_classes)
+                else:
+                    raise ValueError(f"Unknown aggregation mode '{self.cfg.agg}'")
+
+                aux = {
+                    "pair_logits": pair_logits,
+                    "gamma": gamma,
+                    "support_mask": support_mask,
+                    "tau": self.tau,
+                }
+
+            # --- Final Logits Conversion ---
+            eps = 1e-12
+            logits_query = torch.log(torch.clamp(scores, min=eps))
+
+            # Optional inference-time temperature scaling
+            if (
+                not self.training
+                and getattr(self.cfg, "Inference_temperature", 0.0) is not None
+                and self.cfg.Inference_temperature > 0
+            ):
+                logits_query = logits_query / float(self.cfg.Inference_temperature)
+
+            return logits_query, aux
+
+    def _forward_chunked(
         self,
         H_support: torch.Tensor,
         H_query: torch.Tensor,
         y_support: torch.Tensor,
-        support_mask: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, dict]:
-        """Compute query class log-scores and auxiliary diagnostics (single path).
-
-        Parameters
-        ----------
-        H_support : Tensor
-            Support embeddings of shape (B, N, D)
-
-        H_query : Tensor
-            Query embeddings of shape (B, M, D)
-
-        y_support : Tensor
-            Support labels of shape (B, N)
-
-        support_mask : Optional[Tensor], default=None
-            Boolean mask of shape (B, N) where True marks valid supports.
-
-        Returns
-        -------
-        logits_query : Tensor
-            Class log-scores over classes for each query, shape (B, M, C).
-            Downstream callers (ICLearning / TabICLClassifier) treat these as
-            logits: a softmax over logits_query yields normalized probabilities.
-
-        aux : dict
-            Auxiliary diagnostics (pairwise logits for structure loss, gammas, etc.).
+        support_mask: torch.Tensor,
+        num_classes: int,
+        chunk_size: int = 1024
+    ) -> torch.Tensor:
+        """Memory-efficient chunked inference. 
+        Iterates over query chunks, aggregates immediately, and discards pairwise logits.
         """
-        if support_mask is None:
-            support_mask = torch.ones_like(y_support, dtype=torch.bool)
-
         B, N, D = H_support.shape
         _, M, _ = H_query.shape
-        assert D == self.d_model, f"Expected d_model={self.d_model}, got {D}"
+        
+        # 1. Pre-process Supports (Do this ONCE)
+        # Normalize
+        H_sup_norm = self._normalize_embeddings(H_support)
+        # Project K
+        K = self.W_K(H_sup_norm) # (B, N, D)
+        K_T = K.transpose(-1, -2) # (B, D, N)
+        
+        # Normalize Queries (all at once is fine, it's O(M))
+        H_qry_norm = self._normalize_embeddings(H_query)
+        
+        scores_list = []
+        
+        # 2. Iterate over Query Chunks
+        for i in range(0, M, chunk_size):
+            # Slice Query Chunk
+            end_idx = min(i + chunk_size, M)
+            h_q_chunk = H_qry_norm[:, i:end_idx, :] # (B, m_chunk, D)
+            
+            # Project Q Chunk
+            Q_chunk = self.W_Q(h_q_chunk) # (B, m_chunk, D)
+            
+            # Compute Pairwise Logits for Chunk
+            # logits = tau * (Q @ K.T) + bias
+            chunk_logits = torch.matmul(Q_chunk, K_T)
+            chunk_logits = self.tau * chunk_logits + self.bias # (B, m_chunk, N)
+            
+            # Apply Masking (same logic as _pair_logits)
+            mask_expanded = support_mask.unsqueeze(1) # (B, 1, N)
+            chunk_logits = chunk_logits.masked_fill(~mask_expanded, float("-inf"))
+            
+            # --- Optional Top-K (if config enabled) ---
+            if self.cfg.topk is not None and 0 < self.cfg.topk < N:
+                # We must apply topk per chunk
+                _, topk_idx = torch.topk(chunk_logits, k=self.cfg.topk, dim=-1)
+                keep = torch.zeros_like(chunk_logits, dtype=torch.bool)
+                keep.scatter_(2, topk_idx, True)
+                chunk_logits = chunk_logits.masked_fill(~keep, float("-inf"))
+            # ------------------------------------------
 
-        # Single-path design: run the comparator once on attached embeddings.
-        # The resulting pair_logits are used both for the pairwise BCE loss
-        # (structure learning) and, after aggregation, for the calibration loss.
-        pair_logits = self._pair_logits(H_query, H_support, support_mask)  # (B, M, N)
-        gamma = torch.sigmoid(pair_logits)  # (B, M, N)
-
-        # Inference-only gating: drop low-confidence pair votes.
-        # Training stays dense to preserve gradient signal.
-        #if not self.training:
-            #gamma = gamma * (gamma > 0.5).to(gamma.dtype)
-
-        # Determine number of classes present
-        # Assumes y_support are already encoded as contiguous ints per episode
-        num_classes = int(y_support.max().item()) + 1
-
-        if self.cfg.agg == "posterior_avg":
-            scores = self._aggregate_posterior_avg(gamma, y_support, support_mask, num_classes)
-        elif self.cfg.agg == "class_pool":
-            scores = self._aggregate_class_pool(gamma, y_support, support_mask, num_classes)
-        else:
-            raise ValueError(f"Unknown aggregation mode '{self.cfg.agg}' for TabPDLHead.")
-
-        # scores are bounded in [0, 1]; convert to log-space so that downstream
-        # cross-entropy / softmax can achieve near-zero loss for confident
-        # predictions. Softmax(log(scores)) ∝ scores, i.e. final probabilities
-        # are scores normalized across classes.
-        eps = 1e-12
-        logits_query = torch.log(torch.clamp(scores, min=eps))
-
-        # Optional inference-time temperature scaling on class logits.
-        # Training always uses raw log-scores; calibration is applied only at eval.
-        if (
-            not self.training
-            and getattr(self.cfg, "Inference_temperature", 0.0) is not None
-            and self.cfg.Inference_temperature > 0
-        ):
-            logits_query = logits_query / float(self.cfg.Inference_temperature)
-
-        aux = {
-            "pair_logits": pair_logits,
-            "gamma": gamma,
-            "support_mask": support_mask,
-            "tau": self.tau,
-        }
-        return logits_query, aux
+            # Sigmoid
+            chunk_gamma = torch.sigmoid(chunk_logits) # (B, m_chunk, N)
+            
+            # Aggregate Immediately
+            # We reuse the existing aggregation functions, passing the chunked gamma
+            if self.cfg.agg == "posterior_avg":
+                chunk_scores = self._aggregate_posterior_avg(chunk_gamma, y_support, support_mask, num_classes)
+            elif self.cfg.agg == "class_pool":
+                chunk_scores = self._aggregate_class_pool(chunk_gamma, y_support, support_mask, num_classes)
+            else:
+                raise ValueError(f"Unknown aggregation mode")
+                
+            scores_list.append(chunk_scores)
+            
+            # Explicit delete to help allocator
+            del chunk_logits, chunk_gamma, Q_chunk
+        
+        # 3. Concatenate Class Scores
+        return torch.cat(scores_list, dim=1) # (B, M, C)
 
 
 
