@@ -201,6 +201,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         inference_config: Optional[InferenceConfig | Dict] = None,
         elliptical_scale_boost: float = 1.0,
         pdlc_agg: Optional[str] = None,
+        pdlc_inference_temperature: Optional[float] = None,
     ):
         self.n_estimators = n_estimators
         self.norm_methods = norm_methods
@@ -223,6 +224,8 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         self.elliptical_scale_boost = elliptical_scale_boost
         # Optional override for PDLC aggregation at inference (for PDL head checkpoints)
         self.pdlc_agg: Optional[str] = pdlc_agg
+        # Optional override for PDLC inference-time temperature (for PDL head checkpoints)
+        self.pdlc_inference_temperature: Optional[float] = pdlc_inference_temperature
 
     # Compatibility shim for scikit-learn >=1.7 where BaseEstimator._validate_data was removed.
     # This method maintains the expected behavior used within this class, in particular preserving
@@ -357,14 +360,16 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         assert "state_dict" in checkpoint, "The checkpoint doesn't contain the model state."
 
         cfg = checkpoint["config"]
-        # Optional: override PDLC aggregation mode at inference when using a PDL head
+        # Optional: override PDLC aggregation and inference temperature at inference when using a PDL head
         try:
-            if getattr(self, "pdlc_agg", None) is not None:
-                if isinstance(cfg, dict) and cfg.get("icl_head", "tabicl") == "tabpdl":
-                    pdlc_conf = dict(cfg.get("pdlc_config") or {})
+            if isinstance(cfg, dict) and cfg.get("icl_head", "tabicl") == "tabpdl":
+                pdlc_conf = dict(cfg.get("pdlc_config") or {})
+                if getattr(self, "pdlc_agg", None) is not None:
                     pdlc_conf["agg"] = self.pdlc_agg
-                    cfg = dict(cfg)
-                    cfg["pdlc_config"] = pdlc_conf
+                if getattr(self, "pdlc_inference_temperature", None) is not None:
+                    pdlc_conf["Inference_temperature"] = float(self.pdlc_inference_temperature)
+                cfg = dict(cfg)
+                cfg["pdlc_config"] = pdlc_conf
         except Exception:
             pass
 

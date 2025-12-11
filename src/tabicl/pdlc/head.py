@@ -21,7 +21,7 @@ class TabPDLHeadConfig:
     topk: Optional[int] = None
     agg: str = "class_pool"  # "class_pool", "posterior_avg", or "sum"
     embed_norm: str = "none"  # "none", "l2", "layernorm"
-    Inference_temperature: float = 1.0 # counter-acts the voting average
+    Inference_temperature: float = 2.0 # counter-acts the voting average
 
 
 class TabPDLHead(nn.Module):
@@ -331,14 +331,7 @@ class TabPDLHead(nn.Module):
 
             # Optional inference-time temperature scaling
             if not self.training:
-                if self.cfg.agg == "sum":
-                    # For sum aggregation, scale by sqrt(N_eff) where N_eff is the
-                    # number of valid supports per table. This counteracts the
-                    # growth of evidence with support set size.
-                    N_eff = support_mask.sum(dim=1).clamp_min(1).to(logits_query.dtype)  # (B,)
-                    scale = torch.sqrt(N_eff).view(B, 1, 1)
-                    logits_query = logits_query / scale
-                elif (
+                if (
                     getattr(self.cfg, "Inference_temperature", 0.0) is not None
                     and self.cfg.Inference_temperature > 0
                 ):
