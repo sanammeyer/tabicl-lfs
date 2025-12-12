@@ -220,6 +220,7 @@ class Trainer:
                 "topk": getattr(self.config, "pdlc_topk", None),
                 "agg": getattr(self.config, "pdlc_agg", "posterior_avg"),
                 "embed_norm": getattr(self.config, "pdlc_embed_norm", "none"),
+                "symmetrize": getattr(self.config, "pdlc_symmetrize", False),
             },
         }
 

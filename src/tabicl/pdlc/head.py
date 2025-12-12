@@ -21,7 +21,8 @@ class TabPDLHeadConfig:
     topk: Optional[int] = None
     agg: str = "class_pool"  # "class_pool", "posterior_avg", or "sum"
     embed_norm: str = "none"  # "none", "l2", "layernorm"
-    Inference_temperature: float = 1.0 # counter-acts the voting average
+    Inference_temperature: float = 1.0  # counter-acts the voting average
+    symmetrize: bool = False  # if True, use 0.5*(γ(q,a)+γ(a,q)) in aggregation
 
 
 class TabPDLHead(nn.Module):
@@ -127,6 +128,44 @@ class TabPDLHead(nn.Module):
             logits = logits.masked_fill(~mask, float("-inf"))
 
         return logits
+
+    def _pair_logits_reverse(
+        self,
+        H_support: torch.Tensor,
+        H_query: torch.Tensor,
+        support_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute reverse pairwise logits ell(a, q) with anchor masking on support side.
+
+        Parameters
+        ----------
+        H_support : Tensor
+            Support embeddings of shape (B, N, D) treated as queries in this call.
+
+        H_query : Tensor
+            Query embeddings of shape (B, M, D) treated as supports in this call.
+
+        support_mask : Tensor
+            Boolean mask of shape (B, N) over anchors (original supports).
+
+        Returns
+        -------
+        Tensor
+            Reverse pairwise logits of shape (B, N, M), with invalid anchors masked.
+        """
+        B, N, _ = H_support.shape
+        _, M, _ = H_query.shape
+
+        # In reverse call, all original queries are valid supports
+        all_query_mask = torch.ones((B, M), device=H_query.device, dtype=torch.bool)
+
+        # This call treats H_support as "queries" and H_query as "supports"
+        logits_sq = self._pair_logits(H_support, H_query, all_query_mask)  # (B, N, M)
+
+        # Mask invalid anchors along N dimension using original support_mask
+        logits_sq = logits_sq.masked_fill(~support_mask.unsqueeze(-1), float("-inf"))
+
+        return logits_sq
 
     def _aggregate_posterior_avg(
         self,
