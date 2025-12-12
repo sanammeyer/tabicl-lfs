@@ -21,7 +21,7 @@ class TabPDLHeadConfig:
     topk: Optional[int] = None
     agg: str = "class_pool"  # "class_pool", "posterior_avg", or "sum"
     embed_norm: str = "none"  # "none", "l2", "layernorm"
-    Inference_temperature: float = 2.0 # counter-acts the voting average
+    Inference_temperature: float = 1.0 # counter-acts the voting average
 
 
 class TabPDLHead(nn.Module):
@@ -130,65 +130,136 @@ class TabPDLHead(nn.Module):
 
     def _aggregate_posterior_avg(
         self,
-        gamma: torch.Tensor,
-        y_support: torch.Tensor,
-        support_mask: torch.Tensor,
+        gamma: torch.Tensor,         # (B, M, N)
+        y_support: torch.Tensor,     # (B, N)
+        support_mask: torch.Tensor,  # (B, N) bool
         num_classes: int,
     ) -> torch.Tensor:
-        """Posterior-average aggregation (primary PDLC-style aggregator).
-
-        For each anchor i with label c:
-            p_c^{(i)}   = gamma(q, i)
-            p_{c'}^{(i)} = (1 - gamma(q, i)) / (C-1) for c' != c
-
-        Returns unnormalized class scores (one per query and class).
-        A softmax over these scores is applied downstream.
         """
-        B, M, N = gamma.shape  # (batch, num queries, num supports)
-        C = num_classes
+        Memory-efficient PDLC-style posterior-average aggregation.
+
+        For each support i with label y_i:
+        - positive mass to class y_i: gamma(q, i)
+        - negative mass (1-gamma(q,i)) distributed to other classes c != y_i
+            proportional to prior[c], with renormalization by (1 - prior[y_i]).
+
+        Returns per-query class "scores" of shape (B, M, C).
+        """
         eps = 1e-12
-        out = gamma.new_zeros((B, M, C))
+        B, M, N = gamma.shape
+        C = num_classes
+        device = gamma.device
+        dtype = gamma.dtype
+
+        out = torch.zeros((B, M, C), device=device, dtype=dtype)
 
         for b in range(B):
-            g = gamma[b]  # (M, N)
-            y = y_support[b].long()  # (N,)
-            mask = support_mask[b]  # (N,)
+            mask = support_mask[b].bool()
+            N_eff = int(mask.sum().item())
 
-            if not mask.any():
+            if N_eff == 0:
+                # Fallback: no supports -> uniform distribution
+                out[b].fill_(1.0 / C)
                 continue
 
-            g = g[:, mask]  # (M, N_eff)
-            y = y[mask]  # (N_eff,)
-            N_eff = g.shape[1]
+            # Select valid supports
+            y = y_support[b][mask].long()          # (N_eff,)
+            g = gamma[b, :, mask]                  # (M, N_eff)
 
-            # Empirical episode prior over classes from supports
-            prior = torch.bincount(y, minlength=C).to(g.dtype)  # (C,)
-            prior = prior / torch.clamp(prior.sum(), min=eps)  # (C,)
+            # Episode prior over classes from supports
+            prior = torch.bincount(y, minlength=C).to(dtype)  # (C,)
+            prior = prior / prior.sum().clamp_min(eps)        # (C,)
 
-            # Positive vote for own class: sum_i gamma(q,i) * 1_{y_i}
-            oh = torch.nn.functional.one_hot(y, num_classes=C).to(g.dtype)  # (N_eff, C)
-            oh_exp = oh.unsqueeze(0).expand(M, -1, -1)  # (M, N_eff, C)
-            g_exp = g.unsqueeze(-1)  # (M, N_eff, 1)
-            pos_contrib = (g_exp * oh_exp).sum(dim=1)  # (M, C)
+            # Index matrix for scatter_add: (M, N_eff)
+            idx = y.unsqueeze(0).expand(M, N_eff)
 
-            # Negative vote: distribute (1 - gamma(q,i)) to other classes ∝ prior
-            one_minus_g = 1.0 - g  # (M, N_eff)
-            denom = 1.0 - prior[y]  # (N_eff,)
-            denom = torch.clamp(denom, min=eps)
-            scale = one_minus_g / denom.unsqueeze(0)  # (M, N_eff)
-            scale_exp = scale.unsqueeze(-1)  # (M, N_eff, 1)
-            prior_exp = prior.view(1, 1, C)  # (1, 1, C)
-            neg_contrib = scale_exp * prior_exp  # (M, N_eff, C)
-            # Zero out own-class component in the negative vote
-            mask_other = (1.0 - oh).unsqueeze(0)  # (1, N_eff, C)
-            neg_contrib = neg_contrib * mask_other  # (M, N_eff, C)
-            neg_contrib = neg_contrib.sum(dim=1)  # (M, C)
+            # --- Positive contribution: sum gamma per class ---
+            pos = torch.zeros((M, C), device=device, dtype=dtype)
+            pos.scatter_add_(dim=1, index=idx, src=g)  # adds g[:, i] into class y_i
 
-            # Average over anchors (respecting masks); keep as raw scores
-            accum = (pos_contrib + neg_contrib) / float(N_eff)  # (M, C)
-            out[b] = accum
+            # --- Negative contribution ---
+            # w(q,i) = (1 - gamma(q,i)) / (1 - prior[y_i])
+            one_minus = 1.0 - g                               # (M, N_eff)
+            denom = (1.0 - prior[y]).clamp_min(eps)           # (N_eff,)
+            w = one_minus / denom.unsqueeze(0)                # (M, N_eff)
+
+            # total_w(q) = sum_i w(q,i)
+            total_w = w.sum(dim=1, keepdim=True)              # (M, 1)
+
+            # w_by_class(q,c) = sum_{i: y_i=c} w(q,i)
+            w_by_class = torch.zeros((M, C), device=device, dtype=dtype)
+            w_by_class.scatter_add_(dim=1, index=idx, src=w)  # (M, C)
+
+            # For each class c:
+            # neg(q,c) = prior[c] * sum_{i: y_i != c} w(q,i)
+            #         = prior[c] * (total_w(q) - w_by_class(q,c))
+            neg = prior.unsqueeze(0) * (total_w - w_by_class)  # (M, C)
+
+            # Average over anchors
+            out[b] = (pos + neg) / float(N_eff)
 
         return out
+    # def _aggregate_posterior_avg(
+    #     self,
+    #     gamma: torch.Tensor,
+    #     y_support: torch.Tensor,
+    #     support_mask: torch.Tensor,
+    #     num_classes: int,
+    # ) -> torch.Tensor:
+    #     """Posterior-average aggregation (primary PDLC-style aggregator).
+
+    #     For each anchor i with label c:
+    #         p_c^{(i)}   = gamma(q, i)
+    #         p_{c'}^{(i)} = (1 - gamma(q, i)) / (C-1) for c' != c
+
+    #     Returns unnormalized class scores (one per query and class).
+    #     A softmax over these scores is applied downstream.
+    #     """
+    #     B, M, N = gamma.shape  # (batch, num queries, num supports)
+    #     C = num_classes
+    #     eps = 1e-12
+    #     out = gamma.new_zeros((B, M, C))
+
+    #     for b in range(B):
+    #         g = gamma[b]  # (M, N)
+    #         y = y_support[b].long()  # (N,)
+    #         mask = support_mask[b]  # (N,)
+
+    #         if not mask.any():
+    #             continue
+
+    #         g = g[:, mask]  # (M, N_eff)
+    #         y = y[mask]  # (N_eff,)
+    #         N_eff = g.shape[1]
+
+    #         # Empirical episode prior over classes from supports
+    #         prior = torch.bincount(y, minlength=C).to(g.dtype)  # (C,)
+    #         prior = prior / torch.clamp(prior.sum(), min=eps)  # (C,)
+
+    #         # Positive vote for own class: sum_i gamma(q,i) * 1_{y_i}
+    #         oh = torch.nn.functional.one_hot(y, num_classes=C).to(g.dtype)  # (N_eff, C)
+    #         oh_exp = oh.unsqueeze(0).expand(M, -1, -1)  # (M, N_eff, C)
+    #         g_exp = g.unsqueeze(-1)  # (M, N_eff, 1)
+    #         pos_contrib = (g_exp * oh_exp).sum(dim=1)  # (M, C)
+
+    #         # Negative vote: distribute (1 - gamma(q,i)) to other classes ∝ prior
+    #         one_minus_g = 1.0 - g  # (M, N_eff)
+    #         denom = 1.0 - prior[y]  # (N_eff,)
+    #         denom = torch.clamp(denom, min=eps)
+    #         scale = one_minus_g / denom.unsqueeze(0)  # (M, N_eff)
+    #         scale_exp = scale.unsqueeze(-1)  # (M, N_eff, 1)
+    #         prior_exp = prior.view(1, 1, C)  # (1, 1, C)
+    #         neg_contrib = scale_exp * prior_exp  # (M, N_eff, C)
+    #         # Zero out own-class component in the negative vote
+    #         mask_other = (1.0 - oh).unsqueeze(0)  # (1, N_eff, C)
+    #         neg_contrib = neg_contrib * mask_other  # (M, N_eff, C)
+    #         neg_contrib = neg_contrib.sum(dim=1)  # (M, C)
+
+    #         # Average over anchors (respecting masks); keep as raw scores
+    #         accum = (pos_contrib + neg_contrib) / float(N_eff)  # (M, C)
+    #         out[b] = accum
+
+    #     return out
 
     def _aggregate_class_pool(
         self,
