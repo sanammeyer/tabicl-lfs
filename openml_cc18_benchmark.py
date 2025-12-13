@@ -48,6 +48,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--n_estimators", type=int, default=32, help="TabICL ensemble size")
     p.add_argument("--elliptical_scale_boost", type=float, default=1.0, help="Extra multiplicative factor for elliptical scale (ICL)")
     p.add_argument(
+        "--pdlc_inference_temperature",
+        type=float,
+        default=None,
+        help=(
+            "Optional override for PDLC inference-time temperature when using "
+            "a checkpoint trained with the TabPDL head. Ignored for standard TabICL."
+        ),
+    )
+    p.add_argument(
         "--pdlc_agg",
         type=str,
         default="class_pool",

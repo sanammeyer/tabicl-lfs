@@ -31,7 +31,7 @@ VENV_ACTIVATE="${VENV_ACTIVATE:-$PROJECT_ROOT/.tabicl/bin/activate}"   # path to
 PY_SRC_DIR="${PY_SRC_DIR:-$PROJECT_ROOT/src}"                          # so that `import tabicl` works
 #CKPT_DIR_SA="${CKPT_DIR_SA:-$PROJECT_ROOT/checkpoints_mini_tabicl_stage2_sa}"                     # where checkpoints live
 #CKPT_DIR_EA="${CKPT_DIR_EA:-$PROJECT_ROOT/checkpoints_mini_tabicl_stage2_ea}"                     # where checkpoints live
-CKPT_DIR_PDLC="${CKPT_DIR_PDLC:-$PROJECT_ROOT/checkpoints_mini_tabicl_stage2_pdl}"                     # where checkpoints live
+CKPT_DIR_PDLC="${CKPT_DIR_PDLC:-$PROJECT_ROOT/checkpoints_mini_tabicl_stage2_pdl_posterior_avg}"                     # where checkpoints live
 echo "[INFO] Working directory before cd: $(pwd)"
 cd "$PROJECT_ROOT"
 echo "[INFO] Project root: $(pwd)"
@@ -92,7 +92,8 @@ if [[ -f "$CKPT_PDLC" ]]; then
     --device cuda \
     --n_rows "$NO_LIMIT_ROWS" \
     --max_features 500 \
-    --csv_postfix "pdlc_head" \
+    --pdlc_agg "posterior_avg" \
+    --csv_postfix "pdh_head_posterior_avg_trained" \
     --seed 42 || FAIL=1
 else
   echo "[WARN] Missing checkpoint: $CKPT_PDLC — skipping this run"
