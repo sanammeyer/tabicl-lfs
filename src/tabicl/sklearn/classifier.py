@@ -202,6 +202,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         elliptical_scale_boost: float = 1.0,
         pdlc_agg: Optional[str] = None,
         pdlc_inference_temperature: Optional[float] = None,
+        pdlc_symmetrize: Optional[bool] = None,
     ):
         self.n_estimators = n_estimators
         self.norm_methods = norm_methods
@@ -226,6 +227,8 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         self.pdlc_agg: Optional[str] = pdlc_agg
         # Optional override for PDLC inference-time temperature (for PDL head checkpoints)
         self.pdlc_inference_temperature: Optional[float] = pdlc_inference_temperature
+        # Optional override for PDLC symmetrization at inference (for PDL head checkpoints)
+        self.pdlc_symmetrize: Optional[bool] = pdlc_symmetrize
 
     # Compatibility shim for scikit-learn >=1.7 where BaseEstimator._validate_data was removed.
     # This method maintains the expected behavior used within this class, in particular preserving
@@ -368,6 +371,8 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
                     pdlc_conf["agg"] = self.pdlc_agg
                 if getattr(self, "pdlc_inference_temperature", None) is not None:
                     pdlc_conf["Inference_temperature"] = float(self.pdlc_inference_temperature)
+                if getattr(self, "pdlc_symmetrize", None) is not None:
+                    pdlc_conf["symmetrize"] = bool(self.pdlc_symmetrize)
                 cfg = dict(cfg)
                 cfg["pdlc_config"] = pdlc_conf
         except Exception:
@@ -375,6 +380,11 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
 
         self.model_path_ = model_path_
         self.model_ = TabICL(**cfg)
+        # Expose icl_head so downstream code can specialize behavior for TabPDL
+        try:
+            self.icl_head = getattr(self.model_, "icl_head", "tabicl")
+        except Exception:
+            self.icl_head = "tabicl"
         self.model_.load_state_dict(checkpoint["state_dict"])
         self.model_.eval()
         # Optional: set an extra multiplicative factor for elliptical scaling (diagnostics)
@@ -634,7 +644,20 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
 
         # Convert logits to probabilities if required
         if self.average_logits:
-            avg = self.softmax(avg, axis=-1, temperature=self.softmax_temperature)
+            # For the standard TabICL head, treat outputs as logits and apply
+            # temperature-scaled softmax. For the TabPDL head, outputs are
+            # already log-probabilities from the PDLC aggregation, so we
+            # exponentiate and renormalize instead of applying a second softmax.
+            icl_head = getattr(self, "icl_head", "tabicl")
+            if icl_head == "tabpdl":
+                # avg is log P(c|x); convert to probabilities in a numerically
+                # stable way without applying additional temperature scaling.
+                x = avg
+                x_max = np.max(x, axis=-1, keepdims=True)
+                e_x = np.exp(x - x_max)
+                avg = e_x / np.sum(e_x, axis=-1, keepdims=True)
+            else:
+                avg = self.softmax(avg, axis=-1, temperature=self.softmax_temperature)
 
         if self.n_jobs is not None:
             torch.set_num_threads(old_n_threads)

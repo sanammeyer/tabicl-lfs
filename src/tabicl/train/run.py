@@ -1052,8 +1052,8 @@ class Trainer:
                     pred_flat = pred.flatten(end_dim=-2)
                     true_flat = y_test.long().flatten()
                     # pred contains log-scores; treat them as log-probabilities
-                    # for the calibration term via NLL loss.
-                    loss_ce = F.nll_loss(pred_flat, true_flat)
+                    # for the calibration term via CE loss.
+                    loss_ce = F.cross_entropy(pred_flat, true_flat)
                     loss = loss_bce + lambda_ce * loss_ce
                 else:
                     loss = loss_bce

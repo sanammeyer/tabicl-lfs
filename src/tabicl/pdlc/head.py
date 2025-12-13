@@ -1,10 +1,8 @@
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
-from typing import Tuple, Optional
+from typing import Dict, Optional, Tuple
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -12,66 +10,118 @@ import torch.nn.functional as F
 
 @dataclass
 class TabPDLHeadConfig:
-    """Configuration for the integrated TabPDL-ICL head.
+    """Configuration for the TabPDLHead.
 
-    This is intentionally lightweight so it can be passed around or
-    serialized in checkpoints without pulling in training-specific knobs.
+    Attributes
+    ----------
+    topk:
+        If not None, keep only the top-k anchors per query and set the rest
+        to -inf before the sigmoid. Acts as a sparsifier / gating mechanism.
+    agg:
+        Aggregation mode. One of:
+        - "class_pool": mean gamma per class (density-agnostic voting)
+        - "posterior_avg": normalize class scores per query (posterior view)
+        - "sum": sum gamma per class (evidence mass / kernel density)
+    embed_norm:
+        Embedding normalization mode. Currently:
+        - "none" / "layernorm": apply LayerNorm only
+        - "l2": LayerNorm followed by L2-normalization
+    Inference_temperature:
+        Additional temperature scaling applied at inference time
+        (training is unaffected). Ignored when agg == "sum", where an
+        automatic sqrt(N) scaling is used instead.
+    symmetrize:
+        If True, use symmetrized pairwise scores:
+        gamma_sym(q, a) = 0.5 * (gamma(q, a) + gamma(a, q)).
+        Implemented for both training (non-chunked) and inference.
     """
 
     topk: Optional[int] = None
-    agg: str = "class_pool"  # "class_pool", "posterior_avg", or "sum"
-    embed_norm: str = "none"  # "none", "l2", "layernorm"
-    Inference_temperature: float = 1.0  # counter-acts the voting average
-    symmetrize: bool = False  # if True, use 0.5*(γ(q,a)+γ(a,q)) in aggregation
+    agg: str = "class_pool"
+    embed_norm: str = "none"
+    Inference_temperature: float = 1.0
+    symmetrize: bool = False
 
 
 class TabPDLHead(nn.Module):
-    """Pairwise-decomposition head operating on ICL embeddings.
+    """Pairwise Distance Learning (PDL) head for TabICL.
 
-    Given:
-        - H_support: (B, N, D)
-        - H_query:   (B, M, D)
-        - y_support: (B, N) with integer class ids
-        - support_mask: (B, N) boolean, True for valid anchors
-
-    it produces:
-        - logits_query: (B, M, C) where C is the number of unique
-          classes in y_support (padded by caller if needed)
-        - aux: dict with diagnostics (pair logits/probs, optional indices)
+    This head operates on the ICL embeddings and produces class-level
+    logits by:
+      1. Projecting query/support embeddings into a PDL metric space
+         via W_Q and W_K.
+      2. Computing pairwise logits ell(q, a) = tau * <Q_q, K_a> + bias.
+      3. Converting logits to pairwise "same-class" probabilities gamma.
+      4. Aggregating gamma over supports grouped by class.
     """
 
-    def __init__(self, d_model: int, cfg: TabPDLHeadConfig, max_classes: int):
-        super().__init__()
-        self.d_model = d_model # embedding dimension
-        self.max_classes = max_classes # max number of classes supported
-        self.cfg = cfg # configuration for the head
+    # Heuristic threshold for when to switch to chunked inference
+    _CHUNK_FLOP_THRESHOLD = 1e8
+    _CHUNK_SIZE = 1024
 
-        # Mandatory LayerNorm to operate on semantic direction rather than magnitude
+    def __init__(self, d_model: int, max_classes: int, cfg: TabPDLHeadConfig) -> None:
+        super().__init__()
+        self.d_model = d_model
+        self.max_classes = max_classes
+        self.cfg = cfg
+
+        # Embedding normalization
         self.ln_emb = nn.LayerNorm(d_model)
 
-        # Bilinear projections for query and support embeddings
+        # Projections into the PDL space
         self.W_Q = nn.Linear(d_model, d_model, bias=False)
         self.W_K = nn.Linear(d_model, d_model, bias=False)
 
-        # Calibration: global temperature tau > 0 and bias b
-        # Initialize tau > 1.0 via inverse softplus to sharpen pairwise decisions
-        init_tau = 0.1
-        self._tau_param = nn.Parameter(torch.log(torch.expm1(torch.tensor(init_tau, dtype=torch.float32))))
-        self.bias = nn.Parameter(torch.zeros(1, dtype=torch.float32))
+        # Learnable temperature (tau > 0 via softplus) and bias
+        self._tau_param = nn.Parameter(torch.zeros(()))
+        self.bias = nn.Parameter(torch.zeros(1))
 
+    # ------------------------------------------------------------------
+    # Properties / helpers
+    # ------------------------------------------------------------------
     @property
     def tau(self) -> torch.Tensor:
-        # Ensure strictly positive temperature
-        val = torch.nn.functional.softplus(self._tau_param) + 1e-6
-        return val + 1e-6
+        # Softplus to guarantee positivity; add small epsilon to avoid 0
+        return F.softplus(self._tau_param) + 1e-6
 
     def _normalize_embeddings(self, H: torch.Tensor) -> torch.Tensor:
-        # Always apply LayerNorm as the primary normalization step
-        H = self.ln_emb(H)
-        # Optional additional L2 normalization on top of LayerNorm
+        """Apply embedding normalization according to config.
+
+        We always apply LayerNorm for stability, and optionally L2-normalize.
+        """
+        Hn = self.ln_emb(H)
         if self.cfg.embed_norm == "l2":
-            H = torch.nn.functional.normalize(H, p=2.0, dim=-1, eps=1e-12)
-        return H
+            Hn = F.normalize(Hn, p=2.0, dim=-1)
+        # For "none" / "layernorm" we just return the LayerNorm output.
+        return Hn
+
+    # ------------------------------------------------------------------
+    # Pairwise logits
+    # ------------------------------------------------------------------
+    def _apply_support_mask_and_topk(
+        self,
+        logits: torch.Tensor,
+        support_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Apply support mask and optional top-k gating to logits."""
+        # Mask invalid anchors along the support dimension (N)
+        # logits: (B, M, N), support_mask: (B, N)
+        if support_mask is not None:
+            if support_mask.dtype is not torch.bool:
+                support_mask = support_mask.bool()
+            mask = support_mask.unsqueeze(1)  # (B, 1, N)
+            logits = logits.masked_fill(~mask, float("-inf"))
+
+        # Optional top-k gating per query
+        if self.cfg.topk is not None:
+            k = int(self.cfg.topk)
+            if k > 0 and k < logits.size(-1):
+                # Find per-query threshold
+                topk_vals, _ = logits.topk(k, dim=-1)
+                thresh = topk_vals[..., -1].unsqueeze(-1)  # (B, M, 1)
+                logits = logits.masked_fill(logits < thresh, float("-inf"))
+
+        return logits
 
     def _pair_logits(
         self,
@@ -79,375 +129,307 @@ class TabPDLHead(nn.Module):
         H_support: torch.Tensor,
         support_mask: torch.Tensor,
     ) -> torch.Tensor:
-        """Compute pairwise logits ell(q, i) for all query-support pairs.
+        """Compute pairwise logits ell(q, a) for all query-support pairs."""
+        # Normalize
+        Hq = self._normalize_embeddings(H_query)   # (B, M, D)
+        Hs = self._normalize_embeddings(H_support)  # (B, N, D)
 
-        Shapes
-        ------
-        H_query : (B, M, D)
-        H_support : (B, N, D)
-        support_mask : (B, N) boolean
+        # Project
+        Q = self.W_Q(Hq)  # (B, M, D)
+        K = self.W_K(Hs)  # (B, N, D)
 
-        Returns
-        -------
-        Tensor
-            Pairwise logits of shape (B, M, N)
-        """
-
-        B, M, D = H_query.shape
-        _, N, _ = H_support.shape
-
-        # Normalize embeddings first (LayerNorm + optional L2)
-        H_query = self._normalize_embeddings(H_query)   # (B, M, D)
-        H_support = self._normalize_embeddings(H_support)  # (B, N, D)
-
-        # Project queries and supports
-        Q = self.W_Q(H_query)   # (B, M, D)
-        K = self.W_K(H_support)  # (B, N, D)
-
-        # Bilinear similarity via batched matrix multiplication
-        # s_{ij} = tau * ( (h_q W_Q) · (h_s W_K)^T ) + b
+        # Bilinear score
         logits = torch.matmul(Q, K.transpose(-1, -2))  # (B, M, N)
-        tau = self.tau
-        logits = tau * logits + self.bias
+        logits = self.tau * logits + self.bias  # broadcast over (B, M, N)
 
-        # Optional top-k gating: keep only top-k supports per query (others get large negative logits)
-        if self.cfg.topk is not None and self.cfg.topk > 0 and self.cfg.topk < N:
-            B, M, N = logits.shape
-            k = self.cfg.topk
-            # Respect support mask when selecting top-k
-            mask = support_mask.unsqueeze(1)  # (B, 1, N)
-            logits_masked = logits.masked_fill(~mask, float("-inf"))
-            _, topk_idx = torch.topk(logits_masked, k=min(k, N), dim=-1)
-            keep = torch.zeros_like(logits, dtype=torch.bool)
-            keep.scatter_(2, topk_idx, True)
-            # Positions not in top-k get strongly negative logits
-            logits = logits.masked_fill(~keep, float("-inf"))
-        else:
-            # Apply support mask directly
-            mask = support_mask.unsqueeze(1)  # (B, 1, N)
-            logits = logits.masked_fill(~mask, float("-inf"))
-
+        # Mask + optional top-k
+        logits = self._apply_support_mask_and_topk(logits, support_mask)
         return logits
 
     def _pair_logits_reverse(
         self,
-        H_support: torch.Tensor,
-        H_query: torch.Tensor,
-        support_mask: torch.Tensor,
+        H_support: torch.Tensor,        # (B, N, D) -- treated as queries
+        H_query: torch.Tensor,          # (B, M, D) -- treated as supports
+        support_mask: torch.Tensor,     # (B, N)    -- mask over anchors
     ) -> torch.Tensor:
-        """Compute reverse pairwise logits ell(a, q) with anchor masking on support side.
+        """Compute reverse logits ell(a, q) with correct anchor masking.
 
-        Parameters
-        ----------
-        H_support : Tensor
-            Support embeddings of shape (B, N, D) treated as queries in this call.
-
-        H_query : Tensor
-            Query embeddings of shape (B, M, D) treated as supports in this call.
-
-        support_mask : Tensor
-            Boolean mask of shape (B, N) over anchors (original supports).
-
-        Returns
-        -------
-        Tensor
-            Reverse pairwise logits of shape (B, N, M), with invalid anchors masked.
+        The "queries" in this call are the anchors (support points) and are
+        masked by support_mask along the N dimension.
         """
-        B, N, _ = H_support.shape
-        _, M, _ = H_query.shape
+        # Normalize
+        Ha = self._normalize_embeddings(H_support)  # (B, N, D)
+        Hq = self._normalize_embeddings(H_query)    # (B, M, D)
 
-        # In reverse call, all original queries are valid supports
-        all_query_mask = torch.ones((B, M), device=H_query.device, dtype=torch.bool)
+        # Project
+        Q_a = self.W_Q(Ha)  # (B, N, D)
+        K_q = self.W_K(Hq)  # (B, M, D)
 
-        # This call treats H_support as "queries" and H_query as "supports"
-        logits_sq = self._pair_logits(H_support, H_query, all_query_mask)  # (B, N, M)
+        # Bilinear score ell(a, q): (B, N, M)
+        logits = torch.matmul(Q_a, K_q.transpose(-1, -2))
+        logits = self.tau * logits + self.bias
 
-        # Mask invalid anchors along N dimension using original support_mask
-        logits_sq = logits_sq.masked_fill(~support_mask.unsqueeze(-1), float("-inf"))
+        # Mask invalid anchors on the query side (N dimension)
+        if support_mask is not None:
+            logits = logits.masked_fill(~support_mask.unsqueeze(-1), float("-inf"))
 
-        return logits_sq
+        return logits  # (B, N, M)
 
-    def _aggregate_posterior_avg(
-        self,
-        gamma: torch.Tensor,         # (B, M, N)
-        y_support: torch.Tensor,     # (B, N)
-        support_mask: torch.Tensor,  # (B, N) bool
-        num_classes: int,
-    ) -> torch.Tensor:
+    # ------------------------------------------------------------------
+    # Aggregators
+    # ------------------------------------------------------------------
+    def _aggregate_posterior_avg(self, gamma, y_support, support_mask, num_classes):
         """
-        Memory-efficient PDLC-style posterior-average aggregation.
-
-        For each support i with label y_i:
-        - positive mass to class y_i: gamma(q, i)
-        - negative mass (1-gamma(q,i)) distributed to other classes c != y_i
-            proportional to prior[c], with renormalization by (1 - prior[y_i]).
-
-        Returns per-query class "scores" of shape (B, M, C).
+        Stable PDLC posterior averaging:
+        p(c|q) = (1/N) sum_i [ 1[y_i=c]*gamma(q,i) + (1-gamma(q,i)) * prior(c)/(1-prior(y_i)) for c!=y_i ]
         """
-        eps = 1e-12
         B, M, N = gamma.shape
-        C = num_classes
-        device = gamma.device
-        dtype = gamma.dtype
+        C = int(num_classes)
+        out = gamma.new_zeros((B, M, C))
 
-        out = torch.zeros((B, M, C), device=device, dtype=dtype)
+        # do math in fp32 for AMP stability
+        gamma_f = gamma.float()
 
         for b in range(B):
             mask = support_mask[b].bool()
-            N_eff = int(mask.sum().item())
-
-            if N_eff == 0:
-                # Fallback: no supports -> uniform distribution
+            if not mask.any():
                 out[b].fill_(1.0 / C)
                 continue
 
-            # Select valid supports
-            y = y_support[b][mask].long()          # (N_eff,)
-            g = gamma[b, :, mask]                  # (M, N_eff)
+            g = gamma_f[b][:, mask]          # (M, N_eff)
+            y = y_support[b][mask].long()    # (N_eff,)
+            N_eff = y.numel()
 
-            # Episode prior over classes from supports
-            prior = torch.bincount(y, minlength=C).to(dtype)  # (C,)
-            prior = prior / prior.sum().clamp_min(eps)        # (C,)
+            # If somehow only one class exists in supports, the "negative distribution" is undefined.
+            # In that degenerate case, prediction must be that class with prob 1.
+            uniq = torch.unique(y)
+            if uniq.numel() == 1:
+                out[b].zero_()
+                out[b, :, int(uniq.item())] = 1.0
+                continue
 
-            # Index matrix for scatter_add: (M, N_eff)
+            counts = torch.bincount(y, minlength=C).float()
+            # Faithful PDLC prior (no clamping). If you want smoothing: counts + alpha.
+            prior = counts / counts.sum().clamp_min(1.0)
+
+            # positive: sum_{i:y_i=c} gamma(q,i)
             idx = y.unsqueeze(0).expand(M, N_eff)
+            pos = g.new_zeros((M, C))
+            pos.scatter_add_(1, idx, g)
 
-            # --- Positive contribution: sum gamma per class ---
-            pos = torch.zeros((M, C), device=device, dtype=dtype)
-            pos.scatter_add_(dim=1, index=idx, src=g)  # adds g[:, i] into class y_i
+            # build rho (N_eff, C): rho[i,c] = prior[c] / (1 - prior[y_i]) for c != y_i; 0 for c==y_i
+            denom = (1.0 - prior.gather(0, y)).clamp_min(1e-6)         # (N_eff,)
+            rho = prior.unsqueeze(0) / denom.unsqueeze(1)              # (N_eff, C)
+            rho.scatter_(1, y.view(-1, 1), 0.0)
 
-            # --- Negative contribution ---
-            # w(q,i) = (1 - gamma(q,i)) / (1 - prior[y_i])
-            one_minus = 1.0 - g                               # (M, N_eff)
-            denom = (1.0 - prior[y]).clamp_min(eps)           # (N_eff,)
-            w = one_minus / denom.unsqueeze(0)                # (M, N_eff)
+            # negative: sum_i (1-gamma(q,i)) * rho_i,c
+            neg = (1.0 - g) @ rho                                       # (M, C)
 
-            # total_w(q) = sum_i w(q,i)
-            total_w = w.sum(dim=1, keepdim=True)              # (M, 1)
+            p = (pos + neg) / float(N_eff)                               # (M, C)
+            # p should already be normalized; minor safety:
+            p = p.clamp_min(0.0)
+            p = p / p.sum(dim=1, keepdim=True).clamp_min(1e-12)
 
-            # w_by_class(q,c) = sum_{i: y_i=c} w(q,i)
-            w_by_class = torch.zeros((M, C), device=device, dtype=dtype)
-            w_by_class.scatter_add_(dim=1, index=idx, src=w)  # (M, C)
-
-            # For each class c:
-            # neg(q,c) = prior[c] * sum_{i: y_i != c} w(q,i)
-            #         = prior[c] * (total_w(q) - w_by_class(q,c))
-            neg = prior.unsqueeze(0) * (total_w - w_by_class)  # (M, C)
-
-            # Average over anchors
-            out[b] = (pos + neg) / float(N_eff)
+            out[b] = p.to(dtype=gamma.dtype)
 
         return out
-    # def _aggregate_posterior_avg(
-    #     self,
-    #     gamma: torch.Tensor,
-    #     y_support: torch.Tensor,
-    #     support_mask: torch.Tensor,
-    #     num_classes: int,
-    # ) -> torch.Tensor:
-    #     """Posterior-average aggregation (primary PDLC-style aggregator).
 
-    #     For each anchor i with label c:
-    #         p_c^{(i)}   = gamma(q, i)
-    #         p_{c'}^{(i)} = (1 - gamma(q, i)) / (C-1) for c' != c
-
-    #     Returns unnormalized class scores (one per query and class).
-    #     A softmax over these scores is applied downstream.
-    #     """
-    #     B, M, N = gamma.shape  # (batch, num queries, num supports)
-    #     C = num_classes
-    #     eps = 1e-12
-    #     out = gamma.new_zeros((B, M, C))
-
-    #     for b in range(B):
-    #         g = gamma[b]  # (M, N)
-    #         y = y_support[b].long()  # (N,)
-    #         mask = support_mask[b]  # (N,)
-
-    #         if not mask.any():
-    #             continue
-
-    #         g = g[:, mask]  # (M, N_eff)
-    #         y = y[mask]  # (N_eff,)
-    #         N_eff = g.shape[1]
-
-    #         # Empirical episode prior over classes from supports
-    #         prior = torch.bincount(y, minlength=C).to(g.dtype)  # (C,)
-    #         prior = prior / torch.clamp(prior.sum(), min=eps)  # (C,)
-
-    #         # Positive vote for own class: sum_i gamma(q,i) * 1_{y_i}
-    #         oh = torch.nn.functional.one_hot(y, num_classes=C).to(g.dtype)  # (N_eff, C)
-    #         oh_exp = oh.unsqueeze(0).expand(M, -1, -1)  # (M, N_eff, C)
-    #         g_exp = g.unsqueeze(-1)  # (M, N_eff, 1)
-    #         pos_contrib = (g_exp * oh_exp).sum(dim=1)  # (M, C)
-
-    #         # Negative vote: distribute (1 - gamma(q,i)) to other classes ∝ prior
-    #         one_minus_g = 1.0 - g  # (M, N_eff)
-    #         denom = 1.0 - prior[y]  # (N_eff,)
-    #         denom = torch.clamp(denom, min=eps)
-    #         scale = one_minus_g / denom.unsqueeze(0)  # (M, N_eff)
-    #         scale_exp = scale.unsqueeze(-1)  # (M, N_eff, 1)
-    #         prior_exp = prior.view(1, 1, C)  # (1, 1, C)
-    #         neg_contrib = scale_exp * prior_exp  # (M, N_eff, C)
-    #         # Zero out own-class component in the negative vote
-    #         mask_other = (1.0 - oh).unsqueeze(0)  # (1, N_eff, C)
-    #         neg_contrib = neg_contrib * mask_other  # (M, N_eff, C)
-    #         neg_contrib = neg_contrib.sum(dim=1)  # (M, C)
-
-    #         # Average over anchors (respecting masks); keep as raw scores
-    #         accum = (pos_contrib + neg_contrib) / float(N_eff)  # (M, C)
-    #         out[b] = accum
-
-    #     return out
 
     def _aggregate_class_pool(
         self,
-        gamma: torch.Tensor,
-        y_support: torch.Tensor,
-        support_mask: torch.Tensor,
+        gamma: torch.Tensor,          # (B, M, N)
+        y_support: torch.Tensor,      # (B, N)
+        support_mask: torch.Tensor,   # (B, N)
         num_classes: int,
     ) -> torch.Tensor:
-        """Simpler class-pooling aggregation for ablations.
+        """Class-pool aggregation: mean gamma per class.
 
-        p(y=c | q) ∝ ∑_{i: y_i=c} gamma(q, i)
+        For each query q:
+            score_c(q) = mean_{i: y_i = c} gamma(q, i)
         """
         B, M, N = gamma.shape
         C = num_classes
-        eps = 1e-12
         out = gamma.new_zeros((B, M, C))
 
         for b in range(B):
-            g = gamma[b]  # (M, N)
-            y = y_support[b].long()  # (N,)
-            mask = support_mask[b]  # (N,)
+            g = gamma[b]                  # (M, N)
+            y = y_support[b].long()       # (N,)
+            mask = support_mask[b]        # (N,)
 
             if not mask.any():
                 continue
 
-            g = g[:, mask]  # (M, N_eff)
-            y = y[mask]  # (N_eff,)
+            g = g[:, mask]                # (M, N_eff)
+            y = y[mask]                   # (N_eff,)
 
-            # Scatter-add over classes (sum of gamma per class)
             idx = y.unsqueeze(0).expand(g.shape[0], -1)  # (M, N_eff)
             P_sum = torch.zeros((g.shape[0], C), device=g.device, dtype=g.dtype)
-            P_sum.scatter_add_(1, idx, g)
+            P_sum.scatter_add_(1, idx, g)               # (M, C)
 
             # Normalize by support count per class to obtain mean gamma
             counts = torch.bincount(y, minlength=C).to(g.dtype)  # (C,)
-            counts = counts.clamp_min(1.0)  # avoid division by zero
-            P_mean = P_sum / counts.unsqueeze(0)  # (M, C)
+            counts = counts.clamp_min(1.0)                       # avoid division by zero
+            P_mean = P_sum / counts.unsqueeze(0)                 # (M, C)
 
-            # Keep mean gamma as unnormalized class scores; softmax is applied later
             out[b] = P_mean
 
         return out
-    
+
     def _aggregate_sum(
         self,
-        gamma: torch.Tensor,
-        y_support: torch.Tensor,
-        support_mask: torch.Tensor,
+        gamma: torch.Tensor,          # (B, M, N)
+        y_support: torch.Tensor,      # (B, N)
+        support_mask: torch.Tensor,   # (B, N)
         num_classes: int,
     ) -> torch.Tensor:
         """Sum aggregation (Kernel Density / Evidence Mass).
 
-        Score(c) = Sum_{i: y_i=c} gamma(q, i)
-        
+        Score_c(q) = sum_{i: y_i = c} gamma(q, i)
+
         Unlike class_pool, this does NOT divide by the class count.
         This allows the density of the support set to act as a prior:
-        dense clusters have more 'voting mass' than sparse outliers.
+        dense clusters have more voting mass than sparse outliers.
         """
         B, M, N = gamma.shape
         C = num_classes
         out = gamma.new_zeros((B, M, C))
 
         for b in range(B):
-            g = gamma[b]  # (M, N)
-            y = y_support[b].long()  # (N,)
-            mask = support_mask[b]  # (N,)
+            g = gamma[b]                  # (M, N)
+            y = y_support[b].long()       # (N,)
+            mask = support_mask[b]        # (N,)
 
             if not mask.any():
                 continue
 
-            g = g[:, mask]  # (M, N_eff)
-            y = y[mask]  # (N_eff,)
+            g = g[:, mask]                # (M, N_eff)
+            y = y[mask]                   # (N_eff,)
 
-            # Scatter-add over classes (sum of gamma per class)
             idx = y.unsqueeze(0).expand(g.shape[0], -1)  # (M, N_eff)
             P_sum = torch.zeros((g.shape[0], C), device=g.device, dtype=g.dtype)
-            P_sum.scatter_add_(1, idx, g)
+            P_sum.scatter_add_(1, idx, g)               # (M, C)
 
-            # CRITICAL: No division by counts. Return total mass.
+            # No division by counts; return total mass.
             out[b] = P_sum
 
         return out
 
+    def _aggregate(
+        self,
+        gamma: torch.Tensor,
+        y_support: torch.Tensor,
+        support_mask: torch.Tensor,
+        num_classes: int,
+    ) -> torch.Tensor:
+        """Dispatch to the configured aggregation method."""
+        mode = self.cfg.agg
+        if mode == "posterior_avg":
+            return self._aggregate_posterior_avg(gamma, y_support, support_mask, num_classes)
+        if mode == "class_pool":
+            return self._aggregate_class_pool(gamma, y_support, support_mask, num_classes)
+        if mode == "sum":
+            return self._aggregate_sum(gamma, y_support, support_mask, num_classes)
+        raise ValueError(f"Unknown PDLC aggregation mode: {mode}")
 
+    # ------------------------------------------------------------------
+    # Forward paths
+    # ------------------------------------------------------------------
     def forward(
-            self,
-            H_support: torch.Tensor,
-            H_query: torch.Tensor,
-            y_support: torch.Tensor,
-            support_mask: Optional[torch.Tensor] = None,
-        ) -> tuple[torch.Tensor, dict]:
-            if support_mask is None:
-                support_mask = torch.ones_like(y_support, dtype=torch.bool)
+        self,
+        H_support: torch.Tensor,        # (B, N, D)
+        H_query: torch.Tensor,          # (B, M, D)
+        y_support: torch.Tensor,        # (B, N)
+        support_mask: Optional[torch.Tensor] = None,  # (B, N)
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Compute class logits for queries given support embeddings."""
+        if support_mask is None:
+            support_mask = torch.ones_like(y_support, dtype=torch.bool)
 
-            B, N, D = H_support.shape
-            _, M, _ = H_query.shape
-            assert D == self.d_model, f"Expected d_model={self.d_model}, got {D}"
+        B, N, _ = H_support.shape
+        _, M, _ = H_query.shape
 
-            # Determine number of classes present
-            num_classes = int(y_support.max().item()) + 1
-            
-            # --- Memory Heuristic for Chunking ---
-            # If matrix size > 100 Million elements (approx 400MB float32), use chunking.
-            # This prevents OOM on Connect-4 (60k*4k) or Numerai (90k*9k).
-            # Only apply during inference to keep training graph simple.
-            matrix_size = B * M * N
-            should_chunk = (not self.training) and (matrix_size > 100_000_000)
+        num_classes = int(y_support[support_mask].max().item()) + 1
+        num_classes = min(num_classes, self.max_classes)
+        # Disallow symmetrization with top-k for now (semantics are tricky)
+        if self.cfg.symmetrize and self.cfg.topk is not None:
+            raise ValueError(
+                "pdlc_symmetrize=True with pdlc_topk is not supported. "
+                "Set pdlc_topk=None when using symmetrization."
+            )
 
-            if should_chunk:
-                # Run memory-efficient path
-                # Note: We return empty 'aux' because we didn't keep the full pairwise matrix.
-                scores = self._forward_chunked(
-                    H_support, H_query, y_support, support_mask, num_classes, chunk_size=1024
-                )
-                aux = {} # No diagnostics available in chunked mode
-            else:
-                # Run standard path (fastest for small/medium data)
-                pair_logits = self._pair_logits(H_query, H_support, support_mask)  # (B, M, N)
-                gamma = torch.sigmoid(pair_logits)  # (B, M, N)
+        should_chunk = (not self.training) and (B * M * N > self._CHUNK_FLOP_THRESHOLD)
 
-                if self.cfg.agg == "posterior_avg":
-                    scores = self._aggregate_posterior_avg(gamma, y_support, support_mask, num_classes)
-                elif self.cfg.agg == "class_pool":
-                    scores = self._aggregate_class_pool(gamma, y_support, support_mask, num_classes)
-                elif self.cfg.agg == "sum":
-                    scores = self._aggregate_sum(gamma, y_support, support_mask, num_classes)
-                else:
-                    raise ValueError(f"Unknown aggregation mode '{self.cfg.agg}'")
+        if should_chunk:
+            return self._forward_chunked(H_support, H_query, y_support, support_mask, num_classes)
+        else:
+            return self._forward_full(H_support, H_query, y_support, support_mask, num_classes)
 
-                aux = {
-                    "pair_logits": pair_logits,
-                    "gamma": gamma,
-                    "support_mask": support_mask,
-                    "tau": self.tau,
-                }
+    def _apply_inference_temperature(
+        self,
+        logits_query: torch.Tensor,    # (B, M, C)
+        support_mask: torch.Tensor,    # (B, N)
+    ) -> torch.Tensor:
+        """Apply inference-time temperature scaling."""
+        if self.training:
+            return logits_query
 
-            # --- Final Logits Conversion ---
-            eps = 1e-12
-            logits_query = torch.log(torch.clamp(scores, min=eps))
+        # Special handling for "sum" aggregation: scale by sqrt(N_eff)
+        if self.cfg.agg == "sum":
+            N_eff = support_mask.sum(dim=1).clamp_min(1).to(logits_query.dtype)  # (B,)
+            scale = torch.sqrt(N_eff).view(-1, 1, 1)                             # (B,1,1)
+            return logits_query / scale
 
-            # Optional inference-time temperature scaling
-            if not self.training:
-                if (
-                    getattr(self.cfg, "Inference_temperature", 0.0) is not None
-                    and self.cfg.Inference_temperature > 0
-                ):
-                    logits_query = logits_query / float(self.cfg.Inference_temperature)
+        # Generic fixed temperature scaling
+        temp = getattr(self.cfg, "Inference_temperature", 0.0)
+        if temp is not None and temp > 0:
+            return logits_query / float(temp)
 
-            return logits_query, aux
+        return logits_query
+
+    def _forward_full(
+        self,
+        H_support: torch.Tensor,
+        H_query: torch.Tensor,
+        y_support: torch.Tensor,
+        support_mask: torch.Tensor,
+        num_classes: int,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Non-chunked forward pass with optional symmetrization."""
+        # Forward logits ell(q, a)
+        pair_logits_qs = self._pair_logits(H_query, H_support, support_mask)  # (B, M, N)
+
+        if self.cfg.symmetrize:
+            # Reverse logits ell(a, q) with correct anchor masking
+            pair_logits_sq = self._pair_logits_reverse(H_support, H_query, support_mask)  # (B, N, M)
+
+            gamma_qs = torch.sigmoid(pair_logits_qs)                 # (B, M, N)
+            gamma_sq = torch.sigmoid(pair_logits_sq).transpose(1, 2)  # (B, M, N)
+
+            gamma = 0.5 * (gamma_qs + gamma_sq)
+        else:
+            pair_logits_sq = None
+            gamma = torch.sigmoid(pair_logits_qs)
+
+        # Aggregate to class-level scores
+        scores = self._aggregate(gamma, y_support, support_mask, num_classes)  # (B, M, C)
+
+        # Convert to log-space
+        eps = 1e-12
+        logits_query = torch.log(torch.clamp(scores, min=eps))  # (B, M, C)
+
+        # Inference-time temperature scaling
+        logits_query = self._apply_inference_temperature(logits_query, support_mask)
+
+        aux: Dict[str, torch.Tensor] = {
+            "pair_logits": pair_logits_qs,
+            "gamma": gamma,
+            "support_mask": support_mask,
+            "tau": self.tau,
+        }
+        if pair_logits_sq is not None:
+            aux["pair_logits_sq"] = pair_logits_sq
+
+        return logits_query, aux
 
     def _forward_chunked(
         self,
@@ -456,482 +438,66 @@ class TabPDLHead(nn.Module):
         y_support: torch.Tensor,
         support_mask: torch.Tensor,
         num_classes: int,
-        chunk_size: int = 1024
-    ) -> torch.Tensor:
-        """Memory-efficient chunked inference. 
-        Iterates over query chunks, aggregates immediately, and discards pairwise logits.
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        """Chunked inference for very large (B, M, N).
+
+        We chunk along the query dimension M to keep memory usage bounded
+        while still supporting symmetrization.
         """
-        B, N, D = H_support.shape
+        B, N, _ = H_support.shape
         _, M, _ = H_query.shape
-        
-        # 1. Pre-process Supports (Do this ONCE)
-        # Normalize
-        H_sup_norm = self._normalize_embeddings(H_support)
-        # Project K
-        K = self.W_K(H_sup_norm) # (B, N, D)
-        K_T = K.transpose(-1, -2) # (B, D, N)
-        
-        # Normalize Queries (all at once is fine, it's O(M))
-        H_qry_norm = self._normalize_embeddings(H_query)
-        
-        scores_list = []
-        
-        # 2. Iterate over Query Chunks
-        for i in range(0, M, chunk_size):
-            # Slice Query Chunk
-            end_idx = min(i + chunk_size, M)
-            h_q_chunk = H_qry_norm[:, i:end_idx, :] # (B, m_chunk, D)
-            
-            # Project Q Chunk
-            Q_chunk = self.W_Q(h_q_chunk) # (B, m_chunk, D)
-            
-            # Compute Pairwise Logits for Chunk
-            # logits = tau * (Q @ K.T) + bias
-            chunk_logits = torch.matmul(Q_chunk, K_T)
-            chunk_logits = self.tau * chunk_logits + self.bias # (B, m_chunk, N)
-            
-            # Apply Masking (same logic as _pair_logits)
-            mask_expanded = support_mask.unsqueeze(1) # (B, 1, N)
-            chunk_logits = chunk_logits.masked_fill(~mask_expanded, float("-inf"))
-            
-            # --- Optional Top-K (if config enabled) ---
-            if self.cfg.topk is not None and 0 < self.cfg.topk < N:
-                # We must apply topk per chunk
-                _, topk_idx = torch.topk(chunk_logits, k=self.cfg.topk, dim=-1)
-                keep = torch.zeros_like(chunk_logits, dtype=torch.bool)
-                keep.scatter_(2, topk_idx, True)
-                chunk_logits = chunk_logits.masked_fill(~keep, float("-inf"))
-            # ------------------------------------------
 
-            # Sigmoid
-            chunk_gamma = torch.sigmoid(chunk_logits) # (B, m_chunk, N)
-            
-            # Aggregate Immediately
-            # We reuse the existing aggregation functions, passing the chunked gamma
-            if self.cfg.agg == "posterior_avg":
-                chunk_scores = self._aggregate_posterior_avg(chunk_gamma, y_support, support_mask, num_classes)
-            elif self.cfg.agg == "class_pool":
-                chunk_scores = self._aggregate_class_pool(chunk_gamma, y_support, support_mask, num_classes)
-            elif self.cfg.agg == "sum":
-                chunk_scores = self._aggregate_sum(chunk_gamma, y_support, support_mask, num_classes)
+        # Pre-normalize supports and project once
+        Hs_norm = self._normalize_embeddings(H_support)  # (B, N, D)
+        K_support = self.W_K(Hs_norm)                   # (B, N, D)
+        Q_support = self.W_Q(Hs_norm) if self.cfg.symmetrize else None
+
+        scores = H_support.new_zeros((B, M, num_classes))
+
+        for start in range(0, M, self._CHUNK_SIZE):
+            end = min(M, start + self._CHUNK_SIZE)
+            Hq_chunk = H_query[:, start:end, :]          # (B, m, D)
+
+            # Normalize and project queries
+            Hq_norm = self._normalize_embeddings(Hq_chunk)  # (B, m, D)
+            Q_chunk = self.W_Q(Hq_norm)                     # (B, m, D)
+
+            # Forward logits ell(q, a): (B, m, N)
+            logits_qs = torch.matmul(Q_chunk, K_support.transpose(-1, -2))
+            logits_qs = self.tau * logits_qs + self.bias
+            logits_qs = self._apply_support_mask_and_topk(logits_qs, support_mask)
+            gamma_qs = torch.sigmoid(logits_qs)             # (B, m, N)
+
+            if self.cfg.symmetrize:
+                assert Q_support is not None  # for mypy
+                # Reverse logits ell(a, q_chunk): (B, N, m)
+                K_chunk = self.W_K(Hq_norm)   # (B, m, D)
+                logits_sq = torch.matmul(Q_support, K_chunk.transpose(-1, -2))
+                logits_sq = self.tau * logits_sq + self.bias
+                # Mask invalid anchors on the query side (N)
+                logits_sq = logits_sq.masked_fill(~support_mask.unsqueeze(-1), float("-inf"))
+                gamma_sq = torch.sigmoid(logits_sq).transpose(1, 2)  # (B, m, N)
+
+                gamma_chunk = 0.5 * (gamma_qs + gamma_sq)
             else:
-                raise ValueError(f"Unknown aggregation mode '{self.cfg.agg}' for TabPDLHead.")
-                
-            scores_list.append(chunk_scores)
-            
-            # Explicit delete to help allocator
-            del chunk_logits, chunk_gamma, Q_chunk
-        
-        # 3. Concatenate Class Scores
-        return torch.cat(scores_list, dim=1) # (B, M, C)
+                gamma_chunk = gamma_qs
+
+            # Aggregate for this chunk
+            scores_chunk = self._aggregate(gamma_chunk, y_support, support_mask, num_classes)  # (B, m, C)
+            scores[:, start:end, :] = scores_chunk
+
+        eps = 1e-12
+        logits_query = torch.log(torch.clamp(scores, min=eps))  # (B, M, C)
+        logits_query = self._apply_inference_temperature(logits_query, support_mask)
+
+        aux: Dict[str, torch.Tensor] = {
+            # In chunked mode we do not keep full pair_logits / gamma tensors
+            # to save memory; training does not use chunked mode.
+            "support_mask": support_mask,
+            "tau": self.tau,
+        }
+
+        return logits_query, aux
 
 
-
-
-
-''' # # Deprecated: standalone PDLC head and training utilities # # '''
-# class PDLCHead(nn.Module):
-#     """Tiny symmetric MLP to score if two rows share the same class.
-
-#     Forward takes concatenated embeddings of shape (N, 2*D) and returns logits (N, 1).
-#     """
-
-#     def __init__(self, emb_dim: int, hidden: int = 512, dropout: float = 0.1):
-#         super().__init__()
-#         self.emb_dim = emb_dim
-#         self.mlp = nn.Sequential(
-#             nn.Linear(2 * emb_dim, hidden),
-#             nn.GELU(),
-#             nn.Dropout(dropout),
-#             nn.Linear(hidden, 1),
-#         )
-
-#     def forward(self, pairs: torch.Tensor) -> torch.Tensor:
-#         return self.mlp(pairs).squeeze(-1)  # (N,)
-
-
-# @dataclass
-# class TrainConfig:
-#     lr: float = 1e-3
-#     weight_decay: float = 1e-4
-#     batch_size: int = 512
-#     max_grad_norm: float = 1.0
-#     symmetry_weight: float = 0.1
-
-
-# def l2_normalize(x: np.ndarray, eps: float = 1e-12) -> np.ndarray:
-#     n = np.linalg.norm(x, axis=1, keepdims=True)
-#     return x / np.maximum(n, eps)
-
-
-# def build_balanced_pairs(
-#     emb: np.ndarray,
-#     labels: np.ndarray,
-#     num_pairs: int,
-#     rng: np.random.Generator,
-#     *,
-#     class_balance: bool = True,
-#     hard_neg_frac: float = 0.0,
-# ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-#     """Create balanced positive/negative pairs from anchor set.
-
-#     Returns (pair_ab, pair_ba, targets), where pairs are float32 arrays of shape (N, 2D)
-#     and targets are int64 of shape (N,), with N = 2 * num_pairs (both orders).
-#     """
-#     n = emb.shape[0]
-#     classes = np.unique(labels)
-#     D = emb.shape[1]
-
-#     # index by class for fast sampling
-#     by_class = {c: np.where(labels == c)[0] for c in classes}
-#     all_idx = np.arange(n)
-
-#     pos_needed = num_pairs // 2
-#     neg_needed = num_pairs - pos_needed
-
-#     # Positives: uniform over classes when requested; with replacement to ensure balance
-#     pos_pairs = []
-#     if class_balance:
-#         eligible = [c for c in classes if by_class[c].size >= 2]
-#         for _ in range(pos_needed):
-#             if not eligible:
-#                 break
-#             c = eligible[rng.integers(0, len(eligible))]
-#             idx = by_class[c]
-#             # with replacement across samples, without replacement within pair
-#             if idx.size >= 2:
-#                 i, j = rng.choice(idx, size=2, replace=False)
-#                 pos_pairs.append((i, j))
-#     else:
-#         for _ in range(pos_needed):
-#             c = classes[rng.integers(0, len(classes))]
-#             idx = by_class[c]
-#             if idx.size >= 2:
-#                 i, j = rng.choice(idx, size=2, replace=False)
-#                 pos_pairs.append((i, j))
-#     # pad if we couldn't get enough due to tiny classes
-#     while len(pos_pairs) < pos_needed:
-#         cs = [c for c in classes if by_class[c].size >= 2]
-#         if not cs:
-#             break
-#         c = cs[rng.integers(0, len(cs))]
-#         i, j = rng.choice(by_class[c], size=2, replace=False)
-#         pos_pairs.append((i, j))
-
-#     # Negatives: mix of random and hard negatives
-#     neg_pairs = []
-#     n_hard = int(round(hard_neg_frac * neg_needed))
-#     n_rand = max(0, neg_needed - n_hard)
-
-#     # Random negatives
-#     for _ in range(n_rand):
-#         for _try in range(10):
-#             i, j = rng.choice(all_idx, size=2, replace=False)
-#             if labels[i] != labels[j]:
-#                 neg_pairs.append((i, j))
-#                 break
-#         else:
-#             if len(classes) >= 2:
-#                 c1, c2 = rng.choice(classes, size=2, replace=False)
-#                 i = rng.choice(by_class[c1])
-#                 j = rng.choice(by_class[c2])
-#                 neg_pairs.append((i, j))
-
-#     # Hard negatives by nearest different-class in cosine similarity
-#     if n_hard > 0 and emb.shape[0] >= 2:
-#         # emb must be L2-normalized for cosine
-#         S = emb @ emb.T
-#         # for each i, find best j with different label
-#         cand = []
-#         for i in range(emb.shape[0]):
-#             # mask out same-class and self
-#             mask = labels != labels[i]
-#             if mask.any():
-#                 sims = S[i][mask]
-#                 js = np.where(mask)[0]
-#                 j = int(js[np.argmax(sims)])
-#                 cand.append((i, j))
-#         # sample from candidates
-#         if cand:
-#             for _ in range(min(n_hard, len(cand))):
-#                 i, j = cand[rng.integers(0, len(cand))]
-#                 neg_pairs.append((i, j))
-
-#     pairs = pos_pairs + neg_pairs
-#     targets = np.array([1] * len(pos_pairs) + [0] * len(neg_pairs), dtype=np.int64)
-
-#     # both orders
-#     a = emb[[i for i, _ in pairs]]
-#     b = emb[[j for _, j in pairs]]
-#     ab = np.concatenate([a, b], axis=1).astype(np.float32)
-#     ba = np.concatenate([b, a], axis=1).astype(np.float32)
-
-#     # duplicate targets for both orders
-#     t = np.concatenate([targets, targets], axis=0)
-#     return ab, ba, t
-
-
-# def _roc_auc(y_true: np.ndarray, scores: np.ndarray) -> Optional[float]:
-#     try:
-#         from sklearn.metrics import roc_auc_score
-#         return float(roc_auc_score(y_true, scores))
-#     except Exception:
-#         return None
-
-
-# @torch.no_grad()
-# def pair_auc_head(
-#     head: PDLCHead,
-#     emb: np.ndarray,
-#     labels: np.ndarray,
-#     rng: np.random.Generator,
-#     device: torch.device,
-#     num_eval_pairs: int = 4096,
-# ) -> Tuple[Optional[float], Optional[float]]:
-#     """Compute pair AUC for the head and cosine baseline on sampled pairs."""
-#     # Build eval pairs (balanced, no training signal used here explicitly)
-#     ab, ba, t = build_balanced_pairs(emb, labels, num_eval_pairs, rng, class_balance=True, hard_neg_frac=0.0)
-#     N = t.shape[0] // 2
-#     # head scores (symmetrized)
-#     head.eval()
-#     bs = 1024
-#     scores = []
-#     for s in range(0, N, bs):
-#         e = min(N, s + bs)
-#         logit_ab = head(torch.from_numpy(ab[s:e]).to(device)).float()
-#         logit_ba = head(torch.from_numpy(ba[s:e]).to(device)).float()
-#         p = torch.sigmoid(logit_ab).add(torch.sigmoid(logit_ba)).mul_(0.5)
-#         scores.append(p.cpu().numpy())
-#     scores = np.concatenate(scores, axis=0)
-#     auc_head = _roc_auc(t[:N], scores)
-
-#     # cosine baseline on L2-normalized embeddings
-#     d = emb.shape[1]
-#     a_idx = [i for i, _ in zip(range(N), range(N))]  # dummy for construction below
-#     # recover actual indices used
-#     # ab is [a; b], both blocks are D-wide
-#     a = ab[:N, :d]
-#     b = ab[:N, d:]
-#     cos_scores = np.sum(a * b, axis=1)
-#     auc_cos = _roc_auc(t[:N], cos_scores)
-#     return auc_head, auc_cos
-
-
-# @torch.no_grad()
-# def pair_auc_on_pairs(
-#     head: PDLCHead,
-#     pair_ab: np.ndarray,
-#     pair_ba: np.ndarray,
-#     targets: np.ndarray,
-#     device: torch.device,
-# ) -> Tuple[Optional[float], Optional[float]]:
-#     """Compute pair AUCs on a fixed set of pairs for before/after comparisons.
-
-#     targets is expected to be length 2*N (duplicated for both orders); we use the first N.
-#     """
-#     head.eval()
-#     N = targets.shape[0] // 2
-#     bs = 1024
-#     scores = []
-#     for s in range(0, N, bs):
-#         e = min(N, s + bs)
-#         logit_ab = head(torch.from_numpy(pair_ab[s:e]).to(device)).float()
-#         logit_ba = head(torch.from_numpy(pair_ba[s:e]).to(device)).float()
-#         p = torch.sigmoid(logit_ab).add(torch.sigmoid(logit_ba)).mul_(0.5)
-#         scores.append(p.cpu().numpy())
-#     scores = np.concatenate(scores, axis=0)
-#     auc_head = _roc_auc(targets[:N], scores)
-
-#     # cosine baseline
-#     d = pair_ab.shape[1] // 2
-#     a = pair_ab[:N, :d]
-#     b = pair_ab[:N, d:]
-#     cos_scores = np.sum(a * b, axis=1)
-#     auc_cos = _roc_auc(targets[:N], cos_scores)
-#     return auc_head, auc_cos
-
-
-# def train_head_on_pairs(
-#     head: PDLCHead,
-#     pair_ab: np.ndarray,
-#     pair_ba: np.ndarray,
-#     targets: np.ndarray,
-#     cfg: TrainConfig,
-#     device: torch.device,
-#     *,
-#     optimizer: Optional[torch.optim.Optimizer] = None,
-#     epochs: int = 1,
-#     mimic_weight: float = 0.0,
-# ) -> float:
-#     """Train on provided pairs using a persistent optimizer. Returns avg loss over all epochs.
-
-#     - optimizer: if None, a fresh AdamW is created; otherwise it's reused.
-#     - epochs: repeat over the same provided pairs this many times (useful when resampling pairs per call).
-#     - mimic_weight: if >0, add BCEWithLogits loss towards cosine similarity s in [0,1].
-#     """
-#     head.train()
-#     opt = optimizer or torch.optim.AdamW(head.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
-
-#     N = targets.shape[0] // 2  # unique pairs count
-
-#     # Pos weight balancing
-#     n_pos = targets.sum()
-#     n_neg = targets.shape[0] - n_pos
-#     pos_weight = torch.tensor([max(1.0, n_neg / max(1.0, n_pos))], device=device)
-#     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-#     criterion_mimic = nn.BCEWithLogitsLoss()
-
-#     # Precompute cosine targets if requested
-#     d2 = pair_ab.shape[1] // 2
-#     if mimic_weight > 0:
-#         a = pair_ab[:N, :d2]
-#         b = pair_ab[:N, d2:]
-#         # embeddings are expected L2-normalized; clip numerical issues
-#         cos = np.clip((a * b).sum(axis=1), -1.0, 1.0)
-#         s = (cos + 1.0) * 0.5  # in [0,1]
-#         s_ab = torch.from_numpy(s).float().to(device)
-#         s_ba = s_ab  # same pairs reversed
-
-#     # mini-batches
-#     bs = cfg.batch_size
-#     n_batches = math.ceil(N / bs)
-#     losses = []
-#     for _ in range(max(1, epochs)):
-#         for bidx in range(n_batches):
-#             s_i = bidx * bs
-#             e_i = min((bidx + 1) * bs, N)
-#             ab = torch.from_numpy(pair_ab[s_i:e_i]).to(device)
-#             ba = torch.from_numpy(pair_ba[s_i:e_i]).to(device)
-#             t = torch.from_numpy(targets[s_i:e_i]).float().to(device)
-
-#             opt.zero_grad(set_to_none=True)
-#             logit_ab = head(ab)
-#             logit_ba = head(ba)
-#             loss_main = criterion(logit_ab, t) + criterion(logit_ba, t)
-#             loss_sym = F.mse_loss(logit_ab, logit_ba)
-#             loss = loss_main + cfg.symmetry_weight * loss_sym
-
-#             if mimic_weight > 0:
-#                 loss_mimic = criterion_mimic(logit_ab, s_ab[s_i:e_i]) + criterion_mimic(logit_ba, s_ba[s_i:e_i])
-#                 loss = loss + float(mimic_weight) * loss_mimic
-
-#             loss.backward()
-#             if cfg.max_grad_norm:
-#                 nn.utils.clip_grad_norm_(head.parameters(), cfg.max_grad_norm)
-#             opt.step()
-#             losses.append(loss.detach().item())
-
-#     return float(np.mean(losses))
-
-
-# @torch.no_grad()
-# def pair_gamma(
-#     head: PDLCHead,
-#     q_emb: np.ndarray,
-#     a_emb: np.ndarray,
-#     device: torch.device,
-#     batch_size: int = 1024,
-# ) -> np.ndarray:
-#     """Compute symmetric pair probabilities γ between queries and anchors.
-
-#     Returns array of shape (n_q, n_a) with values in [0, 1].
-#     """
-#     head.eval()
-#     n_q, d = q_emb.shape
-#     n_a = a_emb.shape[0]
-#     out = np.empty((n_q, n_a), dtype=np.float32)
-
-#     # Process queries in mini-batches to limit memory
-#     for i in range(0, n_q, 1):
-#         q = q_emb[i : i + 1]  # (1, D)
-#         # tile against all anchors
-#         ab = np.concatenate([np.repeat(q, n_a, axis=0), a_emb], axis=1).astype(np.float32)
-#         ba = np.concatenate([a_emb, np.repeat(q, n_a, axis=0)], axis=1).astype(np.float32)
-
-#         # evaluate in chunks along anchors
-#         gam = []
-#         for s in range(0, n_a, batch_size):
-#             e = min(n_a, s + batch_size)
-#             ab_t = torch.from_numpy(ab[s:e]).to(device)
-#             ba_t = torch.from_numpy(ba[s:e]).to(device)
-#             logit_ab = head(ab_t)
-#             logit_ba = head(ba_t)
-#             p = torch.sigmoid(logit_ab).add(torch.sigmoid(logit_ba)).mul_(0.5).float().cpu().numpy()
-#             gam.append(p)
-#         out[i] = np.concatenate(gam, axis=0)
-#     return out
-
-
-# def cosine_topk(q_emb: np.ndarray, a_emb: np.ndarray, k: int) -> np.ndarray:
-#     """Return indices of top-k anchors per query by cosine similarity."""
-#     # both must be L2-normalized
-#     sims = q_emb @ a_emb.T  # (n_q, n_a)
-#     k = min(k, a_emb.shape[0])
-#     return np.argpartition(-sims, kth=k - 1, axis=1)[:, :k]
-
-
-# def pdlc_posteriors(
-#     head: PDLCHead,
-#     a_emb: np.ndarray,
-#     a_labels: np.ndarray,
-#     q_emb: np.ndarray,
-#     topk: Optional[int],
-#     device: torch.device,
-#     gamma_batch: int = 2048,
-# ) -> Tuple[np.ndarray, np.ndarray]:
-#     """Compute PDLC posteriors for queries.
-
-#     Returns (posteriors, class_order) where posteriors has shape (n_q, C) and rows sum to 1.
-#     """
-#     # Encode labels to 0..C-1 consistently, preserve class order for mapping back
-#     classes, y_enc = np.unique(a_labels, return_inverse=True)
-#     C = classes.shape[0]
-#     n_a = a_emb.shape[0]
-#     prior = np.bincount(y_enc, minlength=C).astype(np.float32)
-#     prior = prior / prior.sum()
-
-#     # Optional top-K preselection
-#     if topk is not None and topk > 0 and topk < n_a:
-#         idx_k = cosine_topk(q_emb, a_emb, k=topk)
-#     else:
-#         idx_k = np.tile(np.arange(n_a), (q_emb.shape[0], 1))
-
-#     # For each query, compute γ to its selected anchors
-#     # We'll batch queries by 1 for simplicity; head eval is cheap
-#     posts = np.zeros((q_emb.shape[0], C), dtype=np.float32)
-#     eps = 1e-12
-#     for qi in range(q_emb.shape[0]):
-#         sel = idx_k[qi]
-#         a_sel = a_emb[sel]
-#         y_sel = y_enc[sel]
-#         gam = pair_gamma(head, q_emb[qi : qi + 1], a_sel, device=device, batch_size=gamma_batch)[0]
-#         # contributions per class
-#         accum = np.zeros(C, dtype=np.float32)
-#         for i, yi in enumerate(y_sel):
-#             # positive vote for its own class
-#             accum[yi] += gam[i]
-#             # negative vote distributed to other classes proportionally to prior
-#             denom = max(eps, 1.0 - prior[yi])
-#             contrib = (1.0 - gam[i]) * (prior / denom)
-#             contrib[yi] = 0.0
-#             accum += contrib
-#         # average over anchors and renormalize
-#         accum /= max(1, len(sel))
-#         s = accum.sum()
-#         posts[qi] = accum / max(s, eps)
-
-#     return posts, classes
-
-
-# def nll_accuracy(posteriors: np.ndarray, true_labels: np.ndarray, classes: np.ndarray) -> Tuple[float, float]:
-#     """Compute mean NLL and accuracy for queries whose class exists in anchors."""
-#     # Map true labels to class indices; mark OOV as -1
-#     class_to_idx = {c: i for i, c in enumerate(classes.tolist())}
-#     idx = np.array([class_to_idx.get(t, -1) for t in true_labels])
-#     mask = idx >= 0
-#     idx = idx[mask]
-#     P = posteriors[mask]
-#     eps = 1e-12
-#     nll = -np.log(np.take_along_axis(P, idx[:, None], axis=1) + eps).mean() if P.size else float("nan")
-#     acc = (P.argmax(axis=1) == idx).mean() if P.size else float("nan")
-#     return float(nll), float(acc)
+__all__ = ["TabPDLHeadConfig", "TabPDLHead"]
