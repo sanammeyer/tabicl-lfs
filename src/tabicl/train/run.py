@@ -766,6 +766,30 @@ class Trainer:
                 f"Unexpected: {unexpected[:5]}{'...' if len(unexpected)>5 else ''}"
             )
 
+        # Optional: reinitialize TabPDL head parameters after loading backbone
+        # This is useful for Stage-2 runs where we want to reuse the encoder
+        # but start with a fresh PDLC head (e.g., switching from class_pool
+        # to posterior_avg aggregation).
+        try:
+            if (
+                getattr(self.config, "pdlc_reinit_head", False)
+                and getattr(self.raw_model, "icl_head", "tabicl") == "tabpdl"
+            ):
+                pdlc_head = getattr(self.raw_model.icl_predictor, "pdlc_head", None)
+                if pdlc_head is not None:
+                    if self.master_process:
+                        print("Reinitializing TabPDL head parameters (W_Q, W_K, tau, bias).")
+                    # Reinitialize projections
+                    torch.nn.init.xavier_uniform_(pdlc_head.W_Q.weight)
+                    torch.nn.init.xavier_uniform_(pdlc_head.W_K.weight)
+                    # Reset temperature and bias to defaults
+                    with torch.no_grad():
+                        pdlc_head._tau_param.zero_()
+                        pdlc_head.bias.zero_()
+        except Exception as e:
+            if self.master_process:
+                print(f"Warning: failed to reinitialize TabPDL head parameters: {e}")
+
         # Optionally load optimizer and scheduler state
         if self.config.only_load_model:
             print("Only loading model weights")
@@ -1057,6 +1081,25 @@ class Trainer:
                     loss = loss_bce + lambda_ce * loss_ce
                 else:
                     loss = loss_bce
+                # --- Symmetry enforcement for PDLC training ---
+                if getattr(self.config, "pdlc_symmetrize", False) or aux.get("pair_logits_sq", None) is not None:
+                    if "pair_logits_sq" in aux:
+                        pair_logits_sq = aux["pair_logits_sq"].transpose(1, 2)  # (B, M, N)
+                        S_rev_flat = pair_logits_sq[M_mask]
+
+                        # Use the same pos_weight / criterion for consistency
+                        loss_bce_rev = criterion(S_rev_flat, T_flat)
+
+                        # Equivalent to training on both (q,a) and (a,q) pairs
+                        loss_bce = 0.5 * (loss_bce + loss_bce_rev)
+
+                        # Recompute total loss if needed
+                        if lambda_ce > 0.0:
+                            loss = loss_bce + lambda_ce * loss_ce
+                        else:
+                            loss = loss_bce
+                # --------------------------------------------
+
 
             # Scale loss for gradient accumulation and backpropagate
             scaled_loss = loss / num_micro_batches

@@ -291,6 +291,17 @@ def build_parser():
             "restricted to the TabPDL head via detached embeddings."
         ),
     )
+    parser.add_argument(
+        "--pdlc_reinit_head",
+        default=False,
+        type=str2bool,
+        help=(
+            "If True and icl_head='tabpdl', reinitialize the TabPDL head projections "
+            "(W_Q, W_K) and temperature/bias (tau, bias) *after* loading a checkpoint. "
+            "Useful for using a Stage-1 backbone while training a fresh PDLC head "
+            "with a different aggregation mode in Stage-2."
+        ),
+    )
 
     # Shared Architecture Config
     parser.add_argument("--ff_factor", type=int, default=2, help="Expansion factor for feedforward dimensions")
