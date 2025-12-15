@@ -202,6 +202,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         elliptical_scale_boost: float = 1.0,
         pdlc_agg: Optional[str] = None,
         pdlc_inference_temperature: Optional[float] = None,
+        # Deprecated: PDLC symmetrization is no longer supported; kept for API compatibility.
         pdlc_symmetrize: Optional[bool] = None,
     ):
         self.n_estimators = n_estimators
@@ -371,8 +372,7 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
                     pdlc_conf["agg"] = self.pdlc_agg
                 if getattr(self, "pdlc_inference_temperature", None) is not None:
                     pdlc_conf["Inference_temperature"] = float(self.pdlc_inference_temperature)
-                if getattr(self, "pdlc_symmetrize", None) is not None:
-                    pdlc_conf["symmetrize"] = bool(self.pdlc_symmetrize)
+                # PDLC symmetrization is ignored.
                 cfg = dict(cfg)
                 cfg["pdlc_config"] = pdlc_conf
         except Exception:

@@ -256,16 +256,17 @@ def build_parser():
         choices=["none", "l2", "layernorm"],
         help="Embedding normalization applied before the TabPDL comparator.",
     )
-    parser.add_argument(
-        "--pdlc_symmetrize",
-        default=False,
-        type=str2bool,
-        help=(
-            "If True and icl_head='tabpdl', symmetrize pairwise PDLC probabilities as "
-            "0.5 * (gamma(q,a) + gamma(a,q)) before aggregation. "
-            "Currently only supported in non-chunked inference (no very large tables)."
-        ),
-    )
+    # Deprecated: symmetrization support has been removed from the TabPDL head.
+    # parser.add_argument(
+    #     "--pdlc_symmetrize",
+    #     default=False,
+    #     type=str2bool,
+    #     help=(
+    #         "If True and icl_head='tabpdl', symmetrize pairwise PDLC probabilities as "
+    #         "0.5 * (gamma(q,a) + gamma(a,q)) before aggregation. "
+    #         "Currently only supported in non-chunked inference (no very large tables)."
+    #     ),
+    # )
     parser.add_argument(
         "--pdlc_tau_lr",
         type=float,

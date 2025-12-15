@@ -31,9 +31,7 @@ class TabPDLHeadConfig:
         (training is unaffected). Ignored when agg == "sum", where an
         automatic sqrt(N) scaling is used instead.
     symmetrize:
-        If True, use symmetrized pairwise scores:
-        gamma_sym(q, a) = 0.5 * (gamma(q, a) + gamma(a, q)).
-        Implemented for both training (non-chunked) and inference.
+        Deprecated. Kept for config compatibility but ignored.
     """
 
     topk: Optional[int] = None
@@ -145,35 +143,6 @@ class TabPDLHead(nn.Module):
         # Mask + optional top-k
         logits = self._apply_support_mask_and_topk(logits, support_mask)
         return logits
-
-    def _pair_logits_reverse(
-        self,
-        H_support: torch.Tensor,        # (B, N, D) -- treated as queries
-        H_query: torch.Tensor,          # (B, M, D) -- treated as supports
-        support_mask: torch.Tensor,     # (B, N)    -- mask over anchors
-    ) -> torch.Tensor:
-        """Compute reverse logits ell(a, q) with correct anchor masking.
-
-        The "queries" in this call are the anchors (support points) and are
-        masked by support_mask along the N dimension.
-        """
-        # Normalize
-        Ha = self._normalize_embeddings(H_support)  # (B, N, D)
-        Hq = self._normalize_embeddings(H_query)    # (B, M, D)
-
-        # Project
-        Q_a = self.W_Q(Ha)  # (B, N, D)
-        K_q = self.W_K(Hq)  # (B, M, D)
-
-        # Bilinear score ell(a, q): (B, N, M)
-        logits = torch.matmul(Q_a, K_q.transpose(-1, -2))
-        logits = self.tau * logits + self.bias
-
-        # Mask invalid anchors on the query side (N dimension)
-        if support_mask is not None:
-            logits = logits.masked_fill(~support_mask.unsqueeze(-1), float("-inf"))
-
-        return logits  # (B, N, M)
 
     # ------------------------------------------------------------------
     # Aggregators
@@ -350,12 +319,6 @@ class TabPDLHead(nn.Module):
 
         num_classes = int(y_support[support_mask].max().item()) + 1
         num_classes = min(num_classes, self.max_classes)
-        # Disallow symmetrization with top-k for now (semantics are tricky)
-        if self.cfg.symmetrize and self.cfg.topk is not None:
-            raise ValueError(
-                "pdlc_symmetrize=True with pdlc_topk is not supported. "
-                "Set pdlc_topk=None when using symmetrization."
-            )
 
         should_chunk = (not self.training) and (B * M * N > self._CHUNK_FLOP_THRESHOLD)
 
@@ -394,21 +357,12 @@ class TabPDLHead(nn.Module):
         support_mask: torch.Tensor,
         num_classes: int,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
-        """Non-chunked forward pass with optional symmetrization."""
+        """Non-chunked forward pass (no symmetrization)."""
         # Forward logits ell(q, a)
         pair_logits_qs = self._pair_logits(H_query, H_support, support_mask)  # (B, M, N)
 
-        if self.cfg.symmetrize:
-            # Reverse logits ell(a, q) with correct anchor masking
-            pair_logits_sq = self._pair_logits_reverse(H_support, H_query, support_mask)  # (B, N, M)
-
-            gamma_qs = torch.sigmoid(pair_logits_qs)                 # (B, M, N)
-            gamma_sq = torch.sigmoid(pair_logits_sq).transpose(1, 2)  # (B, M, N)
-
-            gamma = 0.5 * (gamma_qs + gamma_sq)
-        else:
-            pair_logits_sq = None
-            gamma = torch.sigmoid(pair_logits_qs)
+        # Pairwise "same-class" probabilities gamma(q, a)
+        gamma = torch.sigmoid(pair_logits_qs)  # (B, M, N)
 
         # Aggregate to class-level scores
         scores = self._aggregate(gamma, y_support, support_mask, num_classes)  # (B, M, C)
@@ -426,8 +380,6 @@ class TabPDLHead(nn.Module):
             "support_mask": support_mask,
             "tau": self.tau,
         }
-        if pair_logits_sq is not None:
-            aux["pair_logits_sq"] = pair_logits_sq
 
         return logits_query, aux
 
@@ -450,7 +402,6 @@ class TabPDLHead(nn.Module):
         # Pre-normalize supports and project once
         Hs_norm = self._normalize_embeddings(H_support)  # (B, N, D)
         K_support = self.W_K(Hs_norm)                   # (B, N, D)
-        Q_support = self.W_Q(Hs_norm) if self.cfg.symmetrize else None
 
         scores = H_support.new_zeros((B, M, num_classes))
 
@@ -468,19 +419,7 @@ class TabPDLHead(nn.Module):
             logits_qs = self._apply_support_mask_and_topk(logits_qs, support_mask)
             gamma_qs = torch.sigmoid(logits_qs)             # (B, m, N)
 
-            if self.cfg.symmetrize:
-                assert Q_support is not None  # for mypy
-                # Reverse logits ell(a, q_chunk): (B, N, m)
-                K_chunk = self.W_K(Hq_norm)   # (B, m, D)
-                logits_sq = torch.matmul(Q_support, K_chunk.transpose(-1, -2))
-                logits_sq = self.tau * logits_sq + self.bias
-                # Mask invalid anchors on the query side (N)
-                logits_sq = logits_sq.masked_fill(~support_mask.unsqueeze(-1), float("-inf"))
-                gamma_sq = torch.sigmoid(logits_sq).transpose(1, 2)  # (B, m, N)
-
-                gamma_chunk = 0.5 * (gamma_qs + gamma_sq)
-            else:
-                gamma_chunk = gamma_qs
+            gamma_chunk = gamma_qs
 
             # Aggregate for this chunk
             scores_chunk = self._aggregate(gamma_chunk, y_support, support_mask, num_classes)  # (B, m, C)

@@ -220,7 +220,9 @@ class Trainer:
                 "topk": getattr(self.config, "pdlc_topk", None),
                 "agg": getattr(self.config, "pdlc_agg", "posterior_avg"),
                 "embed_norm": getattr(self.config, "pdlc_embed_norm", "none"),
-                "symmetrize": getattr(self.config, "pdlc_symmetrize", False),
+                # NOTE: symmetrization support has been removed in TabPDLHead;
+                # the config key is kept for compatibility but ignored.
+                # "symmetrize": getattr(self.config, "pdlc_symmetrize", False),
             },
         }
 
@@ -1081,24 +1083,7 @@ class Trainer:
                     loss = loss_bce + lambda_ce * loss_ce
                 else:
                     loss = loss_bce
-                # --- Symmetry enforcement for PDLC training ---
-                if getattr(self.config, "pdlc_symmetrize", False) or aux.get("pair_logits_sq", None) is not None:
-                    if "pair_logits_sq" in aux:
-                        pair_logits_sq = aux["pair_logits_sq"].transpose(1, 2)  # (B, M, N)
-                        S_rev_flat = pair_logits_sq[M_mask]
-
-                        # Use the same pos_weight / criterion for consistency
-                        loss_bce_rev = criterion(S_rev_flat, T_flat)
-
-                        # Equivalent to training on both (q,a) and (a,q) pairs
-                        loss_bce = 0.5 * (loss_bce + loss_bce_rev)
-
-                        # Recompute total loss if needed
-                        if lambda_ce > 0.0:
-                            loss = loss_bce + lambda_ce * loss_ce
-                        else:
-                            loss = loss_bce
-                # --------------------------------------------
+                # Symmetry enforcement for PDLC training has been removed.
 
 
             # Scale loss for gradient accumulation and backpropagate
