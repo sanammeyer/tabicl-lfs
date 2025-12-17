@@ -627,42 +627,58 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         # May be fewer than requested if dataset has quite limited features and classes
         n_estimators = len(class_shift_offsets)
 
-        # Aggregate predictions from all ensemble members, correcting for class shifts
-        avg = None
+        # Reverse class shifts for each ensemble member up front
+        member_outputs = []
         for i, offset in enumerate(class_shift_offsets):
             out = outputs[i]
             # Reverse the class shift
             out = np.concatenate([out[..., offset:], out[..., :offset]], axis=-1)
+            member_outputs.append(out)
 
-            if avg is None:
-                avg = out
-            else:
-                avg += out
+        icl_head = getattr(self, "icl_head", "tabicl")
 
-        # Calculate ensemble average
-        avg /= n_estimators
-
-        # Convert logits to probabilities if required
-        if self.average_logits:
-            # For the standard TabICL head, treat outputs as logits and apply
-            # temperature-scaled softmax. For the TabPDL head, outputs are
-            # already log-probabilities from the PDLC aggregation, so we
-            # exponentiate and renormalize instead of applying a second softmax.
-            icl_head = getattr(self, "icl_head", "tabicl")
-            if icl_head == "tabpdl":
-                # avg is log P(c|x); convert to probabilities in a numerically
-                # stable way without applying additional temperature scaling.
-                x = avg
+        # Aggregate predictions from all ensemble members.
+        # For TabPDL with average_logits=True, treat member outputs as log-scores
+        # and first convert each member to probabilities (mixture in probability
+        # space). For all other cases, keep the existing behavior.
+        if icl_head == "tabpdl" and self.average_logits:
+            avg = None
+            for out in member_outputs:
+                # out is a per-member log-score tensor (logits or log-probabilities);
+                # convert to probabilities in a numerically stable way.
+                x = out
                 x_max = np.max(x, axis=-1, keepdims=True)
                 e_x = np.exp(x - x_max)
-                avg = e_x / np.sum(e_x, axis=-1, keepdims=True)
-            else:
+                p = e_x / np.sum(e_x, axis=-1, keepdims=True)
+                if avg is None:
+                    avg = p
+                else:
+                    avg += p
+            # Mixture over ensemble members
+            avg /= n_estimators
+        else:
+            # Original aggregation: average outputs directly, then apply the
+            # appropriate normalization depending on head type.
+            avg = None
+            for out in member_outputs:
+                if avg is None:
+                    avg = out
+                else:
+                    avg += out
+
+            # Calculate ensemble average in the output space (logits or probabilities)
+            avg /= n_estimators
+
+            # Convert logits to probabilities if required
+            if self.average_logits:
+                # For the standard TabICL head, treat outputs as logits and apply
+                # temperature-scaled softmax.
                 avg = self.softmax(avg, axis=-1, temperature=self.softmax_temperature)
 
         if self.n_jobs is not None:
             torch.set_num_threads(old_n_threads)
 
-        # Normalize probabilities to sum to 1
+        # Normalize probabilities to sum to 1 (harmless if already normalized)
         return avg / avg.sum(axis=1, keepdims=True)
 
     def predict(self, X):

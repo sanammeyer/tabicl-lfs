@@ -107,6 +107,26 @@ class Trainer:
             "lr",
             "prior_time",
             "train_time",
+            # PDLC training diagnostics
+            "pdlc_pos_weight",
+            "pdlc_pos_frac",
+            "pdlc_pair_logit_mean",
+            "pdlc_pair_logit_std",
+            "pdlc_pair_logit_pos_mean",
+            "pdlc_pair_logit_neg_mean",
+            "pdlc_logit_gap",
+            "pdlc_gamma_pos_mean",
+            "pdlc_gamma_neg_mean",
+            "pdlc_gamma_gap",
+            "pdlc_gamma_saturated_low",
+            "pdlc_gamma_saturated_high",
+            "pdlc_neff_mean",
+            "pdlc_neff_median",
+            "pdlc_entropy",
+            "pdlc_max_prob",
+            "pdlc_prob_gap",
+            "pdlc_prior_entropy",
+            "pdlc_entropy_reduction",
             # Probe metrics (may be empty when not on probe step)
             "probe/attn_kl_mean",
             "probe/attn_entropy_mean",
@@ -1099,11 +1119,116 @@ class Trainer:
                 micro_results["ce"] = ce_val.item() / num_micro_batches
                 # Log PDLC pairwise BCE component (unscaled by CE weight)
                 micro_results["bce"] = (loss_bce.item() / num_micro_batches)
+                # Pairwise class-balance diagnostics
+                micro_results["pdlc_pos_weight"] = float(pos_weight) / num_micro_batches
+                pos_frac = (n_pos / (n_total + eps)).item()
+                micro_results["pdlc_pos_frac"] = pos_frac / num_micro_batches
+                # Pairwise logit statistics (pre-sigmoid)
+                try:
+                    pair_mean = S_flat.mean()
+                    pair_std = S_flat.std(unbiased=False)
+                    micro_results["pdlc_pair_logit_mean"] = float(pair_mean) / num_micro_batches
+                    micro_results["pdlc_pair_logit_std"] = float(pair_std) / num_micro_batches
+                    pos_mask = (T_flat == 1)
+                    neg_mask = (T_flat == 0)
+                    if pos_mask.any():
+                        logit_pos_mean = S_flat[pos_mask].mean()
+                        micro_results["pdlc_pair_logit_pos_mean"] = float(logit_pos_mean) / num_micro_batches
+                    if neg_mask.any():
+                        logit_neg_mean = S_flat[neg_mask].mean()
+                        micro_results["pdlc_pair_logit_neg_mean"] = float(logit_neg_mean) / num_micro_batches
+                    if pos_mask.any() and neg_mask.any():
+                        logit_gap = logit_pos_mean - logit_neg_mean
+                        micro_results["pdlc_logit_gap"] = float(logit_gap) / num_micro_batches
+                except Exception:
+                    pass
                 # Optional: log current PDLC temperature tau if available from aux
                 try:
                     tau_val = aux.get("tau", None)
                     if tau_val is not None:
                         micro_results["pdlc_tau"] = float(tau_val) / num_micro_batches
+                except Exception:
+                    pass
+                # Optional: gamma diagnostics (mean gamma for positive/negative pairs,
+                # separation gap, saturation, and effective support size)
+                try:
+                    gamma = aux.get("gamma", None)
+                    if gamma is not None:
+                        gamma_flat = gamma[M_mask]
+                        if gamma_flat.numel() == T_flat.numel():
+                            pos_mask = (T_flat == 1)
+                            neg_mask = (T_flat == 0)
+                            if pos_mask.any():
+                                gamma_pos_mean = gamma_flat[pos_mask].mean()
+                                micro_results["pdlc_gamma_pos_mean"] = float(gamma_pos_mean) / num_micro_batches
+                            if neg_mask.any():
+                                gamma_neg_mean = gamma_flat[neg_mask].mean()
+                                micro_results["pdlc_gamma_neg_mean"] = float(gamma_neg_mean) / num_micro_batches
+                            if pos_mask.any() and neg_mask.any():
+                                gamma_gap = gamma_pos_mean - gamma_neg_mean
+                                micro_results["pdlc_gamma_gap"] = float(gamma_gap) / num_micro_batches
+                            # Saturation rates for gamma
+                            sat_low = (gamma_flat < 0.01).float().mean()
+                            sat_high = (gamma_flat > 0.99).float().mean()
+                            micro_results["pdlc_gamma_saturated_low"] = float(sat_low) / num_micro_batches
+                            micro_results["pdlc_gamma_saturated_high"] = float(sat_high) / num_micro_batches
+                        # Effective number of supports per query (using gamma over supports)
+                        try:
+                            B_eff, M_eff, N_eff = gamma.shape
+                            neff_values = []
+                            for b_idx in range(B_eff):
+                                mask_b = support_mask[b_idx].bool()
+                                if not mask_b.any():
+                                    continue
+                                g_b = gamma[b_idx][:, mask_b]  # (M_eff, N_valid)
+                                # Sum over supports for each query
+                                sum_g = g_b.sum(dim=1, keepdim=True)
+                                valid_q = (sum_g.squeeze(-1) > 1e-8)
+                                if not valid_q.any():
+                                    continue
+                                w = g_b[valid_q] / sum_g[valid_q].clamp_min(1e-8)
+                                neff_q = 1.0 / (w * w).sum(dim=1)
+                                neff_values.append(neff_q)
+                            if neff_values:
+                                neff_all = torch.cat(neff_values, dim=0)
+                                neff_mean = neff_all.mean()
+                                neff_median = neff_all.median()
+                                micro_results["pdlc_neff_mean"] = float(neff_mean) / num_micro_batches
+                                micro_results["pdlc_neff_median"] = float(neff_median) / num_micro_batches
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                # Class-level confidence diagnostics: entropy and max probability
+                try:
+                    log_probs = F.log_softmax(pred_flat, dim=1)
+                    probs = log_probs.exp()
+                    entropy = -(probs * log_probs).sum(dim=1).mean()
+                    max_prob = probs.max(dim=1).values.mean()
+                    micro_results["pdlc_entropy"] = float(entropy) / num_micro_batches
+                    micro_results["pdlc_max_prob"] = float(max_prob) / num_micro_batches
+                    # Class-probability gap (top-1 vs top-2)
+                    top2_vals, _ = probs.topk(k=2, dim=1)
+                    prob_gap = (top2_vals[:, 0] - top2_vals[:, 1]).mean()
+                    micro_results["pdlc_prob_gap"] = float(prob_gap) / num_micro_batches
+                    # Prior vs posterior entropy (based on support label frequencies)
+                    try:
+                        # Compute prior from support labels y_train
+                        prior_entropies = []
+                        for b_idx in range(B):
+                            y_b = y_train[b_idx]
+                            counts = torch.bincount(y_b.long())
+                            p = counts.float() / counts.sum().clamp_min(1.0)
+                            prior_entropy_b = -(p * p.clamp_min(1e-12).log()).sum()
+                            prior_entropies.append(prior_entropy_b)
+                        if prior_entropies:
+                            prior_entropy = torch.stack(prior_entropies).mean()
+                            micro_results["pdlc_prior_entropy"] = float(prior_entropy) / num_micro_batches
+                            # Entropy reduction: prior - posterior
+                            ent_reduction = prior_entropy - entropy
+                            micro_results["pdlc_entropy_reduction"] = float(ent_reduction) / num_micro_batches
+                    except Exception:
+                        pass
                 except Exception:
                     pass
                 accuracy = (pred_flat.argmax(dim=1) == true_flat).sum() / len(true_flat)
