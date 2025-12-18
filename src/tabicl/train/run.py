@@ -1291,7 +1291,8 @@ class Trainer:
         micro_batches = [torch.split(t, self.config.micro_batch_size, dim=0) for t in batch]
         micro_batches = list(zip(*micro_batches))
 
-        # Accumulate metrics across micro-batches; include optional BCE slot
+        # Accumulate metrics across micro-batches; seed with core fields but
+        # allow additional keys to be added dynamically from micro_results.
         results = {"ce": 0.0, "bce": 0.0, "pdlc_tau": 0.0, "accuracy": 0.0}
         failed_batches = 0
 
@@ -1299,7 +1300,7 @@ class Trainer:
             try:
                 micro_results = self.run_micro_batch(micro_batch, idx, num_micro_batches)
                 for k, v in micro_results.items():
-                    results[k] += v
+                    results[k] = results.get(k, 0.0) + v
             except torch.cuda.OutOfMemoryError:
                 print(
                     f"Warning: OOM error in micro-batch {idx+1}/{num_micro_batches} at step {self.curr_step}. Skipping."
