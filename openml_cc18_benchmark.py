@@ -35,6 +35,18 @@ from benchmark_utils import load_dataset as _unused_load_dataset  # kept for ref
 from benchmark_utils import compute_metrics, compute_dataset_metadata
 
 
+def _str2bool(v: str | bool) -> bool:
+    """Minimal boolean parser for CLI flags (mirrors training str2bool behavior)."""
+    if isinstance(v, bool):
+        return v
+    val = v.lower()
+    if val in {"yes", "true", "t", "y", "1"}:
+        return True
+    if val in {"no", "false", "f", "n", "0"}:
+        return False
+    raise argparse.ArgumentTypeError(f"Boolean value expected, got '{v}'.")
+
+
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Benchmark OpenML-CC18 with 10-fold CV")
     p.add_argument("--model", choices=["tabicl", "tabpfn"], default="tabicl", help="Model to benchmark")
@@ -66,6 +78,17 @@ def parse_args() -> argparse.Namespace:
             "a checkpoint trained with the TabPDL head. Ignored for standard TabICL."
         ),
     )
+    # Deprecated: PDLC symmetrization is no longer supported and this flag is ignored.
+    # p.add_argument(
+    #     "--pdlc_symmetrize",
+    #     type=_str2bool,
+    #     default=None,
+    #     help=(
+    #         "Optional override for PDLC symmetrization at inference when using "
+    #         "a checkpoint trained with the TabPDL head. When omitted, the checkpoint "
+    #         "setting is used; when set, it forces symmetrization on or off."
+    #     ),
+    # )
     p.add_argument("--limit", type=int, default=None, help="Limit number of tasks for quick runs")
     p.add_argument(
         "--output",
@@ -117,6 +140,7 @@ def evaluate_task_tabicl(
     n_estimators: int,
     elliptical_scale_boost: float,
     pdlc_agg: Optional[str],
+    pdlc_inference_temperature: Optional[float],
     n_rows: int,
     max_features: int,
     max_classes: int,
@@ -200,6 +224,7 @@ def evaluate_task_tabicl(
                 elliptical_scale_boost=elliptical_scale_boost,
                 random_state=seed,
                 pdlc_agg=pdlc_agg,
+                pdlc_inference_temperature=pdlc_inference_temperature,
             )
             t0 = time.perf_counter()
             clf.fit(X_train, y_train)
@@ -425,6 +450,7 @@ def main():
                     n_estimators=args.n_estimators,
                     elliptical_scale_boost=args.elliptical_scale_boost,
                     pdlc_agg=args.pdlc_agg,
+                    pdlc_inference_temperature=args.pdlc_inference_temperature,
                     n_rows=args.n_rows,
                     max_features=args.max_features,
                     max_classes=args.max_classes,
