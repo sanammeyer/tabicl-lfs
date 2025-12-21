@@ -43,9 +43,8 @@ def compute_elliptical_diag(
     with torch.no_grad():
         value_diff = (v - v_prev) / float(delta)
         nd = value_diff.dim()
-        head_idx = nd - 3
-        dim_idx = nd - 1
-        reduce_dims = tuple(i for i in range(nd) if i not in (head_idx, dim_idx))
+        len_idx = -2
+        reduce_dims = (len_idx,)
         if mask_keep is not None:
             # mask_keep expected to indicate which key positions to include
             # Accept 1D (L,) mask; broadcast to (..., 1, L, 1)
@@ -149,7 +148,6 @@ def multi_head_attention_forward(
     elliptical_scale_mode: str = "max",
     # Testing/override controls
     elliptical_force_identity: bool = False,
-    elliptical_manual_m: Optional[Tensor] = None,
     # TFrow-specific controls: exclude CLS tokens from EA
     row_num_cls: Optional[int] = None,
     exclude_cls_from_ea: bool = False,
@@ -232,60 +230,9 @@ def multi_head_attention_forward(
     q = q.view(*batch_shape, tgt_len, num_heads, head_dim).transpose(-3, -2)  # (batch_shape, nh, tgt_len, hs)
     k = k.view(*batch_shape, src_len, num_heads, head_dim).transpose(-3, -2)  # (batch_shape, nh, src_len, hs)
     v = v.view(*batch_shape, src_len, num_heads, head_dim).transpose(-3, -2)  # (batch_shape, nh, src_len, hs)
-
-    # Apply rotary position embeddings if provided
-    if rope is not None:
-        q = rope.rotate_queries_or_keys(q)
-        k = rope.rotate_queries_or_keys(k)
-
-    # Apply elliptical per-head scaling to queries and keys (diagonal Mahalanobis)
-    if elliptical_manual_m is not None:
-        if elliptical_manual_m.shape != (num_heads, head_dim):
-            raise ValueError(
-                f"elliptical_manual_m must have shape (num_heads={num_heads}, head_dim={head_dim}), got {elliptical_manual_m.shape}"
-            )
-        if exclude_cls_from_ea and (row_num_cls is not None) and (row_num_cls > 0):
-            # Per-time scaling: 1 for CLS positions, m for feature positions
-            scale = torch.ones_like(q)
-            m_bc = elliptical_manual_m.view(1, 1, num_heads, 1, head_dim).to(dtype=q.dtype, device=q.device)
-            if q.shape[-2] > row_num_cls:
-                tgt = scale[..., :, row_num_cls:, :]
-                scale[..., :, row_num_cls:, :] = m_bc.expand(tgt.shape)
-            q = q * scale
-            k = k * scale
-        else:
-            m_bc = elliptical_manual_m.view(*([1] * (v.dim() - 2)), num_heads, 1, head_dim).to(dtype=q.dtype, device=q.device)
-            q = q * m_bc
-            k = k * m_bc
-    elif elliptical_force_identity:
-        # Identity metric fallback: no scaling
-        pass
-    elif elliptical_scale is not None:
-        # Expected to be broadcastable over q: (..., nh, tgt_len, head_dim)
-        # Typical shapes: (1, nh, 1, head_dim) or (B, nh, 1, head_dim)
-        if elliptical_scale.dim() < 4:
-            raise ValueError(
-                f"elliptical_scale must have at least 4 dims (..., nh, 1|T, hs), got {elliptical_scale.shape}"
-            )
-        if elliptical_scale.shape[-1] != head_dim:
-            raise ValueError(
-                f"elliptical_scale head_dim mismatch: expected {head_dim}, got {elliptical_scale.shape[-1]}"
-            )
-        if elliptical_scale.shape[-3] != num_heads:
-            raise ValueError(
-                f"elliptical_scale num_heads mismatch: expected {num_heads} at dim -3, got {elliptical_scale.shape[-3]}"
-            )
-        if elliptical_scale.shape[-2] not in (1, tgt_len):
-            raise ValueError(
-                f"elliptical_scale time dim must be 1 or tgt_len ({tgt_len}), got {elliptical_scale.shape[-2]}"
-            )
-
-        # Cast to q/k dtype/device
-        elliptical_scale = elliptical_scale.to(dtype=q.dtype, device=q.device)
-        # No normalization here: any regularization handled during training
-        q = q * elliptical_scale
-        k = k * elliptical_scale
-    elif elliptical and v_prev is not None:
+    
+        
+    if elliptical and v_prev is not None:
         if v_prev.shape != v.shape:
             raise ValueError(f"v_prev shape {v_prev.shape} must match v shape {v.shape} for elliptical estimator")
         if exclude_cls_from_ea and (row_num_cls is not None) and (row_num_cls > 0):
@@ -297,8 +244,9 @@ def multi_head_attention_forward(
             else:
                 m = compute_elliptical_diag(v, v_prev, delta=elliptical_delta, scale_mode=elliptical_scale_mode)
             # Build per-time scale
+            sqrt_m = torch.sqrt(m.clamp_min(1e-12)).to(dtype=q.dtype, device=q.device)
+            m_bc = sqrt_m.unsqueeze(-2)
             scale = torch.ones_like(q)
-            m_bc = m.view(1, 1, m.shape[0], 1, m.shape[1]).to(dtype=q.dtype, device=q.device)
             if q.shape[-2] > row_num_cls:
                 tgt = scale[..., :, row_num_cls:, :]
                 scale[..., :, row_num_cls:, :] = m_bc.expand(tgt.shape)
@@ -314,9 +262,44 @@ def multi_head_attention_forward(
             else:
                 m = compute_elliptical_diag(v, v_prev, delta=elliptical_delta, scale_mode=elliptical_scale_mode)
             # Broadcast to (..., nh, 1, hs)
-            m_bc = m.view(*([1] * (v.dim() - 2)), m.shape[0], 1, m.shape[1])
+            sqrt_m = torch.sqrt(m.clamp_min(1e-12)).to(dtype=q.dtype, device=q.device)
+            m_bc = sqrt_m.unsqueeze(-2)
             q = q * m_bc
             k = k * m_bc
+    elif elliptical_force_identity:
+        # Identity metric fallback: no scaling
+        pass
+    # elif elliptical_scale is not None:
+    #     # Expected to be broadcastable over q: (..., nh, tgt_len, head_dim)
+    #     # Typical shapes: (1, nh, 1, head_dim) or (B, nh, 1, head_dim)
+    #     if elliptical_scale.dim() < 4:
+    #         raise ValueError(
+    #             f"elliptical_scale must have at least 4 dims (..., nh, 1|T, hs), got {elliptical_scale.shape}"
+    #         )
+    #     if elliptical_scale.shape[-1] != head_dim:
+    #         raise ValueError(
+    #             f"elliptical_scale head_dim mismatch: expected {head_dim}, got {elliptical_scale.shape[-1]}"
+    #         )
+    #     if elliptical_scale.shape[-3] != num_heads:
+    #         raise ValueError(
+    #             f"elliptical_scale num_heads mismatch: expected {num_heads} at dim -3, got {elliptical_scale.shape[-3]}"
+    #         )
+    #     if elliptical_scale.shape[-2] not in (1, tgt_len):
+    #         raise ValueError(
+    #             f"elliptical_scale time dim must be 1 or tgt_len ({tgt_len}), got {elliptical_scale.shape[-2]}"
+    #         )
+
+    #     # Cast to q/k dtype/device
+    #     elliptical_scale = elliptical_scale.to(dtype=q.dtype, device=q.device)
+    #     # No normalization here: any regularization handled during training
+    #     q = q * elliptical_scale
+    #     k = k * elliptical_scale
+
+    
+    # Apply rotary position embeddings if provided
+    if rope is not None:
+        q = rope.rotate_queries_or_keys(q)
+        k = rope.rotate_queries_or_keys(k)
 
     # Disable dropout during evaluation
     if not training:

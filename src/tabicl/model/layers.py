@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import List, Optional
+from typing import Callable, List, Optional, Tuple
 
 import torch
 from torch import nn, Tensor
@@ -68,7 +68,7 @@ class OneHotAndLinear(nn.Linear):
         self.num_classes = num_classes
         self.embed_dim = embed_dim
 
-    def forward(self, src: Tensor) -> Tensor:
+    def forward(self, input: Tensor) -> Tensor:
         """Transform integer indices to dense embeddings.
 
         Parameters
@@ -82,7 +82,7 @@ class OneHotAndLinear(nn.Linear):
             Embedded representation of shape (batch_size, sequence_length, embed_dim)
         """
         # Convert indices to one-hot vectors and apply linear projection
-        one_hot = F.one_hot(src.long(), self.num_classes).to(src.dtype)
+        one_hot = F.one_hot(input.long(), self.num_classes).to(input.dtype)
         return F.linear(one_hot, self.weight, self.bias)
 
 
@@ -111,12 +111,12 @@ class SkippableLinear(nn.Linear):
         super().__init__(in_features, out_features, bias)
         self.skip_value = skip_value
 
-    def forward(self, src: Tensor) -> Tensor:
+    def forward(self, input: Tensor) -> Tensor:
         """Forward pass that handles inputs flagged with `skip_value`.
 
         Parameters
         ----------
-        src : Tensor
+        input : Tensor
             Input tensor of shape (..., in_features)
 
         Returns
@@ -126,8 +126,8 @@ class SkippableLinear(nn.Linear):
             to skipped inputs are filled with `skip_value`
         """
 
-        out = F.linear(src, self.weight, self.bias)
-        skip_mask = (src == self.skip_value).all(dim=-1)
+        out = F.linear(input, self.weight, self.bias)
+        skip_mask = (input == self.skip_value).all(dim=-1)
         if skip_mask.any():
             out[skip_mask] = self.skip_value
 
@@ -257,10 +257,13 @@ class MultiheadAttention(nn.MultiheadAttention):
         key: Tensor,
         value: Tensor,
         key_padding_mask: Optional[Tensor] = None,
+        need_weights: bool = False,
         attn_mask: Optional[Tensor | int] = None,
+        average_attn_weights: bool = False,
+        is_causal: bool = False,
         rope: Optional[RotaryEmbedding] = None,
         elliptical_scale: Optional[Tensor] = None,
-    ) -> Tensor:
+    ) -> Tuple[Tensor, Optional[Tensor]]:
         """Compute multi-head attention with support for rotary positional encoding.
 
         Parameters
@@ -317,7 +320,7 @@ class MultiheadAttention(nn.MultiheadAttention):
             rope=rope,
             elliptical_scale=elliptical_scale,
         )
-        return attn_out
+        return attn_out, None
 
 
 class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
@@ -351,7 +354,7 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         nhead: int,
         dim_feedforward: int,
         dropout: float = 0.0,
-        activation: str | callable = "gelu",
+        activation: str | Callable = "gelu",
         norm_first: bool = True,
         elliptical: bool = False,
     ):
@@ -502,7 +505,6 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
             elliptical_delta=self.elliptical_delta,
             elliptical_scale_mode=self.elliptical_scale_mode,
             elliptical_force_identity=(self.elliptical_override == "identity"),
-            elliptical_manual_m=(self.elliptical_manual_m if self.elliptical_override == "manual" else None),
             row_num_cls=getattr(self, "_row_num_cls", None),
             exclude_cls_from_ea=bool(getattr(self, "_exclude_cls_from_ea", False)),
         )
@@ -565,7 +567,7 @@ class InducedSelfAttentionBlock(nn.Module):
         dim_feedforward: int,
         num_inds: int,
         dropout: float = 0.0,
-        activation: str | callable = "gelu",
+        activation: str | Callable = "gelu",
         norm_first: bool = True,
         skip_value: float = -100.0,
         elliptical: bool = False,
