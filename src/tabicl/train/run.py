@@ -133,6 +133,31 @@ class Trainer:
             "probe/delta_ce",
             "probe/ce",
             "probe/chance_entropy",
+            # Elliptical Attention diagnostics (TFrow / TFicl; layer indices are 1-based)
+            "row_L2_context_div",
+            "row_L2_sparsity",
+            "row_L2_scale_mean",
+            "row_L2_feat_velocity",
+            "row_L2_q_norm",
+            "row_L2_logit_mean",
+            "row_L12_context_div",
+            "row_L12_sparsity",
+            "row_L12_scale_mean",
+            "row_L12_feat_velocity",
+            "row_L12_q_norm",
+            "row_L12_logit_mean",
+            "icl_L2_context_div",
+            "icl_L2_sparsity",
+            "icl_L2_scale_mean",
+            "icl_L2_feat_velocity",
+            "icl_L2_q_norm",
+            "icl_L2_logit_mean",
+            "icl_L12_context_div",
+            "icl_L12_sparsity",
+            "icl_L12_scale_mean",
+            "icl_L12_feat_velocity",
+            "icl_L12_q_norm",
+            "icl_L12_logit_mean",
         ]
 
     def configure_ddp(self):
@@ -190,6 +215,11 @@ class Trainer:
         """Set up Weights & Biases logging."""
 
         if self.config.wandb_log and self.master_process:
+            # Ensure checkpoint directory exists for wandb run-id bookkeeping
+            if self.config.checkpoint_dir is None:
+                raise ValueError("checkpoint_dir must be set when wandb_log is True.")
+            os.makedirs(self.config.checkpoint_dir, exist_ok=True)
+
             id_path = os.path.join(self.config.checkpoint_dir, "wand_id.txt")
             if self.config.wandb_id is None:
                 if os.path.exists(id_path):
@@ -874,6 +904,82 @@ class Trainer:
                 except Exception as e:
                     print(f"Error removing checkpoint {ckpt_path}: {e}")
 
+    @torch.no_grad()
+    def _collect_ea_metrics(self) -> dict:
+        """Collect Elliptical Attention diagnostics from TFrow and TFicl blocks.
+
+        Tracks (per-head, per-dim) metric statistics and basic stability
+        proxies for a small subset of layers (first EA layer and last layer)
+        in both the row interaction transformer (TFrow) and the ICL transformer (TFicl).
+        """
+        metrics: dict[str, float] = {}
+
+        # Helper: generic extraction for a stack of MultiheadAttentionBlock
+        def _extract_from_blocks(blocks, prefix: str) -> None:
+            if not blocks:
+                return
+            num_blocks = len(blocks)
+            layer_indices: set[int] = set()
+            if num_blocks >= 2:
+                layer_indices.add(1)  # First EA-capable layer
+            layer_indices.add(num_blocks - 1)  # Last layer
+
+            for idx in sorted(layer_indices):
+                blk = blocks[idx]
+                layer_key = f"{prefix}_L{idx + 1}"
+
+                m = getattr(blk, "last_m", None)
+                if isinstance(m, torch.Tensor):
+                    try:
+                        # Flatten all leading (sample) dimensions into one for context diversity
+                        if m.dim() >= 3:
+                            samples = int(m.numel() // (m.shape[-2] * m.shape[-1]))
+                            m_flat = m.reshape(samples, m.shape[-2], m.shape[-1])
+                        else:
+                            m_flat = m
+
+                        # Contextual diversity: variation of M across samples
+                        metrics[f"{layer_key}_context_div"] = m_flat.std(dim=0).mean().item()
+                        # Sparsity / anisotropy across feature dim
+                        metrics[f"{layer_key}_sparsity"] = m.std(dim=-1).mean().item()
+                        # Global scale of the ellipse
+                        metrics[f"{layer_key}_scale_mean"] = m.mean().item()
+                    except Exception:
+                        pass
+
+                val_diff = getattr(blk, "last_val_diff", None)
+                if isinstance(val_diff, torch.Tensor):
+                    # Layer-wise "velocity" of value representations
+                    metrics[f"{layer_key}_feat_velocity"] = float(val_diff.item())
+
+                q_norm = getattr(blk, "last_q_norm", None)
+                if isinstance(q_norm, torch.Tensor):
+                    metrics[f"{layer_key}_q_norm"] = float(q_norm.item())
+
+                logit_mean = getattr(blk, "last_logit_mean", None)
+                if isinstance(logit_mean, torch.Tensor):
+                    metrics[f"{layer_key}_logit_mean"] = float(logit_mean.item())
+
+        # TFrow (row interaction) EA metrics
+        try:
+            row_blocks = self.raw_model.row_interactor.tf_row.blocks  # type: ignore[attr-defined]
+        except Exception:
+            row_blocks = None
+
+        if row_blocks is not None and getattr(self.raw_model, "row_elliptical", False):
+            _extract_from_blocks(row_blocks, prefix="row")
+
+        # TFicl EA metrics
+        try:
+            icl_blocks = self.raw_model.icl_predictor.tf_icl.blocks  # type: ignore[attr-defined]
+        except Exception:
+            icl_blocks = None
+
+        if icl_blocks is not None and getattr(self.raw_model, "icl_elliptical", False):
+            _extract_from_blocks(icl_blocks, prefix="icl")
+
+        return metrics
+
     @ddp_cleanup
     def train(self):
         """Main training loop.
@@ -928,6 +1034,14 @@ class Trainer:
             if self.wandb_run is not None:
                 # Add learning rate to results
                 results["lr"] = self.scheduler.get_last_lr()[0]
+                # Attach Elliptical Attention diagnostics (if available)
+                try:
+                    ea_metrics = self._collect_ea_metrics()
+                    if ea_metrics:
+                        results.update(ea_metrics)
+                except Exception as e:
+                    if self.master_process:
+                        print(f"[warn] EA metrics collection failed at step {self.curr_step}: {e}")
                 wandb.log(results, step=self.curr_step)
 
             # Periodic diagnostics probe

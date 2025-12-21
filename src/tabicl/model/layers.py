@@ -319,6 +319,7 @@ class MultiheadAttention(nn.MultiheadAttention):
             attn_mask=attn_mask,
             rope=rope,
             elliptical_scale=elliptical_scale,
+            metrics_obj=None,
         )
         return attn_out, None
 
@@ -371,6 +372,11 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
         self.elliptical_manual_m: Optional[Tensor] = None  # shape (nhead, head_dim) when set
         # Cache for previous block to consume
         self._last_v: Optional[Tensor] = None
+        # EA diagnostics (populated when EA is active)
+        self.last_m: Optional[Tensor] = None
+        self.last_val_diff: Optional[Tensor] = None
+        self.last_q_norm: Optional[Tensor] = None
+        self.last_logit_mean: Optional[Tensor] = None
 
     def init_weights(self):
         """Initialize projection layers to zero for stable training."""
@@ -507,6 +513,7 @@ class MultiheadAttentionBlock(nn.TransformerEncoderLayer):
             elliptical_force_identity=(self.elliptical_override == "identity"),
             row_num_cls=getattr(self, "_row_num_cls", None),
             exclude_cls_from_ea=bool(getattr(self, "_exclude_cls_from_ea", False)),
+            metrics_obj=self,
         )
         self._last_v = v_heads.detach() if isinstance(v_heads, torch.Tensor) else None
         return self.dropout1(attn_out)

@@ -151,6 +151,8 @@ def multi_head_attention_forward(
     # TFrow-specific controls: exclude CLS tokens from EA
     row_num_cls: Optional[int] = None,
     exclude_cls_from_ea: bool = False,
+    # Optional metrics sink (e.g., a MultiheadAttentionBlock) for EA diagnostics
+    metrics_obj: Optional[object] = None,
 ) -> Tuple[Tensor, Tensor]:
     """Multi-head attention with support for rotary position embeddings
     as well as specialized processing when attn_mask is an integer.
@@ -230,8 +232,7 @@ def multi_head_attention_forward(
     q = q.view(*batch_shape, tgt_len, num_heads, head_dim).transpose(-3, -2)  # (batch_shape, nh, tgt_len, hs)
     k = k.view(*batch_shape, src_len, num_heads, head_dim).transpose(-3, -2)  # (batch_shape, nh, src_len, hs)
     v = v.view(*batch_shape, src_len, num_heads, head_dim).transpose(-3, -2)  # (batch_shape, nh, src_len, hs)
-    
-        
+
     if elliptical and v_prev is not None:
         if v_prev.shape != v.shape:
             raise ValueError(f"v_prev shape {v_prev.shape} must match v shape {v.shape} for elliptical estimator")
@@ -243,15 +244,29 @@ def multi_head_attention_forward(
                 m = compute_elliptical_diag(v_feat, v_prev_feat, delta=elliptical_delta, scale_mode=elliptical_scale_mode)
             else:
                 m = compute_elliptical_diag(v, v_prev, delta=elliptical_delta, scale_mode=elliptical_scale_mode)
-            # Build per-time scale
+            # Build per-time scale (CLS tokens unscaled, features scaled)
             sqrt_m = torch.sqrt(m.clamp_min(1e-12)).to(dtype=q.dtype, device=q.device)
-            m_bc = sqrt_m.unsqueeze(-2)
+            m_bc = sqrt_m.unsqueeze(-2)  # (*batch_shape, nh, 1, Dh)
             scale = torch.ones_like(q)
             if q.shape[-2] > row_num_cls:
                 tgt = scale[..., :, row_num_cls:, :]
                 scale[..., :, row_num_cls:, :] = m_bc.expand(tgt.shape)
             q = q * scale
             k = k * scale
+
+            # EA diagnostics: store metric, value-diff, q-norm, and approximate logit scale
+            if metrics_obj is not None:
+                try:
+                    metrics_obj.last_m = m.detach()
+                    metrics_obj.last_val_diff = (v - v_prev).abs().mean().detach()
+                    metrics_obj.last_q_norm = q.norm(dim=-1).mean().detach()
+                    logit_scale = (1.0 / float(head_dim) ** 0.5)
+                    qn = q.norm(dim=-1)
+                    kn = k.norm(dim=-1)
+                    metrics_obj.last_logit_mean = (qn * kn * logit_scale).mean().detach()
+                except Exception:
+                    # Metrics collection is best-effort; never break the forward path
+                    pass
         else:
             # For ICL int mask: restrict estimator to allowed key set (train slice only)
             if isinstance(attn_mask, int):
@@ -263,9 +278,21 @@ def multi_head_attention_forward(
                 m = compute_elliptical_diag(v, v_prev, delta=elliptical_delta, scale_mode=elliptical_scale_mode)
             # Broadcast to (..., nh, 1, hs)
             sqrt_m = torch.sqrt(m.clamp_min(1e-12)).to(dtype=q.dtype, device=q.device)
-            m_bc = sqrt_m.unsqueeze(-2)
+            m_bc = sqrt_m.unsqueeze(-2)  # (*batch_shape, nh, 1, Dh)
             q = q * m_bc
             k = k * m_bc
+
+            if metrics_obj is not None:
+                try:
+                    metrics_obj.last_m = m.detach()
+                    metrics_obj.last_val_diff = (v - v_prev).abs().mean().detach()
+                    metrics_obj.last_q_norm = q.norm(dim=-1).mean().detach()
+                    logit_scale = (1.0 / float(head_dim) ** 0.5)
+                    qn = q.norm(dim=-1)
+                    kn = k.norm(dim=-1)
+                    metrics_obj.last_logit_mean = (qn * kn * logit_scale).mean().detach()
+                except Exception:
+                    pass
     elif elliptical_force_identity:
         # Identity metric fallback: no scaling
         pass
