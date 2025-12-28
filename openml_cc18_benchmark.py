@@ -8,7 +8,7 @@ Supported models (select via --model):
 - tabicl: Uses TabICLClassifier; pass --checkpoint to select checkpoint file.
 - tabpfn: Uses TabPFNClassifier with default settings.
 
-Results are aggregated per task (mean/std across folds) and saved to CSV.
+Results are saved per task *fold* (one row per fold) instead of aggregating across folds.
 """
 from __future__ import annotations
 
@@ -16,13 +16,21 @@ import argparse
 import random
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 import openml
 import pandas as pd
 import torch
 import time
+
+try:
+    import wandb
+
+    HAVE_WANDB = True
+except Exception:
+    wandb = None  # type: ignore[assignment]
+    HAVE_WANDB = False
 
 # Prefer local sources for tabicl (src/tabicl) over venv dir named 'tabicl'
 ROOT = Path(__file__).resolve().parent
@@ -71,8 +79,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--pdlc_agg",
         type=str,
-        default="class_pool",
-        choices=[None, "posterior_avg", "class_pool", "sum"],
+        default="posterior_avg",
         help=(
             "Optional override for PDLC aggregation mode at inference when using "
             "a checkpoint trained with the TabPDL head. Ignored for standard TabICL."
@@ -102,6 +109,9 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="String appended to default CSV filename after checkpoint stem (e.g. '_run1')",
     )
+    p.add_argument("--wandb", action="store_true", help="Log metrics to Weights & Biases")
+    p.add_argument("--wandb_project", type=str, default="tabicl_cc18", help="Weights & Biases project name")
+    p.add_argument("--wandb_run_name", type=str, default=None, help="Optional Weights & Biases run name")
     p.add_argument("--n_rows", type=int, default=10000, help="Skip datasets with more than this many rows")
     p.add_argument("--max_features", type=int, default=500, help="Skip datasets with more than this many features")
     p.add_argument("--max_classes", type=int, default=10, help="Skip datasets with more than this many classes")
@@ -145,7 +155,7 @@ def evaluate_task_tabicl(
     max_features: int,
     max_classes: int,
     seed: int,
-) -> Dict[str, Any]:
+) -> List[Dict[str, Any]]:
     from tabicl import TabICLClassifier
 
     task = openml.tasks.get_task(task_id)
@@ -168,111 +178,133 @@ def evaluate_task_tabicl(
     # Dataset-level filters
     if n_rows is not None and len(X) > n_rows:
         print(f"[SKIP] Task {task_id}: rows {len(X)} > n_rows {n_rows}")
-        return {
-            "task_id": task_id,
-            "dataset_id": int(dataset.dataset_id),
-            "dataset_name": dataset.name,
-            "n_valid_folds": 0,
-            "error": f"Dataset has {len(X)} rows, exceeds limit of {n_rows}",
-            **meta_cols,
-        }
+        return [
+            {
+                "task_id": task_id,
+                "dataset_id": int(dataset.dataset_id),
+                "dataset_name": dataset.name,
+                "fold": None,
+                "n_valid_folds": 0,
+                "error": f"Dataset has {len(X)} rows, exceeds limit of {n_rows}",
+                **meta_cols,
+                "seed": int(seed),
+            }
+        ]
     if max_features is not None and X.shape[1] > max_features:
         print(f"[SKIP] Task {task_id}: features {X.shape[1]} > max_features {max_features}")
-        return {
-            "task_id": task_id,
-            "dataset_id": int(dataset.dataset_id),
-            "dataset_name": dataset.name,
-            "n_valid_folds": 0,
-            "error": f"Dataset has {X.shape[1]} features, exceeds limit of {max_features}",
-            **meta_cols,
-        }
+        return [
+            {
+                "task_id": task_id,
+                "dataset_id": int(dataset.dataset_id),
+                "dataset_name": dataset.name,
+                "fold": None,
+                "n_valid_folds": 0,
+                "error": f"Dataset has {X.shape[1]} features, exceeds limit of {max_features}",
+                **meta_cols,
+                "seed": int(seed),
+            }
+        ]
     n_cls = len(np.unique(y))
     if max_classes is not None and n_cls > max_classes:
         print(f"[SKIP] Task {task_id}: classes {n_cls} > max_classes {max_classes}")
-        return {
+        return [
+            {
+                "task_id": task_id,
+                "dataset_id": int(dataset.dataset_id),
+                "dataset_name": dataset.name,
+                "fold": None,
+                "n_valid_folds": 0,
+                "error": f"Dataset has {n_cls} classes, exceeds limit of {max_classes}",
+                **meta_cols,
+                "seed": int(seed),
+            }
+        ]
+
+    fold_rows: List[Dict[str, Any]] = []
+    valid_folds = 0
+    for fold in range(10):
+        try:
+            train_idx, test_idx = task.get_train_test_split_indices(repeat=0, fold=fold, sample=0)
+        except Exception as e:
+            print(f"[SKIP] Task {task_id} fold {fold+1}: split error: {e}")
+            continue
+
+        print(f"  Running Task {task_id} Fold {fold+1}/10...")
+        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+
+        if len(np.unique(y_train)) < len(np.unique(y)):
+            print(f"[SKIP] Task {task_id} fold {fold+1}: missing classes in train.")
+            continue
+
+        clf = TabICLClassifier(
+            device=device,
+            model_path=checkpoint,
+            allow_auto_download=False,
+            use_hierarchical=True,
+            n_estimators=n_estimators,
+            elliptical_scale_boost=elliptical_scale_boost,
+            random_state=seed,
+            pdlc_agg=pdlc_agg,
+            pdlc_inference_temperature=pdlc_inference_temperature,
+        )
+        t0 = time.perf_counter()
+        clf.fit(X_train, y_train)
+        t1 = time.perf_counter()
+        y_pred = clf.predict(X_test)
+        t2 = time.perf_counter()
+        y_prob = clf.predict_proba(X_test)
+        t3 = time.perf_counter()
+
+        metrics = compute_metrics(y_test, y_pred, y_prob, classes=clf.classes_)
+        metrics.update(
+            {
+                "fit_seconds": t1 - t0,
+                "predict_seconds": (t3 - t2),
+                "n_train": int(len(train_idx)),
+                "n_test": int(len(test_idx)),
+            }
+        )
+        row: Dict[str, Any] = {
             "task_id": task_id,
             "dataset_id": int(dataset.dataset_id),
             "dataset_name": dataset.name,
-            "n_valid_folds": 0,
-            "error": f"Dataset has {n_cls} classes, exceeds limit of {max_classes}",
+            "fold": int(fold),
+            "task_type": "Binary" if len(np.unique(y)) == 2 else "Multiclass",
             **meta_cols,
+            **metrics,
+            "seed": int(seed),
         }
-    else:
-        fold_results = []
-        valid_folds = 0
-        for fold in range(10):
-            try:
-                train_idx, test_idx = task.get_train_test_split_indices(repeat=0, fold=fold, sample=0)
-            except Exception as e:
-                print(f"[SKIP] Task {task_id} fold {fold+1}: split error: {e}")
-                continue
-            
-            print(f"  Running Task {task_id} Fold {fold+1}/10...")
-            X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-            y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+        fold_rows.append(row)
+        valid_folds += 1
 
-            if len(np.unique(y_train)) < len(np.unique(y)):
-                print(f"[SKIP] Task {task_id} fold {fold+1}: missing classes in train.")
-                continue
+    if valid_folds == 0 or not fold_rows:
+        return [
+            {
+                "task_id": task_id,
+                "dataset_id": int(dataset.dataset_id),
+                "dataset_name": dataset.name,
+                "fold": None,
+                "n_valid_folds": 0,
+                "error": "No valid folds",
+                **meta_cols,
+                "seed": int(seed),
+            }
+        ]
 
-            clf = TabICLClassifier(
-                device=device,
-                model_path=checkpoint,
-                allow_auto_download=False,
-                use_hierarchical=True,
-                n_estimators=n_estimators,
-                elliptical_scale_boost=elliptical_scale_boost,
-                random_state=seed,
-                pdlc_agg=pdlc_agg,
-                pdlc_inference_temperature=pdlc_inference_temperature,
-            )
-            t0 = time.perf_counter()
-            clf.fit(X_train, y_train)
-            t1 = time.perf_counter()
-            y_pred = clf.predict(X_test)
-            t2 = time.perf_counter()
-            y_prob = clf.predict_proba(X_test)
-            t3 = time.perf_counter()
-
-            metrics = compute_metrics(y_test, y_pred, y_prob, classes=clf.classes_)
-            metrics.update(
-                {
-                    "fit_seconds": t1 - t0,
-                    "predict_seconds": (t3 - t2),
-                    "n_train": int(len(train_idx)),
-                    "n_test": int(len(test_idx)),
-                }
-            )
-            fold_results.append(metrics)
-            valid_folds += 1
-
-    if valid_folds == 0:
-        return {
-            "task_id": task_id,
-            "dataset_id": int(dataset.dataset_id),
-            "dataset_name": dataset.name,
-            "n_valid_folds": 0,
-            "error": "No valid folds",
-            **meta_cols,
-        }
-
-    df = pd.DataFrame(fold_results)
-    out: Dict[str, Any] = {
-        "task_id": task_id,
-        "dataset_id": int(dataset.dataset_id),
-        "dataset_name": dataset.name,
-        "n_valid_folds": int(valid_folds),
-        "task_type": "Binary" if len(np.unique(y)) == 2 else "Multiclass",
-        **meta_cols,
-    }
-    for c in df.columns:
-        out[f"{c}_mean"] = float(df[c].mean())
-        out[f"{c}_std"] = float(df[c].std(ddof=1))
-    out["seed"] = int(seed)
-    return out
+    for row in fold_rows:
+        row["n_valid_folds"] = int(valid_folds)
+    return fold_rows
 
 
-def evaluate_task_tabpfn(task_id: int, device: str, n_rows: int, max_features: int, max_classes: int, seed: int) -> Dict[str, Any]:
+def evaluate_task_tabpfn(
+    task_id: int,
+    device: str,
+    n_rows: int,
+    max_features: int,
+    max_classes: int,
+    seed: int,
+) -> List[Dict[str, Any]]:
     try:
         from tabpfn import TabPFNClassifier  # type: ignore
     except Exception as e:
@@ -287,33 +319,45 @@ def evaluate_task_tabpfn(task_id: int, device: str, n_rows: int, max_features: i
 
     # TabPFN expects numerical X and typically no NaNs (default benchmark)
     if X.isna().any().any():
-        return {
-            "task_id": task_id,
-            "dataset_id": int(dataset.dataset_id),
-            "dataset_name": dataset.name,
-            "n_valid_folds": 0,
-            "error": "Dataset contains missing values (TabPFN default benchmark does not impute)",
-        }
+        return [
+            {
+                "task_id": task_id,
+                "dataset_id": int(dataset.dataset_id),
+                "dataset_name": dataset.name,
+                "fold": None,
+                "n_valid_folds": 0,
+                "error": "Dataset contains missing values (TabPFN default benchmark does not impute)",
+                "seed": int(seed),
+            }
+        ]
 
     # Dataset-level filters
     if n_rows is not None and len(X) > n_rows:
         print(f"[SKIP] Task {task_id}: rows {len(X)} > n_rows {n_rows}")
-        return {
-            "task_id": task_id,
-            "dataset_id": int(dataset.dataset_id),
-            "dataset_name": dataset.name,
-            "n_valid_folds": 0,
-            "error": f"Dataset has {len(X)} rows, exceeds limit of {n_rows}",
-        }
+        return [
+            {
+                "task_id": task_id,
+                "dataset_id": int(dataset.dataset_id),
+                "dataset_name": dataset.name,
+                "fold": None,
+                "n_valid_folds": 0,
+                "error": f"Dataset has {len(X)} rows, exceeds limit of {n_rows}",
+                "seed": int(seed),
+            }
+        ]
     if max_features is not None and X.shape[1] > max_features:
         print(f"[SKIP] Task {task_id}: features {X.shape[1]} > max_features {max_features}")
-        return {
-            "task_id": task_id,
-            "dataset_id": int(dataset.dataset_id),
-            "dataset_name": dataset.name,
-            "n_valid_folds": 0,
-            "error": f"Dataset has {X.shape[1]} features, exceeds limit of {max_features}",
-        }
+        return [
+            {
+                "task_id": task_id,
+                "dataset_id": int(dataset.dataset_id),
+                "dataset_name": dataset.name,
+                "fold": None,
+                "n_valid_folds": 0,
+                "error": f"Dataset has {X.shape[1]} features, exceeds limit of {max_features}",
+                "seed": int(seed),
+            }
+        ]
 
     le = __import__("sklearn.preprocessing", fromlist=["LabelEncoder"]).LabelEncoder()
     y_enc = le.fit_transform(y)
@@ -321,13 +365,17 @@ def evaluate_task_tabpfn(task_id: int, device: str, n_rows: int, max_features: i
 
     if max_classes is not None and len(classes) > max_classes:
         print(f"[SKIP] Task {task_id}: classes {len(classes)} > max_classes {max_classes}")
-        return {
-            "task_id": task_id,
-            "dataset_id": int(dataset.dataset_id),
-            "dataset_name": dataset.name,
-            "n_valid_folds": 0,
-            "error": f"Dataset has {len(classes)} classes, exceeds limit of {max_classes}",
-        }
+        return [
+            {
+                "task_id": task_id,
+                "dataset_id": int(dataset.dataset_id),
+                "dataset_name": dataset.name,
+                "fold": None,
+                "n_valid_folds": 0,
+                "error": f"Dataset has {len(classes)} classes, exceeds limit of {max_classes}",
+                "seed": int(seed),
+            }
+        ]
 
     metadata = compute_dataset_metadata(X.copy(), y_enc, le, dataset)
     meta_cols = {
@@ -337,7 +385,7 @@ def evaluate_task_tabpfn(task_id: int, device: str, n_rows: int, max_features: i
         "imbalance_ratio": float(metadata.get("imbalance_ratio", np.nan)),
     }
 
-    fold_results = []
+    fold_rows: List[Dict[str, Any]] = []
     valid_folds = 0
     for fold in range(10):
         try:
@@ -397,33 +445,36 @@ def evaluate_task_tabpfn(task_id: int, device: str, n_rows: int, max_features: i
                 "n_test": int(len(test_idx)),
             }
         )
-        fold_results.append(metrics)
-        valid_folds += 1
-
-    if valid_folds == 0:
-        return {
+        row: Dict[str, Any] = {
             "task_id": task_id,
             "dataset_id": int(dataset.dataset_id),
             "dataset_name": dataset.name,
-            "n_valid_folds": 0,
-            "error": "No valid folds",
+            "fold": int(fold),
+            "task_type": "Binary" if len(classes) == 2 else "Multiclass",
             **meta_cols,
+            **metrics,
+            "seed": int(seed),
         }
+        fold_rows.append(row)
+        valid_folds += 1
 
-    df = pd.DataFrame(fold_results)
-    out: Dict[str, Any] = {
-        "task_id": task_id,
-        "dataset_id": int(dataset.dataset_id),
-        "dataset_name": dataset.name,
-        "n_valid_folds": int(valid_folds),
-        "task_type": "Binary" if len(classes) == 2 else "Multiclass",
-        **meta_cols,
-    }
-    for c in df.columns:
-        out[f"{c}_mean"] = float(df[c].mean())
-        out[f"{c}_std"] = float(df[c].std(ddof=1))
-    out["seed"] = int(seed)
-    return out
+    if valid_folds == 0 or not fold_rows:
+        return [
+            {
+                "task_id": task_id,
+                "dataset_id": int(dataset.dataset_id),
+                "dataset_name": dataset.name,
+                "fold": None,
+                "n_valid_folds": 0,
+                "error": "No valid folds",
+                **meta_cols,
+                "seed": int(seed),
+            }
+        ]
+
+    for row in fold_rows:
+        row["n_valid_folds"] = int(valid_folds)
+    return fold_rows
 
 
 def main():
@@ -431,6 +482,16 @@ def main():
     device = resolve_device(args.device)
     set_global_seed(args.seed)
     print(f"Using device: {device}")
+
+    wandb_run = None
+    if args.wandb:
+        if not HAVE_WANDB:
+            raise RuntimeError("wandb is not installed. Install with `pip install wandb` or omit --wandb.")
+        wandb_run = wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            config=vars(args),
+        )
 
     suite = openml.study.get_suite(99)  # OpenML-CC18
     task_ids = list(suite.tasks)
@@ -443,7 +504,7 @@ def main():
         print(f"[{i}/{len(task_ids)}] Task {tid}")
         try:
             if args.model == "tabicl":
-                res = evaluate_task_tabicl(
+                res_rows = evaluate_task_tabicl(
                     tid,
                     device=device,
                     checkpoint=args.checkpoint,
@@ -457,7 +518,7 @@ def main():
                     seed=args.seed,
                 )
             else:
-                res = evaluate_task_tabpfn(
+                res_rows = evaluate_task_tabpfn(
                     tid,
                     device=device,
                     n_rows=args.n_rows,
@@ -466,8 +527,21 @@ def main():
                     seed=args.seed,
                 )
         except Exception as e:
-            res = {"task_id": tid, "dataset_id": None, "dataset_name": "N/A", "n_valid_folds": 0, "error": str(e)}
-        results.append(res)
+            res_rows = [
+                {
+                    "task_id": tid,
+                    "dataset_id": None,
+                    "dataset_name": "N/A",
+                    "fold": None,
+                    "n_valid_folds": 0,
+                    "error": str(e),
+                    "seed": int(args.seed),
+                }
+            ]
+        if args.wandb and HAVE_WANDB:
+            for row in res_rows:
+                wandb.log(row)
+        results.extend(res_rows)
 
     df = pd.DataFrame(results)
     out_dir = ROOT / "results"
@@ -485,6 +559,9 @@ def main():
 
     df.to_csv(out_path, index=False)
     print(f"Saved results to {out_path}")
+
+    if wandb_run is not None:
+        wandb_run.finish()
 
 
 if __name__ == "__main__":

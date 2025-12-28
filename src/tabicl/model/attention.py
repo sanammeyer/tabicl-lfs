@@ -75,6 +75,23 @@ def compute_elliptical_diag(
     return m
 
 
+def rope_pair_tie_metric(m: Tensor) -> Tensor:
+    """Enforce RoPE-plane isotropy: m_{2i} = m_{2i+1} for all i.
+
+    Expects the last dimension to be the per-head feature dimension (head_dim)
+    and leaves all leading batch/head dimensions unchanged.
+    """
+    Dh = m.shape[-1]
+    if Dh % 2 != 0:
+        # If head_dim is odd, we cannot safely form RoPE pairs; leave m unchanged.
+        return m
+
+    # Group features into (Dh/2) RoPE planes of size 2, average within each pair,
+    # and then broadcast back to the original shape.
+    m_paired = m.view(*m.shape[:-1], Dh // 2, 2).mean(dim=-1, keepdim=True)
+    return m_paired.expand(*m.shape[:-1], Dh // 2, 2).reshape_as(m)
+
+
 def sdpa_with_flattened_batch(
     q: Tensor, k: Tensor, v: Tensor, attn_mask: Optional[Tensor] = None, dropout_p: float = 0.0
 ) -> Tensor:
@@ -244,6 +261,11 @@ def multi_head_attention_forward(
                 m = compute_elliptical_diag(v_feat, v_prev_feat, delta=elliptical_delta, scale_mode=elliptical_scale_mode)
             else:
                 m = compute_elliptical_diag(v, v_prev, delta=elliptical_delta, scale_mode=elliptical_scale_mode)
+
+            # For TFrow (RoPE path), enforce RoPE-plane pair-tying on m.
+            if rope is not None:
+                m = rope_pair_tie_metric(m)
+
             # Build per-time scale (CLS tokens unscaled, features scaled)
             sqrt_m = torch.sqrt(m.clamp_min(1e-12)).to(dtype=q.dtype, device=q.device)
             m_bc = sqrt_m.unsqueeze(-2)  # (*batch_shape, nh, 1, Dh)
@@ -276,6 +298,11 @@ def multi_head_attention_forward(
                 m = compute_elliptical_diag(v, v_prev, delta=elliptical_delta, scale_mode=elliptical_scale_mode, mask_keep=keep)
             else:
                 m = compute_elliptical_diag(v, v_prev, delta=elliptical_delta, scale_mode=elliptical_scale_mode)
+
+            # For RoPE-enabled paths (e.g., TFrow), enforce RoPE-plane pair-tying on m.
+            if rope is not None:
+                m = rope_pair_tie_metric(m)
+
             # Broadcast to (..., nh, 1, hs)
             sqrt_m = torch.sqrt(m.clamp_min(1e-12)).to(dtype=q.dtype, device=q.device)
             m_bc = sqrt_m.unsqueeze(-2)  # (*batch_shape, nh, 1, Dh)
