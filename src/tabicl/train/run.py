@@ -226,18 +226,36 @@ class Trainer:
                     with open(id_path, "r") as f:
                         self.config.wandb_id = f.read().strip()
 
-            self.wandb_run = wandb.init(
-                dir=self.config.wandb_dir,
-                project=self.config.wandb_project,
-                name=self.config.wandb_name,
-                id=self.config.wandb_id,
-                config=self.config,
-                resume="allow",
-                mode=self.config.wandb_mode,
-            )
+            # For explicit online logging, require a configured API key rather than silently downgrade.
+            if str(getattr(self.config, "wandb_mode", "offline")).lower() == "online":
+                if not os.environ.get("WANDB_API_KEY"):
+                    raise RuntimeError(
+                        "WANDB_API_KEY is not set but wandb_mode='online' and wandb_log=True. "
+                        "Please run 'wandb login' in this environment or export WANDB_API_KEY "
+                        "before launching training."
+                    )
 
-            with open(id_path, "w") as f:
-                f.write(self.wandb_run.id)
+            try:
+                self.wandb_run = wandb.init(
+                    dir=self.config.wandb_dir,
+                    project=self.config.wandb_project,
+                    name=self.config.wandb_name,
+                    id=self.config.wandb_id,
+                    config=self.config,
+                    resume="allow",
+                    mode=self.config.wandb_mode,
+                )
+
+                with open(id_path, "w") as f:
+                    f.write(self.wandb_run.id)
+            except Exception as e:
+                # If the user asked for online logging, treat failures as fatal.
+                if str(getattr(self.config, "wandb_mode", "offline")).lower() == "online":
+                    raise
+                # Otherwise, gracefully disable wandb and continue.
+                print(f"[WARN] Failed to initialize wandb (disabling wandb_log): {e}")
+                self.wandb_run = None
+                self.config.wandb_log = False
         else:
             self.wandb_run = None
 
@@ -327,13 +345,13 @@ class Trainer:
 
         # Wrap model into DDP container if using distributed training
         if self.ddp:
-            # Enable find_unused_parameters to support optional components
-            # such as the TabPDL head, which may not contribute gradients
-            # on every rank / step (e.g., due to data-dependent control flow).
             self.model = DDP(
                 model,
                 device_ids=[self.ddp_local_rank],
                 broadcast_buffers=False,
+                # Enable find_unused_parameters to support optional components
+                # such as the TabPDL head, which may not contribute gradients
+                # on every rank / step (e.g., due to data-dependent control flow).
                 find_unused_parameters=True,
             )
             self.raw_model = self.model.module
