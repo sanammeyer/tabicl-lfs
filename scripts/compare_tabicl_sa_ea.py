@@ -764,16 +764,44 @@ def run_geometry_panel(
 
         X_tensor = torch.from_numpy(X_variant).float().unsqueeze(0).to(device_t)
         with torch.no_grad():
+            # Compute row representations for the full (train+test) episode
             col_out = model.col_embedder(
                 X_tensor,
                 train_size=train_size,
                 mgr_config=clf.inference_config_.COL_CONFIG,
             )
             row_reps = model.row_interactor(col_out, mgr_config=clf.inference_config_.ROW_CONFIG)
-            yt = torch.as_tensor(y_train_shifted, device=device_t, dtype=torch.float32).unsqueeze(0)
+
+            # Choose labels for conditioning in a way that mirrors the model's
+            # own hierarchical vs non-hierarchical inference behavior.
+            enc = model.icl_predictor
+            y_train_tensor = torch.as_tensor(y_train_shifted, device=device_t, dtype=torch.long)
+
+            # If the classifier is using hierarchical classification (more classes
+            # than the ICL head supports natively), build the same root grouping
+            # the model would use and condition on group indices instead of raw
+            # class indices. This ensures we never pass out-of-range indices to
+            # the OneHotAndLinear encoder.
+            use_hier = bool(getattr(clf, "use_hierarchical", False))
+            n_classes = int(getattr(clf, "n_classes_", y_train_tensor.max().item() + 1))
+            max_classes = int(getattr(model, "max_classes", n_classes))
+
+            if use_hier and n_classes > max_classes:
+                # Build hierarchical tree on the training rows only
+                enc._fit_hierarchical(
+                    row_reps[0, :train_size, :].detach(),
+                    y_train_tensor.detach(),
+                )
+                root = enc.root
+                labels_for_encoding = root.group_indices.to(device_t)  # per-train-row group id
+            else:
+                # Standard (non-hierarchical) conditioning on class indices
+                labels_for_encoding = y_train_tensor
+
+            yt = labels_for_encoding.to(dtype=torch.float32, device=device_t).unsqueeze(0)
             R_cond = row_reps.clone()
-            # Label conditioning (class-shifted)
-            R_cond[:, :train_size] = R_cond[:, :train_size] + model.icl_predictor.y_encoder(yt)
+            # Label conditioning
+            R_cond[:, :train_size] = R_cond[:, :train_size] + enc.y_encoder(yt)
 
         return R_cond, train_size, norm_method, vidx
 
