@@ -323,31 +323,6 @@ def multi_head_attention_forward(
     elif elliptical_force_identity:
         # Identity metric fallback: no scaling
         pass
-    # elif elliptical_scale is not None:
-    #     # Expected to be broadcastable over q: (..., nh, tgt_len, head_dim)
-    #     # Typical shapes: (1, nh, 1, head_dim) or (B, nh, 1, head_dim)
-    #     if elliptical_scale.dim() < 4:
-    #         raise ValueError(
-    #             f"elliptical_scale must have at least 4 dims (..., nh, 1|T, hs), got {elliptical_scale.shape}"
-    #         )
-    #     if elliptical_scale.shape[-1] != head_dim:
-    #         raise ValueError(
-    #             f"elliptical_scale head_dim mismatch: expected {head_dim}, got {elliptical_scale.shape[-1]}"
-    #         )
-    #     if elliptical_scale.shape[-3] != num_heads:
-    #         raise ValueError(
-    #             f"elliptical_scale num_heads mismatch: expected {num_heads} at dim -3, got {elliptical_scale.shape[-3]}"
-    #         )
-    #     if elliptical_scale.shape[-2] not in (1, tgt_len):
-    #         raise ValueError(
-    #             f"elliptical_scale time dim must be 1 or tgt_len ({tgt_len}), got {elliptical_scale.shape[-2]}"
-    #         )
-
-    #     # Cast to q/k dtype/device
-    #     elliptical_scale = elliptical_scale.to(dtype=q.dtype, device=q.device)
-    #     # No normalization here: any regularization handled during training
-    #     q = q * elliptical_scale
-    #     k = k * elliptical_scale
 
     
     # Apply rotary position embeddings if provided
