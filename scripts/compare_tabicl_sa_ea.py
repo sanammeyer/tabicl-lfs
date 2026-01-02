@@ -557,6 +557,7 @@ def run_behavioural_panel(
     n_estimators: int,
     seed: int,
     use_hierarchical: bool,
+    results_postfix: str = "",
 ) -> List[Dict[str, Any]]:
     N = len(X)
     print(f"\n=== Behavioural: {ds_name} (N={N}, classes={y.nunique()}) ===")
@@ -627,7 +628,12 @@ def run_behavioural_panel(
         return []
 
     # Persist behavioural metrics
-    out_path = REPO_ROOT / "results" / "compare_mini_tabicl_behaviour.csv"
+    beh_filename = (
+        f"compare_mini_tabicl_behaviour{results_postfix}.csv"
+        if results_postfix
+        else "compare_mini_tabicl_behaviour.csv"
+    )
+    out_path = REPO_ROOT / "results" / beh_filename
     behaviour_cols = [
         "dataset",
         "context_length",
@@ -674,6 +680,7 @@ def run_geometry_panel(
     n_estimators: int,
     seed: int,
     use_hierarchical: bool,
+    results_postfix: str = "",
 ) -> List[Dict[str, Any]]:
     print(f"\n=== Geometry: {ds_name} ===")
 
@@ -887,7 +894,12 @@ def run_geometry_panel(
         "m_cv_ea": m_cv_ea,
         "seed": int(seed),
     }
-    out_path = REPO_ROOT / "results" / "compare_mini_tabicl_geometry.csv"
+    geom_filename = (
+        f"compare_mini_tabicl_geometry{results_postfix}.csv"
+        if results_postfix
+        else "compare_mini_tabicl_geometry.csv"
+    )
+    out_path = REPO_ROOT / "results" / geom_filename
     geom_cols = [
         "dataset",
         "collapse_sa_top1",
@@ -1114,6 +1126,7 @@ def run_robustness_panel(
     n_noise_features: int,
     label_poison_fracs: Sequence[float],
     use_hierarchical: bool,
+    results_postfix: str = "",
 ) -> List[Dict[str, Any]]:
     print(f"\n=== Robustness / inductive bias: {ds_name} ===")
 
@@ -1549,7 +1562,12 @@ def run_robustness_panel(
 
     # Persist robustness metrics to CSV
     if robustness_rows:
-        out_path = REPO_ROOT / "results" / "compare_mini_tabicl_robustness.csv"
+        rob_filename = (
+            f"compare_mini_tabicl_robustness{results_postfix}.csv"
+            if results_postfix
+            else "compare_mini_tabicl_robustness.csv"
+        )
+        out_path = REPO_ROOT / "results" / rob_filename
         robust_cols = [
             "dataset",
             "condition",
@@ -1799,6 +1817,12 @@ def parse_args() -> argparse.Namespace:
         help="Fractions of synthetic outlier rows to inject into the training context for the context-poisoning robustness test.",
     )
     ap.add_argument(
+        "--results_postfix",
+        type=str,
+        default="",
+        help="Optional string appended before '.csv' in result filenames (e.g. '_run2').",
+    )
+    ap.add_argument(
         "--max_rows",
         type=int,
         default=None,
@@ -1887,6 +1911,7 @@ def main() -> None:
                         n_estimators=args.n_estimators,
                         seed=seed,
                         use_hierarchical=args.use_hierarchical,
+                        results_postfix=args.results_postfix,
                     )
                     if beh_rows:
                         all_beh_rows.extend(beh_rows)
@@ -1906,6 +1931,7 @@ def main() -> None:
                         n_estimators=args.n_estimators,
                         seed=seed,
                         use_hierarchical=args.use_hierarchical,
+                        results_postfix=args.results_postfix,
                     )
                     if geom_rows:
                         all_geom_rows.extend(geom_rows)
@@ -1928,6 +1954,7 @@ def main() -> None:
                         n_noise_features=args.n_noise_features,
                         label_poison_fracs=args.label_poison_fracs,
                         use_hierarchical=args.use_hierarchical,
+                        results_postfix=args.results_postfix,
                     )
                     if rob_rows:
                         all_rob_rows.extend(rob_rows)
