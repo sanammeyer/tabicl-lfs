@@ -112,7 +112,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--wandb", action="store_true", help="Log metrics to Weights & Biases")
     p.add_argument("--wandb_project", type=str, default="tabicl_cc18", help="Weights & Biases project name")
     p.add_argument("--wandb_run_name", type=str, default=None, help="Optional Weights & Biases run name")
-    p.add_argument("--n_rows", type=int, default=10000, help="Skip datasets with more than this many rows")
+    p.add_argument("--n_rows", type=int, default=50000, help="Skip datasets with more than this many rows")
     p.add_argument("--max_features", type=int, default=500, help="Skip datasets with more than this many features")
     p.add_argument("--max_classes", type=int, default=10, help="Skip datasets with more than this many classes")
     p.add_argument("--seed", type=int, default=42, help="Global random seed for reproducibility")

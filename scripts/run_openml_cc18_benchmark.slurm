@@ -12,10 +12,10 @@
 #SBATCH --export=NONE                # Don't inherit submit shell env
 #SBATCH --clusters=hlai
 #SBATCH --partition=hlai_std         # Partition/queue
-#SBATCH --gpus=1                     # Number of GPUs per node
+##SBATCH --gpus=1                     # Number of GPUs per node
 #SBATCH --ntasks=1                   # One task
 #SBATCH --cpus-per-task=16           # CPU cores
-#SBATCH --mem=64G                   # RAM
+#SBATCH --mem=128G                   # RAM
 #SBATCH --time=120:00:00             # Max runtime
 #SBATCH --mail-type=BEGIN,END,FAIL,TIME_LIMIT  # Email on key events (override with sbatch --mail-type)
 #SBATCH --mail-user=sanamjeet.meyer@campus.lmu.de     # Destination email (override with sbatch --mail-user)
@@ -31,7 +31,9 @@ VENV_ACTIVATE="${VENV_ACTIVATE:-$PROJECT_ROOT/.tabicl/bin/activate}"   # path to
 PY_SRC_DIR="${PY_SRC_DIR:-$PROJECT_ROOT/src}"                          # so that `import tabicl` works
 #CKPT_DIR_SA="${CKPT_DIR_SA:-$PROJECT_ROOT/checkpoints_mini_tabicl_stage2_sa}"                     # where checkpoints live
 #CKPT_DIR_EA="${CKPT_DIR_EA:-$PROJECT_ROOT/checkpoints_mini_tabicl_stage2_ea}"                     # where checkpoints live
-CKPT_DIR_PDLC="${CKPT_DIR_PDLC:-$PROJECT_ROOT/checkpoints_mini_tabicl_stage2_pdl_posterior_avg}"                     # where checkpoints live
+CKPT_DIR="${CKPT_DIR:-$PROJECT_ROOT/checkpoints_mini_tabicl_stage2_pdl_posterior_avg(old)}"  # where checkpoints live
+CSV_POSTFIX="${CSV_POSTFIX:-}"
+
 echo "[INFO] Working directory before cd: $(pwd)"
 cd "$PROJECT_ROOT"
 echo "[INFO] Project root: $(pwd)"
@@ -64,12 +66,12 @@ export NCCL_IB_DISABLE=1
 export NCCL_P2P_DISABLE=0
 
 # Resolve checkpoints (absolute paths)
-CKPT_PDLC="$CKPT_DIR_PDLC/step-1000.ckpt"
+CKPT="$CKPT_DIR/step-1000.ckpt"
 #CKPT_SA="$CKPT_DIR_SA/step-1000.ckpt"
 
 
-echo "[INFO] Checkpoint dir: $CKPT_DIR_PDLC"
-printf "[INFO] Looking for checkpoint files:\n  - %s\n" "$CKPT_PDLC"
+echo "[INFO] Checkpoint dir: $CKPT_DIR"
+printf "[INFO] Looking for checkpoint files:\n  - %s\n" "$CKPT"
 
 # Helper: run a single benchmark config
 run_benchmark() {
@@ -86,17 +88,17 @@ FAIL=0
 
 echo "[INFO] Starting OpenML-CC18 benchmark runs"
 
-if [[ -f "$CKPT_PDLC" ]]; then
+if [[ -f "$CKPT" ]]; then
   run_benchmark tabicl \
-    --checkpoint "$CKPT_PDLC" \
+    --checkpoint "$CKPT" \
     --device cuda \
     --n_rows "$NO_LIMIT_ROWS" \
     --max_features 500 \
     --pdlc_agg "posterior_avg" \
-    --csv_postfix "pdh_head_posterior_avg_trained" \
+    --csv_postfix "$CSV_POSTFIX" \
     --seed 42 || FAIL=1
 else
-  echo "[WARN] Missing checkpoint: $CKPT_PDLC — skipping this run"
+  echo "[WARN] Missing checkpoint: $CKPT — skipping this run"
 fi
 
 # Be tidy
@@ -105,4 +107,3 @@ if [[ -n "${VIRTUAL_ENV:-}" ]]; then
 fi
 
 exit $FAIL
-

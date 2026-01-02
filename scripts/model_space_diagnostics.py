@@ -255,7 +255,8 @@ def _episode_signature(
     # Build ICL episode via EnsembleGenerator (train part is stored in clf)
     X_te_num = clf.X_encoder_.transform(X_te)
     data = clf.ensemble_generator_.transform(X_te_num)
-    methods = list(data.keys())
+    # Deterministic choice of normalization method
+    methods = sorted(data.keys())
     norm_method = methods[0]
     Xs, ys_shifted = data[norm_method]
     shuffle_patterns = clf.ensemble_generator_.feature_shuffle_patterns_[norm_method]
@@ -284,19 +285,75 @@ def _episode_signature(
         R_cond = row_reps.clone()
         R_cond[:, :train_size] = R_cond[:, :train_size] + model.icl_predictor.y_encoder(yt)
 
-    # Row geometry
-    sig = _row_geometry_stats(R_cond, rng=rng)
-    sig["train_size"] = float(train_size)
-    sig["n_rows_total"] = float(R_cond.shape[1])
+    # ---------------- Dataset-level signature (pre label-conditioning) ----------------
+    ds_geo = _row_geometry_stats(row_reps, rng=rng)
+    ds_sig: Dict[str, float] = {f"ds_{k}": v for k, v in ds_geo.items()}
+
+    # Spectrum features on row_reps[0]
+    R_plain = row_reps[0]  # (T, E)
+    T, E = R_plain.shape
+    ds_effective_rank = float("nan")
+    ds_top1_singular_frac = float("nan")
+    if T > 1 and E > 0:
+        R_centered = R_plain - R_plain.mean(dim=0, keepdim=True)
+        try:
+            # Use torch SVD, then move to numpy
+            s = torch.linalg.svdvals(R_centered)
+            s_np = s.cpu().numpy()
+            if s_np.size > 0:
+                # Effective rank from eigenvalue spectrum (proportional to s^2)
+                eigvals = s_np**2
+                total = float(eigvals.sum())
+                if total > 0.0:
+                    p = eigvals / total
+                    p = p[p > 0]
+                    ent = float(-np.sum(p * np.log(p)))
+                    ds_effective_rank = float(np.exp(ent))
+                # Top singular value fraction
+                s_sum = float(s_np.sum())
+                if s_sum > 0.0:
+                    ds_top1_singular_frac = float(s_np[0] / s_sum)
+        except Exception:
+            ds_effective_rank = float("nan")
+            ds_top1_singular_frac = float("nan")
+
+    ds_sig["ds_effective_rank"] = ds_effective_rank
+    ds_sig["ds_top1_singular_frac"] = ds_top1_singular_frac
+
+    # ---------------- Episode-level signature (after label-conditioning) ----------------
+    ep_geo = _row_geometry_stats(R_cond, rng=rng)
+    sig: Dict[str, float] = {f"ep_{k}": v for k, v in ep_geo.items()}
+    sig["ep_train_size"] = float(train_size)
+    sig["ep_n_rows_total"] = float(R_cond.shape[1])
 
     # Attention weights and sharpness (+ EA metric if active)
     W_tt, m_diag = _compute_test_to_train_weights(model, R_cond, train_size)
     neff = per_row_neff(W_tt)
     ent, top1_mass = per_row_entropy_and_top1(W_tt)
 
+    # Map original labels to the shifted label space used in the episode
     y_tr_np = np.asarray(y_tr)
+    y_train_shifted_np = np.asarray(y_train_shifted)
+    # Build a mapping from original labels -> shifted labels (majority mapping per class)
+    label_map: Dict[Any, float] = {}
+    for cls in np.unique(y_tr_np):
+        mask = y_tr_np == cls
+        shifted_vals = y_train_shifted_np[mask]
+        if shifted_vals.size == 0:
+            continue
+        vals, counts = np.unique(shifted_vals, return_counts=True)
+        label_map[cls] = float(vals[np.argmax(counts)])
+
     y_te_np = np.asarray(y_te)
-    top1_purity, topk_purity = per_row_purity(W_tt, y_tr_np, y_te_np, topk=5)
+    # Map train labels exactly, map test labels with -1 for unseen classes
+    y_train_mapped = np.array([label_map.get(v, -1.0) for v in y_tr_np], dtype=float)
+    y_test_mapped = np.array([label_map.get(v, -1.0) for v in y_te_np], dtype=float)
+
+    # Compute neighbour purity in the shifted label space; ignore rows with unknown test labels (-1)
+    top1_purity_raw, topk_purity_raw = per_row_purity(W_tt, y_train_mapped, y_test_mapped, topk=5)
+    valid_mask = y_test_mapped >= 0
+    top1_purity = np.where(valid_mask, top1_purity_raw, np.nan)
+    topk_purity = np.where(valid_mask, topk_purity_raw, np.nan)
 
     def _safe_mean_std(arr: np.ndarray) -> Tuple[float, float]:
         if arr.size == 0:
@@ -305,11 +362,11 @@ def _episode_signature(
         s = float(np.nanstd(arr, ddof=1)) if np.sum(np.isfinite(arr)) > 1 else float("nan")
         return m, s
 
-    sig["attn_neff_mean"], sig["attn_neff_std"] = _safe_mean_std(neff)
-    sig["attn_entropy_mean"], sig["attn_entropy_std"] = _safe_mean_std(ent)
-    sig["attn_top1_mass_mean"], sig["attn_top1_mass_std"] = _safe_mean_std(top1_mass)
-    sig["neigh_top1_purity_mean"], sig["neigh_top1_purity_std"] = _safe_mean_std(top1_purity)
-    sig["neigh_top5_purity_mean"], sig["neigh_top5_purity_std"] = _safe_mean_std(topk_purity)
+    sig["ep_attn_neff_mean"], sig["ep_attn_neff_std"] = _safe_mean_std(neff)
+    sig["ep_attn_entropy_mean"], sig["ep_attn_entropy_std"] = _safe_mean_std(ent)
+    sig["ep_attn_top1_mass_mean"], sig["ep_attn_top1_mass_std"] = _safe_mean_std(top1_mass)
+    sig["ep_neigh_top1_purity_mean"], sig["ep_neigh_top1_purity_std"] = _safe_mean_std(top1_purity)
+    sig["ep_neigh_top5_purity_mean"], sig["ep_neigh_top5_purity_std"] = _safe_mean_std(topk_purity)
 
     # EA metric M statistics (if EA is active)
     if m_diag is not None:
@@ -326,11 +383,13 @@ def _episode_signature(
         m_min = float("nan")
         m_max = float("nan")
 
-    sig["M_log_mean"] = m_log_mean
-    sig["M_log_std"] = m_log_std
-    sig["M_min"] = m_min
-    sig["M_max"] = m_max
+    sig["ep_M_log_mean"] = m_log_mean
+    sig["ep_M_log_std"] = m_log_std
+    sig["ep_M_min"] = m_min
+    sig["ep_M_max"] = m_max
 
+    # Merge dataset-level and episode-level signatures
+    sig.update(ds_sig)
     return sig
 
 
@@ -351,6 +410,12 @@ def sample_cc18_signatures(
     if limit_tasks is not None:
         task_ids = task_ids[:limit_tasks]
 
+    # Use official OpenML split with a fixed fold for consistency:
+    # repeat=0, fold=0, sample=0
+    split_repeat = 0
+    split_fold = 0
+    split_sample = 0
+
     rows: List[Dict[str, Any]] = []
 
     for i, tid in enumerate(task_ids, 1):
@@ -358,10 +423,8 @@ def sample_cc18_signatures(
         try:
             task = openml.tasks.get_task(tid)
             ds = openml.datasets.get_dataset(task.dataset_id)
-            X, y, _, _ = ds.get_data(
-                target=ds.default_target_attribute,
-                dataset_format="dataframe",
-            )
+            # Use task-defined target and feature space for consistency
+            X, y = task.get_X_and_y(dataset_format="dataframe")
             if max_features is not None and X.shape[1] > max_features:
                 print(f"  [SKIP] features {X.shape[1]} > max_features {max_features}")
                 continue
@@ -371,13 +434,20 @@ def sample_cc18_signatures(
                 print(f"  [SKIP] classes {n_cls} > max_classes {max_classes}")
                 continue
 
-            X_tr, X_te, y_tr, y_te = train_test_split(
-                X,
-                y,
-                test_size=0.3,
-                random_state=seed,
-                stratify=y,
-            )
+            try:
+                train_idx, test_idx = task.get_train_test_split_indices(
+                    repeat=split_repeat,
+                    fold=split_fold,
+                    sample=split_sample,
+                )
+            except Exception as e:
+                print(f"  [WARN] Error getting split for task {tid}: {e}")
+                continue
+
+            X_tr = X.iloc[train_idx]
+            X_te = X.iloc[test_idx]
+            y_tr = y.iloc[train_idx]
+            y_te = y.iloc[test_idx]
 
             clf = TabICLClassifier(
                 device=device,
@@ -581,7 +651,8 @@ def run_c2st_signatures(
             ]
         )
 
-        cv = StratifiedKFold(n_splits=min(5, max(2, y_all.sum())), shuffle=True, random_state=seed + b)
+        # Use a fixed, small number of CV folds; datasets are balanced by construction
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed + b)
         aucs: List[float] = []
         for train_idx, test_idx in cv.split(X_all, y_all):
             X_train, X_test = X_all[train_idx], X_all[test_idx]
@@ -698,40 +769,52 @@ def main() -> None:
     df_cc.to_csv(cc_path, index=False)
     print(f"[INFO] Saved CC18 model signatures to {cc_path} (n={len(df_cc)})")
 
-    # 3) C2ST in model space
-    feature_cols = [
-        c
-        for c in df_pre.columns
-        if c
-        not in {
-            "source",
-            "prior_dir",
-            "prior_batch_idx",
-            "prior_dataset_idx",
-            "n_rows",
-            "n_features",
-        }
-    ]
-    feature_cols = [c for c in feature_cols if c in df_cc.columns]
-    if not feature_cols:
-        print("[WARN] No overlapping signature features for model-space C2ST.")
-        return
+    # 3) C2ST in model space (dataset-level vs episode-level signatures)
+    # Dataset-level features (from row_reps)
+    feature_cols_ds = [c for c in df_pre.columns if c.startswith("ds_") and c in df_cc.columns]
+    # Episode-level features (from R_cond / attention)
+    feature_cols_ep = [c for c in df_pre.columns if c.startswith("ep_") and c in df_cc.columns]
+    # For episode-level mismatch, avoid trivial size features
+    ep_size_keys = {"ep_train_size", "ep_n_rows_total"}
+    feature_cols_ep_strict = [c for c in feature_cols_ep if c not in ep_size_keys]
 
-    df_c2st = run_c2st_signatures(
-        df_pre=df_pre,
-        df_cc=df_cc,
-        feature_cols=feature_cols,
-        n_bootstrap=args.c2st_bootstrap,
-        seed=args.seed + 3,
-    )
-    c2st_path = out_dir / "model_sig_c2st.csv"
-    df_c2st.to_csv(c2st_path, index=False)
-    print(f"[INFO] Saved model-space C2ST results to {c2st_path}")
-    if len(df_c2st):
-        print(
-            f"[INFO] Model-space C2ST AUC: mean={df_c2st['auc_mean'].mean():.3f}, "
-            f"std={df_c2st['auc_mean'].std(ddof=1) if len(df_c2st)>1 else 0.0:.3f}"
+    if feature_cols_ds:
+        df_c2st_ds = run_c2st_signatures(
+            df_pre=df_pre,
+            df_cc=df_cc,
+            feature_cols=feature_cols_ds,
+            n_bootstrap=args.c2st_bootstrap,
+            seed=args.seed + 3,
         )
+        c2st_ds_path = out_dir / "model_sig_c2st_ds.csv"
+        df_c2st_ds.to_csv(c2st_ds_path, index=False)
+        print(f"[INFO] Saved dataset-level model-space C2ST results to {c2st_ds_path}")
+        if len(df_c2st_ds):
+            print(
+                f"[INFO] Dataset-level C2ST AUC: mean={df_c2st_ds['auc_mean'].mean():.3f}, "
+                f"std={df_c2st_ds['auc_mean'].std(ddof=1) if len(df_c2st_ds)>1 else 0.0:.3f}"
+            )
+    else:
+        print("[WARN] No dataset-level (ds_*) features for model-space C2ST.")
+
+    if feature_cols_ep_strict:
+        df_c2st_ep = run_c2st_signatures(
+            df_pre=df_pre,
+            df_cc=df_cc,
+            feature_cols=feature_cols_ep_strict,
+            n_bootstrap=args.c2st_bootstrap,
+            seed=args.seed + 4,
+        )
+        c2st_ep_path = out_dir / "model_sig_c2st_ep.csv"
+        df_c2st_ep.to_csv(c2st_ep_path, index=False)
+        print(f"[INFO] Saved episode-level model-space C2ST results to {c2st_ep_path}")
+        if len(df_c2st_ep):
+            print(
+                f"[INFO] Episode-level C2ST AUC: mean={df_c2st_ep['auc_mean'].mean():.3f}, "
+                f"std={df_c2st_ep['auc_mean'].std(ddof=1) if len(df_c2st_ep)>1 else 0.0:.3f}"
+            )
+    else:
+        print("[WARN] No episode-level (ep_*) features for model-space C2ST.")
 
 
 if __name__ == "__main__":

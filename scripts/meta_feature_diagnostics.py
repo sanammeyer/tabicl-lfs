@@ -53,6 +53,7 @@ if str(SRC_DIR) not in sys.path:
 
 from benchmark_utils import compute_dataset_metadata  # type: ignore
 from tabicl.prior.genload import LoadPriorDataset  # type: ignore
+from tabicl.sklearn.classifier import TabICLClassifier  # type: ignore
 
 
 META_FEATURE_COLUMNS = (
@@ -293,10 +294,11 @@ def compute_meta_features_from_array(
         for j in col_idx:
             col = X[:, j]
             col = col[~np.isnan(col)]
-            if col.size == 0:
+            n_valid = col.size
+            if n_valid == 0:
                 continue
             nunique = np.unique(col).size
-            unique_ratios.append(float(nunique) / float(n_rows))
+            unique_ratios.append(float(nunique) / float(n_valid))
         if unique_ratios:
             unique_ratio_mean = float(np.mean(unique_ratios))
             unique_ratio_min = float(np.min(unique_ratios))
@@ -569,8 +571,11 @@ def compute_cc18_meta_features(
     max_classes: int,
     limit_tasks: Optional[int],
     seed: int,
+    tabicl_checkpoint: Optional[str] = None,
+    tabicl_device: str = "cpu",
+    tabicl_n_estimators: int = 1,
 ) -> pd.DataFrame:
-    """Compute phi(D) for OpenML-CC18 tasks (full dataset view)."""
+    """Compute phi(D) for OpenML-CC18 tasks using official train/test split (fold 0)."""
     try:
         import openml  # type: ignore
     except ImportError as e:
@@ -590,6 +595,12 @@ def compute_cc18_meta_features(
 
     print(f"[INFO] OpenML-CC18: considering {len(task_ids)} tasks")
 
+    # Use a fixed OpenML split for consistency with evaluation:
+    # repeat=0, fold=0, sample=0 (10-fold CV, first fold)
+    split_repeat = 0
+    split_fold = 0
+    split_sample = 0
+
     records: List[Dict[str, Any]] = []
 
     for idx, task_id in enumerate(task_ids, 1):
@@ -598,10 +609,8 @@ def compute_cc18_meta_features(
             task = openml.tasks.get_task(task_id)
             dataset = openml.datasets.get_dataset(task.dataset_id)
 
-            X, y, _, _ = dataset.get_data(
-                target=dataset.default_target_attribute,
-                dataset_format="dataframe",
-            )
+            # Use task-defined target and feature set to stay consistent with evaluation
+            X, y = task.get_X_and_y(dataset_format="dataframe")
 
             # Basic metadata / filters consistent with openml_cc18_benchmark.evaluate_task_tabicl
             le = LabelEncoder()
@@ -622,8 +631,51 @@ def compute_cc18_meta_features(
                 print(f"  [SKIP] classes {n_cls} > max_classes {max_classes}")
                 continue
 
-            # Full-dataset phi(D) (model sees the entire table)
-            phi = compute_meta_features_from_dataframe(X, y_enc, rng=rng, cfg=cfg)
+            # Use official train/test split (fixed fold) for encoder fitting, but compute phi(D)
+            # on the full dataset to keep label statistics consistent with priors.
+            try:
+                train_idx, test_idx = task.get_train_test_split_indices(
+                    repeat=split_repeat,
+                    fold=split_fold,
+                    sample=split_sample,
+                )
+            except Exception as e:
+                print(f"  [WARN] Error getting split for task {task_id}: {e}")
+                continue
+
+            # Optionally process CC18 via TabICL X_encoder before computing meta-features
+            if tabicl_checkpoint:
+                try:
+                    X_train = X.iloc[train_idx]
+                    y_train = y.iloc[train_idx]
+
+                    clf = TabICLClassifier(
+                        device=tabicl_device,
+                        model_path=tabicl_checkpoint,
+                        allow_auto_download=False,
+                        use_hierarchical=True,
+                        n_estimators=tabicl_n_estimators,
+                        random_state=seed,
+                        verbose=False,
+                    )
+                    # Fit only to obtain a dataset-specific X_encoder_
+                    clf.fit(X_train, y_train)
+                    # Transform the full dataset into the model's numeric feature space
+                    X_enc_full = clf.X_encoder_.transform(X)
+                    phi = compute_meta_features_from_array(
+                        X_enc_full,
+                        y_enc,
+                        rng=rng,
+                        cfg=cfg,
+                        n_numeric_features=X_enc_full.shape[1],
+                        n_categorical_features=0,
+                    )
+                except Exception as e:
+                    print(f"  [WARN] TabICL preprocessing failed for task {task_id}: {e}")
+                    phi = compute_meta_features_from_dataframe(X, y_enc, rng=rng, cfg=cfg)
+            else:
+                # Raw DataFrame meta-features on the full dataset
+                phi = compute_meta_features_from_dataframe(X, y_enc, rng=rng, cfg=cfg)
 
             rec: Dict[str, Any] = {
                 "task_id": int(task_id),
@@ -769,7 +821,8 @@ def run_c2st_bootstrap(
             ]
         )
 
-        cv = StratifiedKFold(n_splits=min(5, max(2, y_all.sum())), shuffle=True, random_state=seed + b)
+        # Use a fixed, small number of CV folds; datasets are balanced by construction
+        cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed + b)
         aucs: List[float] = []
         for train_idx, test_idx in cv.split(X_all, y_all):
             X_train, X_test = X_all[train_idx], X_all[test_idx]
@@ -1079,6 +1132,28 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional limit on number of CC18 tasks (for smoke tests).",
     )
+    # Optional TabICL preprocessing for CC18 (X_encoder)
+    p.add_argument(
+        "--tabicl_checkpoint",
+        type=str,
+        default=str(REPO_ROOT / "checkpoints_mini_tabicl_stage2_sa" / "step-1000.ckpt"),
+        help=(
+            "Optional TabICL checkpoint; if set, CC18 meta-features are computed on "
+            "TabICL X_encoder-transformed data (using the official train split)."
+        ),
+    )
+    p.add_argument(
+        "--tabicl_device",
+        type=str,
+        default="cpu",
+        help="Device to use for TabICL preprocessing (cpu|cuda).",
+    )
+    p.add_argument(
+        "--tabicl_n_estimators",
+        type=int,
+        default=1,
+        help="Ensemble size for TabICLClassifier used to build X_encoder (affects speed, not phi(D) directly).",
+    )
     # C2ST options
     p.add_argument(
         "--c2st_bootstrap",
@@ -1186,6 +1261,9 @@ def main() -> None:
         max_classes=args.cc18_max_classes,
         limit_tasks=args.cc18_limit,
         seed=args.seed + 1,
+        tabicl_checkpoint=args.tabicl_checkpoint,
+        tabicl_device=args.tabicl_device,
+        tabicl_n_estimators=args.tabicl_n_estimators,
     )
     print(f"[INFO] Phi_cc18 shape: {df_cc.shape}")
     df_cc.to_csv(cc18_out, index=False)
