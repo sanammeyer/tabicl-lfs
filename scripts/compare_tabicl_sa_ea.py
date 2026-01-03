@@ -136,9 +136,23 @@ def fetch_openml_dataset(name_or_id: str | int) -> Tuple[pd.DataFrame, pd.Series
     """
     import openml
 
-    # By integer ID
+    # By integer ID: try dataset id first, then task id
     if isinstance(name_or_id, int) or (str(name_or_id).isdigit()):
-        ds = openml.datasets.get_dataset(int(name_or_id))
+        num_id = int(name_or_id)
+        ds = None
+        # Try as dataset id
+        try:
+            ds = openml.datasets.get_dataset(num_id)
+        except Exception:
+            ds = None
+        # If that fails, try as task id and resolve to dataset id
+        if ds is None:
+            try:
+                task = openml.tasks.get_task(num_id)
+                ds_id = int(getattr(task, "dataset_id"))
+                ds = openml.datasets.get_dataset(ds_id)
+            except Exception as e:
+                raise ValueError(f"Could not load OpenML dataset or task with id={num_id}: {e}")
         X, y, _, _ = ds.get_data(
             target=getattr(ds, "default_target_attribute", None),
             dataset_format="dataframe",
@@ -578,20 +592,35 @@ def run_behavioural_panel(
         if train_size >= N:
             continue
 
+        rs = int(rng.randint(0, 1_000_000))
+        stratify = y if y.nunique() > 1 else None
         try:
             X_tr, X_te, y_tr, y_te = train_test_split(
                 X,
                 y,
                 train_size=train_size,
-                random_state=int(rng.randint(0, 1_000_000)),
-                stratify=y,
+                random_state=rs,
+                stratify=stratify,
             )
         except ValueError as e:
-            # Can happen for very small train_size with stratify on many classes
+            # Fall back to unstratified split instead of skipping this context length
             print(
-                f"  [warn] Skipping context_length={train_size} due to stratified split error: {e}"
+                f"  [warn] Stratified split failed for context_length={train_size} "
+                f"(error: {e}); falling back to unstratified split."
             )
-            continue
+            try:
+                X_tr, X_te, y_tr, y_te = train_test_split(
+                    X,
+                    y,
+                    train_size=train_size,
+                    random_state=rs,
+                    stratify=None,
+                )
+            except ValueError as e2:
+                print(
+                    f"  [warn] Unstratified split also failed for context_length={train_size}: {e2}; skipping."
+                )
+                continue
 
         print(f"  Context length (train_size) = {train_size}  | test_size = {len(X_te)}")
 
@@ -685,13 +714,24 @@ def run_geometry_panel(
     print(f"\n=== Geometry: {ds_name} ===")
 
     # Single split for geometry: use moderate test size
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X,
-        y,
-        test_size=0.3,
-        random_state=seed,
-        stratify=y,
-    )
+    stratify = y if y.nunique() > 1 else None
+    try:
+        X_tr, X_te, y_tr, y_te = train_test_split(
+            X,
+            y,
+            test_size=0.2,
+            random_state=seed,
+            stratify=stratify,
+        )
+    except ValueError:
+        # Fallback: unstratified split if class counts are too small
+        X_tr, X_te, y_tr, y_te = train_test_split(
+            X,
+            y,
+            test_size=0.2,
+            random_state=seed,
+            stratify=None,
+        )
 
     def _fit_clf(model_path: Path) -> TabICLClassifier:
         clf = TabICLClassifier(
@@ -932,31 +972,86 @@ def run_geometry_panel(
 # ---------------------------------------------------------------------------
 
 
-def _add_irrelevant_features(
+def add_uninformative_features_shuffled(
     X_train: pd.DataFrame,
     X_test: pd.DataFrame,
-    n_noise_cols: int,
+    n_add: int,
     rng: np.random.Generator,
+    *,
+    with_replacement: bool = True,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Concatenate pure noise columns to test feature selection capability."""
-    if n_noise_cols <= 0:
+    """
+    TabPFN-style uninformative features:
+      - pick existing columns
+      - create copies whose values are randomly permuted across rows
+        (preserves marginal distribution + missingness, breaks label association)
+
+    We permute train and test independently to preserve each split's marginals.
+    Works for numeric + categorical/object columns, because we permute raw values.
+    """
+    if n_add <= 0:
         return X_train, X_test
 
-    noise_tr = rng.normal(0.0, 1.0, size=(len(X_train), n_noise_cols))
-    noise_te = rng.normal(0.0, 1.0, size=(len(X_test), n_noise_cols))
+    cols = list(X_train.columns)
+    if len(cols) == 0:
+        return X_train, X_test
 
-    new_cols = [f"noise_{i}" for i in range(n_noise_cols)]
+    if with_replacement:
+        picked = rng.choice(cols, size=n_add, replace=True)
+    else:
+        n_add = min(n_add, len(cols))
+        picked = rng.choice(cols, size=n_add, replace=False)
 
-    X_tr_aug = pd.concat(
-        [X_train.reset_index(drop=True), pd.DataFrame(noise_tr, columns=new_cols)],
-        axis=1,
+    X_tr = X_train.reset_index(drop=True).copy()
+    X_te = X_test.reset_index(drop=True).copy()
+
+    for i, c in enumerate(picked):
+        new_c = f"uninformative_shuffle_{c}_{i}"
+        tr_vals = X_tr[c].to_numpy(copy=True)
+        te_vals = X_te[c].to_numpy(copy=True)
+
+        X_tr[new_c] = rng.permutation(tr_vals)
+        X_te[new_c] = rng.permutation(te_vals)
+
+    return X_tr, X_te
+
+
+def apply_tabpfn_cell_outliers(
+    X: pd.DataFrame,
+    rng: np.random.Generator,
+    *,
+    p_cell: float = 0.02,
+    outlier_factor: float = 50.0,
+    numeric_only: bool = True,
+) -> pd.DataFrame:
+    """
+    TabPFN-style cell-wise outliers (numeric features):
+      - For each numeric cell independently with probability p_cell,
+        multiply the value by u ~ Uniform(0, outlier_factor).
+    """
+    if outlier_factor <= 0 or p_cell <= 0:
+        return X
+
+    X_out = X.copy()
+    num_cols = (
+        list(X_out.select_dtypes(include="number").columns)
+        if numeric_only
+        else list(X_out.columns)
     )
-    X_te_aug = pd.concat(
-        [X_test.reset_index(drop=True), pd.DataFrame(noise_te, columns=new_cols)],
-        axis=1,
-    )
+    if not num_cols:
+        return X_out
 
-    return X_tr_aug, X_te_aug
+    for c in num_cols:
+        col = X_out[c].to_numpy(copy=True)
+        finite = np.isfinite(col)
+        mask = (rng.random(size=col.shape[0]) < p_cell) & finite
+        if not np.any(mask):
+            continue
+        mult = rng.uniform(0.0, float(outlier_factor), size=int(mask.sum()))
+        col[mask] = col[mask] * mult
+        X_out[c] = col
+
+    return X_out
 
 
 def _flip_labels(
@@ -1131,13 +1226,24 @@ def run_robustness_panel(
     print(f"\n=== Robustness / inductive bias: {ds_name} ===")
 
     # Fixed split
-    X_tr, X_te, y_tr, y_te = train_test_split(
-        X,
-        y,
-        test_size=0.3,
-        random_state=seed,
-        stratify=y,
-    )
+    stratify = y if y.nunique() > 1 else None
+    try:
+        X_tr, X_te, y_tr, y_te = train_test_split(
+            X,
+            y,
+            test_size=0.2,
+            random_state=seed,
+            stratify=stratify,
+        )
+    except ValueError:
+        # Fallback: unstratified split if class counts are too small
+        X_tr, X_te, y_tr, y_te = train_test_split(
+            X,
+            y,
+            test_size=0.2,
+            random_state=seed,
+            stratify=None,
+        )
 
     def _fit_clf(model_path: Path) -> TabICLClassifier:
         clf = TabICLClassifier(
@@ -1191,6 +1297,53 @@ def run_robustness_panel(
             "ea_checkpoint": str(model_ea),
         }
     )
+
+    # (a2) Cell-wise outliers (TabPFN-style): corrupt TEST only, keep context clean
+    cell_outlier_factors = [5.0, 10.0, 50.0]
+    p_cell = 0.02
+    print("  Cell-wise outliers (TabPFN-style, test-only):")
+    for fac in cell_outlier_factors:
+        X_te_o = apply_tabpfn_cell_outliers(
+            X_te,
+            rng,
+            p_cell=p_cell,
+            outlier_factor=fac,
+            numeric_only=True,
+        )
+
+        # reuse already-fitted clean-context models clf_sa/clf_ea
+        m_sa_o = _eval_metrics_from_fitted_clf(clf_sa, X_te_o, y_te)
+        m_ea_o = _eval_metrics_from_fitted_clf(clf_ea, X_te_o, y_te)
+
+        print(
+            f"    factor={fac:g}: "
+            f"acc(SA)={m_sa_o.accuracy:.4f}, acc(EA)={m_ea_o.accuracy:.4f}; "
+            f"NLL(SA)={m_sa_o.log_loss:.4f}, NLL(EA)={m_ea_o.log_loss:.4f}"
+        )
+
+        robustness_rows.append(
+            {
+                "dataset": ds_name,
+                "condition": "cell_outliers_tabpfn_test",
+                "param_type": "outlier_factor",
+                "param_value": float(fac),
+                "p_cell": float(p_cell),
+                "n_test": len(X_te_o),
+                "acc_sa": m_sa_o.accuracy,
+                "acc_ea": m_ea_o.accuracy,
+                "f1_sa": m_sa_o.f1_macro,
+                "f1_ea": m_ea_o.f1_macro,
+                "nll_sa": m_sa_o.log_loss,
+                "nll_ea": m_ea_o.log_loss,
+                "ece_sa": m_sa_o.ece,
+                "ece_ea": m_ea_o.ece,
+                "seed": seed,
+                "n_estimators": n_estimators,
+                "use_hierarchical": bool(use_hierarchical),
+                "sa_checkpoint": str(model_sa),
+                "ea_checkpoint": str(model_ea),
+            }
+        )
 
     # Feature-rotation robustness: stronger tests for diagonal metric assumptions
     num_cols = list(X_tr.select_dtypes(include="number").columns)
@@ -1381,12 +1534,12 @@ def run_robustness_panel(
                     }
                 )
 
-    # (a) Irrelevant feature robustness: add pure noise columns
+    # (a) Uninformative features (TabPFN-style): shuffled copies of existing columns
     if n_noise_features > 0:
-        print("  Irrelevant features (Gaussian noise columns):")
-        X_tr_noise, X_te_noise = _add_irrelevant_features(X_tr, X_te, n_noise_features, rng)
+        print("  Uninformative features (shuffled feature copies, TabPFN-style):")
+        X_tr_u, X_te_u = add_uninformative_features_shuffled(X_tr, X_te, n_noise_features, rng)
 
-        clf_sa_noise = TabICLClassifier(
+        clf_sa_u = TabICLClassifier(
             device=device,
             model_path=str(model_sa),
             allow_auto_download=False,
@@ -1395,9 +1548,9 @@ def run_robustness_panel(
             random_state=seed,
             verbose=False,
         )
-        clf_sa_noise.fit(X_tr_noise, y_tr)
+        clf_sa_u.fit(X_tr_u, y_tr)
 
-        clf_ea_noise = TabICLClassifier(
+        clf_ea_u = TabICLClassifier(
             device=device,
             model_path=str(model_ea),
             allow_auto_download=False,
@@ -1406,30 +1559,30 @@ def run_robustness_panel(
             random_state=seed,
             verbose=False,
         )
-        clf_ea_noise.fit(X_tr_noise, y_tr)
+        clf_ea_u.fit(X_tr_u, y_tr)
 
-        m_sa_noise = _eval_metrics_from_fitted_clf(clf_sa_noise, X_te_noise, y_te)
-        m_ea_noise = _eval_metrics_from_fitted_clf(clf_ea_noise, X_te_noise, y_te)
+        m_sa_u = _eval_metrics_from_fitted_clf(clf_sa_u, X_te_u, y_te)
+        m_ea_u = _eval_metrics_from_fitted_clf(clf_ea_u, X_te_u, y_te)
         print(
-            f"  Irrelevant features (n_noise={n_noise_features}): "
-            f"acc(SA)={m_sa_noise.accuracy:.4f}, acc(EA)={m_ea_noise.accuracy:.4f}; "
-            f"NLL(SA)={m_sa_noise.log_loss:.4f}, NLL(EA)={m_ea_noise.log_loss:.4f}"
+            f"  Uninformative features (n_add={n_noise_features}): "
+            f"acc(SA)={m_sa_u.accuracy:.4f}, acc(EA)={m_ea_u.accuracy:.4f}; "
+            f"NLL(SA)={m_sa_u.log_loss:.4f}, NLL(EA)={m_ea_u.log_loss:.4f}"
         )
         robustness_rows.append(
             {
                 "dataset": ds_name,
-                "condition": "irrelevant_features",
-                "param_type": "n_noise",
+                "condition": "uninformative_features_shuffled",
+                "param_type": "n_add",
                 "param_value": int(n_noise_features),
-                "n_test": len(X_te_noise),
-                "acc_sa": m_sa_noise.accuracy,
-                "acc_ea": m_ea_noise.accuracy,
-                "f1_sa": m_sa_noise.f1_macro,
-                "f1_ea": m_ea_noise.f1_macro,
-                "nll_sa": m_sa_noise.log_loss,
-                "nll_ea": m_ea_noise.log_loss,
-                "ece_sa": m_sa_noise.ece,
-                "ece_ea": m_ea_noise.ece,
+                "n_test": len(X_te_u),
+                "acc_sa": m_sa_u.accuracy,
+                "acc_ea": m_ea_u.accuracy,
+                "f1_sa": m_sa_u.f1_macro,
+                "f1_ea": m_ea_u.f1_macro,
+                "nll_sa": m_sa_u.log_loss,
+                "nll_ea": m_ea_u.log_loss,
+                "ece_sa": m_sa_u.ece,
+                "ece_ea": m_ea_u.ece,
                 "seed": seed,
                 "n_estimators": n_estimators,
                 "use_hierarchical": bool(use_hierarchical),
@@ -1575,6 +1728,7 @@ def run_robustness_panel(
             "param_value",
             "rotation_seed",
             "rotation_cols_hash",
+            "p_cell",
             "n_test",
             "acc_sa",
             "acc_ea",
@@ -1746,8 +1900,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--datasets",
         type=str,
-        default="3,6,11,15,23,28,29,31,32,37,44,46,50,54,151,182",
-        help="Comma-separated list of OpenML IDs or names (e.g. '3,11,cmc').",
+        default="14952,7592,14965,219,9977,9976,43,167141,3021,9978,3,146821,28,32,2074",
+        help="Comma-separated list of OpenML IDs or names (default: Panel A robustness set).",
     )
     ap.add_argument(
         "--context_sizes",
@@ -1800,7 +1954,7 @@ def parse_args() -> argparse.Namespace:
         "--n_noise_features",
         type=int,
         default=50,
-        help="Number of pure Gaussian noise feature columns for the irrelevant-feature robustness test.",
+        help="Number of TabPFN-style uninformative shuffled-copy features to add (NOT Gaussian noise).",
     )
     ap.add_argument(
         "--label_poison_fracs",
