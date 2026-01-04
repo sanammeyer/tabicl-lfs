@@ -265,7 +265,6 @@ def linear_cka(X: np.ndarray, Y: np.ndarray) -> float:
 
 
 @torch.no_grad()
-@torch.no_grad()
 def _compute_test_to_train_weights(
     model,
     R_cond: torch.Tensor,
@@ -1926,14 +1925,14 @@ def parse_args() -> argparse.Namespace:
         "--seed",
         type=int,
         default=42,
-        help="Base random seed for splits and ensemble configs (used to derive a small default seed sweep).",
+        help="Base random seed for splits and ensemble configs (used to derive a small default 5-seed sweep).",
     )
     ap.add_argument(
         "--seeds",
         type=int,
         nargs="*",
         default=None,
-        help="Explicit list of seeds for a small seed sweep. When provided, overrides the default sweep derived from --seed.",
+        help="Explicit list of seeds for a small seed sweep. When provided, overrides the default 5-seed sweep derived from --seed.",
     )
     ap.add_argument(
         "--skip_behaviour",
@@ -2016,12 +2015,12 @@ def main() -> None:
         raise SystemExit("No datasets specified; use --datasets id1,id2,...")
 
     # Determine seeds for sweep (at least one).
-    # By default, run a small sweep over three seeds derived from --seed.
+    # By default, run a small sweep over five seeds derived from --seed.
     if args.seeds:
         seed_values = list(dict.fromkeys(args.seeds))
     else:
         base = int(args.seed)
-        seed_values = [base + i for i in range(3)]
+        seed_values = [base + i for i in range(5)]
 
     # Collect results across all datasets / seeds for aggregated summary
     all_beh_rows: List[Dict[str, Any]] = []

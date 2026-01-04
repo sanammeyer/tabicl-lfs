@@ -709,7 +709,7 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Device to use (default: cuda if available, else cpu).",
     )
-    ap.add_argument("--n_estimators", type=int, default=1)
+    ap.add_argument("--n_estimators", type=int, default=32)
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument(
         "--seeds",
