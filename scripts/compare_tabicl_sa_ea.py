@@ -604,7 +604,7 @@ def run_behavioural_panel(
         except ValueError as e:
             # Fall back to unstratified split instead of skipping this context length
             print(
-                f"  [warn] Stratified split failed for context_length={train_size} "
+                f" [warn] Stratified split failed for context_length={train_size} "
                 f"(error: {e}); falling back to unstratified split."
             )
             try:
@@ -632,8 +632,8 @@ def run_behavioural_panel(
                 f"NLL={m.log_loss:.4f}, ECE={m.ece:.4f}"
             )
 
-        print(f"    SA: {_fmt(m_sa)}")
-        print(f"    EA: {_fmt(m_ea)}")
+        print(f" SA: {_fmt(m_sa)}")
+        print(f" EA: {_fmt(m_ea)}")
 
         rows.append(
             dict(
@@ -1315,7 +1315,7 @@ def run_robustness_panel(
         m_ea_o = _eval_metrics_from_fitted_clf(clf_ea, X_te_o, y_te)
 
         print(
-            f"    factor={fac:g}: "
+            f"factor={fac:g}: "
             f"acc(SA)={m_sa_o.accuracy:.4f}, acc(EA)={m_ea_o.accuracy:.4f}; "
             f"NLL(SA)={m_sa_o.log_loss:.4f}, NLL(EA)={m_ea_o.log_loss:.4f}"
         )
