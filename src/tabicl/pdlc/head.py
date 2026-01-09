@@ -15,8 +15,13 @@ class TabPDLHeadConfig:
     Attributes
     ----------
     topk:
-        If not None, keep only the top-k anchors per query and set the rest
-        to -inf before the sigmoid. Acts as a sparsifier / gating mechanism.
+        If not None, keep only the top-k anchors per query.
+        - For `agg in {"class_pool","sum"}`: logits for non-topk anchors are set to -inf
+          before the sigmoid (so they contribute gamma=0).
+        - For `agg == "posterior_avg"`: non-topk anchors are excluded from BOTH the
+          positive and negative terms of the posterior average (so they contribute 0
+          mass, rather than contributing a large "negative" mass via (1-gamma)).
+        Acts as a sparsifier / gating mechanism.
     agg:
         Aggregation mode. One of:
         - "class_pool": mean gamma per class (density-agnostic voting)
@@ -110,8 +115,11 @@ class TabPDLHead(nn.Module):
             mask = support_mask.unsqueeze(1)  # (B, 1, N)
             logits = logits.masked_fill(~mask, float("-inf"))
 
-        # Optional top-k gating per query
-        if self.cfg.topk is not None:
+        # Optional top-k gating per query.
+        # NOTE: For posterior_avg we apply top-k inside the aggregator instead,
+        # because setting logits=-inf implies gamma=0 and thus (1-gamma)=1, which
+        # would incorrectly add a strong "negative" contribution from dropped anchors.
+        if self.cfg.topk is not None and self.cfg.agg != "posterior_avg":
             k = int(self.cfg.topk)
             if k > 0 and k < logits.size(-1):
                 # Find per-query threshold
@@ -183,8 +191,26 @@ class TabPDLHead(nn.Module):
 
             # positive: sum_{i:y_i=c} gamma(q,i)
             idx = y.unsqueeze(0).expand(M, N_eff)
+            # Optional top-k gating: exclude non-topk anchors from both pos and neg.
+            if self.cfg.topk is not None:
+                k = int(self.cfg.topk)
+                if k > 0 and k < N_eff:
+                    topk_idx = g.topk(k, dim=1).indices  # (M, k)
+                    keep = torch.zeros_like(g, dtype=torch.bool)
+                    keep.scatter_(1, topk_idx, True)
+                else:
+                    keep = torch.ones_like(g, dtype=torch.bool)
+                keep_f = keep.to(dtype=g.dtype)
+                g_used = g * keep_f
+                one_minus_g_used = (1.0 - g) * keep_f
+                denom_q = keep_f.sum(dim=1).clamp_min(1.0)  # (M,)
+            else:
+                g_used = g
+                one_minus_g_used = 1.0 - g
+                denom_q = g.new_full((M,), float(N_eff))
+
             pos = g.new_zeros((M, C))
-            pos.scatter_add_(1, idx, g)
+            pos.scatter_add_(1, idx, g_used)
 
             # build rho (N_eff, C): rho[i,c] = prior[c] / (1 - prior[y_i]) for c != y_i; 0 for c==y_i
             denom = (1.0 - prior.gather(0, y)).clamp_min(1e-6)         # (N_eff,)
@@ -192,9 +218,9 @@ class TabPDLHead(nn.Module):
             rho.scatter_(1, y.view(-1, 1), 0.0)
 
             # negative: sum_i (1-gamma(q,i)) * rho_i,c
-            neg = (1.0 - g) @ rho                                       # (M, C)
+            neg = one_minus_g_used @ rho                                 # (M, C)
 
-            p = (pos + neg) / float(N_eff)                               # (M, C)
+            p = (pos + neg) / denom_q.unsqueeze(1)                       # (M, C)
             # p should already be normalized; minor safety:
             p = p.clamp_min(0.0)
             p = p / p.sum(dim=1, keepdim=True).clamp_min(1e-12)
