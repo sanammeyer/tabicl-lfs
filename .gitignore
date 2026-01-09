@@ -130,4 +130,5 @@ dmypy.json
 
 # Developer environments
 .idea
-.vscode./checkpoints
+.vscode/
+checkpoints/

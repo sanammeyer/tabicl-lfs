@@ -113,7 +113,7 @@ def evaluate_dataset(did: int, task_id: int, device: str) -> Dict[str, Any]:
 
             clf = TabICLClassifier(
                 device=device,
-                model_path=str(ROOT / "checkpoints_mini_tabicl_stage1_sa" / "step-25000.ckpt"),
+                model_path=str(ROOT / "checkpoints" / "mini_tabicl_stage1_sa" / "step-25000.ckpt"),
                 allow_auto_download=False,
                 use_hierarchical=True,
             )

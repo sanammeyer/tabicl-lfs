@@ -30,7 +30,7 @@ We are continuously improving TabICL, and as a by-product (Great thanks to [Davi
 
 ### Open-source pretraining code 🥳
 
-After intensive refactoring, we fully open-sourced our pretraining code to reproduce our paper. The scripts folder provides the commands for [stage 1](./scripts/train_stage1.sh), [stage 2](./scripts/train_stage2.sh), and [stage 3](./scripts/train_stage3.sh) of curriculum learning.
+After intensive refactoring, we fully open-sourced our pretraining code to reproduce our paper. The scripts folder provides the commands for [stage 1](./scripts/sh/train_stage1.sh), [stage 2](./scripts/sh/train_stage2.sh), and [stage 3](./scripts/sh/train_stage3.sh) of curriculum learning.
 
 ***05/01/2025***
 
