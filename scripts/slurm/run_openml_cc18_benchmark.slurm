@@ -12,10 +12,10 @@
 #SBATCH --export=NONE                # Don't inherit submit shell env
 #SBATCH --clusters=hlai
 #SBATCH --partition=hlai_std         # Partition/queue
-##SBATCH --gpus=1                     # Number of GPUs per node
+#SBATCH --gpus=1                     # Number of GPUs per node
 #SBATCH --ntasks=1                   # One task
 #SBATCH --cpus-per-task=16           # CPU cores
-#SBATCH --mem=128G                   # RAM
+#SBATCH --mem=32G                   # RAM
 #SBATCH --time=120:00:00             # Max runtime
 #SBATCH --mail-type=BEGIN,END,FAIL,TIME_LIMIT  # Email on key events (override with sbatch --mail-type)
 #SBATCH --mail-user=sanamjeet.meyer@campus.lmu.de     # Destination email (override with sbatch --mail-user)
