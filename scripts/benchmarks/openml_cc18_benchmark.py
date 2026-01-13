@@ -23,6 +23,8 @@ import openml
 import pandas as pd
 import torch
 import time
+import json
+import gc
 
 try:
     import wandb
@@ -32,10 +34,14 @@ except Exception:
     wandb = None  # type: ignore[assignment]
     HAVE_WANDB = False
 
-# Prefer local sources for tabicl (src/tabicl) over venv dir named 'tabicl'
-ROOT = Path(__file__).resolve().parent
-SRC_PATH = ROOT / "src"
-if SRC_PATH.exists():
+# Repo root (this file lives at scripts/benchmarks/openml_cc18_benchmark.py)
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+# Ensure repo root + local sources are importable when invoking via file path.
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+SRC_PATH = REPO_ROOT / "src"
+if SRC_PATH.exists() and str(SRC_PATH) not in sys.path:
     sys.path.insert(0, str(SRC_PATH))
 
 # Reuse helpers
@@ -61,11 +67,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--checkpoint",
         type=str,
-        default=str(ROOT / "checkpoints" / "step-1300.ckpt"),
+        default=str(REPO_ROOT / "checkpoints" / "step-1300.ckpt"),
         help="TabICL checkpoint path (only used for --model tabicl)",
     )
     p.add_argument("--device", type=str, default="auto", help="Device: auto|cpu|cuda")
     p.add_argument("--n_estimators", type=int, default=32, help="TabICL ensemble size")
+    p.add_argument("--batch_size", type=int, default=8, help="TabICL inference batch size (smaller reduces OOM risk)")
     p.add_argument("--elliptical_scale_boost", type=float, default=1.0, help="Extra multiplicative factor for elliptical scale (ICL)")
     p.add_argument(
         "--pdlc_inference_temperature",
@@ -94,6 +101,48 @@ def parse_args() -> argparse.Namespace:
             "a checkpoint trained with the TabPDL head. Set <=0 to disable gating."
         ),
     )
+    p.add_argument(
+        "--pdlc_topk_tune",
+        action="store_true",
+        help=(
+            "Tune PDLC top-k per dataset on a held-out subset of the fold-0 train split, "
+            "then reuse the tuned k for all folds. Uses candidates derived from dataset size."
+        ),
+    )
+    p.add_argument(
+        "--pdlc_topk_tune_metric",
+        type=str,
+        default="f1_macro",
+        choices=["f1_macro", "accuracy", "roc_auc"],
+        help="Metric optimized during top-k tuning.",
+    )
+    p.add_argument(
+        "--pdlc_topk_tune_val_frac",
+        type=float,
+        default=0.2,
+        help="Fraction of fold-0 train split used as tuning validation queries.",
+    )
+    p.add_argument(
+        "--pdlc_topk_tune_abs",
+        type=str,
+        default="8,16,32,64,128",
+        help="Comma-separated absolute k candidates (clipped to support size).",
+    )
+    p.add_argument(
+        "--pdlc_topk_tune_fracs",
+        type=str,
+        default="0,0.001,0.002,0.005,0.01,0.02,0.05",
+        help=(
+            "Comma-separated fractional k candidates (k=round(frac*N_support)); "
+            "use 0 to include the 'no top-k gating' candidate."
+        ),
+    )
+    p.add_argument(
+        "--pdlc_topk_tune_cache",
+        type=str,
+        default=None,
+        help="Optional JSON cache path to store tuned best_frac per dataset_id for resumable runs.",
+    )
     # Deprecated: PDLC symmetrization is no longer supported and this flag is ignored.
     # p.add_argument(
     #     "--pdlc_symmetrize",
@@ -106,6 +155,7 @@ def parse_args() -> argparse.Namespace:
     #     ),
     # )
     p.add_argument("--limit", type=int, default=None, help="Limit number of tasks for quick runs")
+    p.add_argument("--folds", type=int, default=10, help="Number of CV folds to run (default: 10)")
     p.add_argument(
         "--output",
         type=str,
@@ -152,19 +202,212 @@ def set_global_seed(seed: int):
         pass
 
 
+def _is_oom_error(e: BaseException) -> bool:
+    s = str(e).lower()
+    return isinstance(e, torch.OutOfMemoryError) or ("out of memory" in s) or ("cuda out of memory" in s) or ("hip out of memory" in s)
+
+
+def _cleanup_after_oom() -> None:
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _parse_int_list(csv: str) -> List[int]:
+    out: List[int] = []
+    for s in str(csv).split(","):
+        s = s.strip()
+        if not s:
+            continue
+        out.append(int(s))
+    return out
+
+
+def _parse_float_list(csv: str) -> List[float]:
+    out: List[float] = []
+    for s in str(csv).split(","):
+        s = s.strip()
+        if not s:
+            continue
+        out.append(float(s))
+    return out
+
+
+def _dedup_preserve_order(seq: List[Any]) -> List[Any]:
+    seen = set()
+    out: List[Any] = []
+    for x in seq:
+        key = ("__none__" if x is None else x)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(x)
+    return out
+
+
+def _load_json(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def _save_json(path: Path, obj: Dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(obj, indent=2, sort_keys=True))
+
+
+def _tune_pdlc_topk_for_task_fold0(
+    *,
+    X_train0: pd.DataFrame,
+    y_train0: pd.Series,
+    device: str,
+    checkpoint: str,
+    batch_size: int,
+    elliptical_scale_boost: float,
+    pdlc_agg: Optional[str],
+    pdlc_inference_temperature: Optional[float],
+    metric: str,
+    val_frac: float,
+    abs_candidates: List[int],
+    frac_candidates: List[float],
+    seed: int,
+) -> Dict[str, Any]:
+    """Tune PDLC top-k on fold-0 train split; returns best_frac to scale k with dataset size."""
+    from tabicl import TabICLClassifier
+    from sklearn.model_selection import train_test_split
+
+    if not (0.0 < float(val_frac) < 1.0):
+        raise ValueError(f"pdlc_topk_tune_val_frac must be in (0,1), got {val_frac}")
+
+    # Split fold-0 train into anchors (support) and validation queries.
+    try:
+        Xa, Xv, ya, yv = train_test_split(
+            X_train0,
+            y_train0,
+            test_size=float(val_frac),
+            random_state=int(seed),
+            stratify=y_train0,
+        )
+    except Exception:
+        Xa, Xv, ya, yv = train_test_split(
+            X_train0,
+            y_train0,
+            test_size=float(val_frac),
+            random_state=int(seed),
+            shuffle=True,
+        )
+
+    N_support = int(len(Xa))
+    candidates: List[Optional[int]] = []
+    # Fractions: 0 -> None (no gating)
+    for frac in frac_candidates:
+        if float(frac) <= 0:
+            candidates.append(None)
+            continue
+        k = int(round(float(frac) * float(N_support)))
+        k = max(1, min(N_support, k))
+        candidates.append(k)
+    # Absolutes
+    for k in abs_candidates:
+        if int(k) <= 0:
+            candidates.append(None)
+        else:
+            candidates.append(min(N_support, int(k)))
+    candidates = _dedup_preserve_order(candidates)
+
+    clf = TabICLClassifier(
+        device=device,
+        model_path=checkpoint,
+        allow_auto_download=False,
+        use_hierarchical=True,
+        n_estimators=1,
+        batch_size=int(batch_size),
+        elliptical_scale_boost=float(elliptical_scale_boost),
+        random_state=int(seed),
+        pdlc_agg=pdlc_agg,
+        pdlc_inference_temperature=pdlc_inference_temperature,
+        pdlc_topk=None,
+    )
+    clf.fit(Xa, ya)
+
+    # If this isn't a TabPDL checkpoint, nothing to tune.
+    if getattr(clf, "icl_head", "tabicl") != "tabpdl":
+        return {"best_frac": None, "best_k_support": None, "note": "Checkpoint is not TabPDL (icl_head!=tabpdl)."}
+
+    pdlc_head = getattr(getattr(getattr(clf, "model_", None), "icl_predictor", None), "pdlc_head", None)
+    if pdlc_head is None:
+        return {"best_frac": None, "best_k_support": None, "note": "Model has no pdlc_head; cannot tune."}
+
+    metric_key = str(metric)
+    rows: List[Dict[str, Any]] = []
+    best_score = float("-inf")
+    best_acc = float("-inf")
+    best_k: Optional[int] = None
+
+    old_topk = getattr(pdlc_head.cfg, "topk", None)
+    try:
+        for k in candidates:
+            pdlc_head.cfg.topk = k
+            y_pred = clf.predict(Xv)
+            y_prob = clf.predict_proba(Xv)
+            m = compute_metrics(yv, y_pred, y_prob, classes=clf.classes_)
+            score = float(m.get(metric_key, float("nan")))
+            acc = float(m.get("accuracy", float("nan")))
+            rows.append({"topk": k, "support_n": N_support, "val_n": int(len(Xv)), **m})
+
+            k_rank = int(k) if k is not None else -1
+            best_rank = int(best_k) if best_k is not None else -1
+            if (score > best_score) or (score == best_score and acc > best_acc) or (
+                score == best_score and acc == best_acc and k_rank < best_rank
+            ):
+                best_score = float(score)
+                best_acc = float(acc)
+                best_k = k
+    finally:
+        pdlc_head.cfg.topk = old_topk
+
+    best_frac = None if best_k is None else float(best_k) / float(N_support)
+    return {
+        "best_frac": best_frac,
+        "best_k_support": best_k,
+        "support_n": N_support,
+        "val_n": int(len(Xv)),
+        "metric": metric_key,
+        "rows": rows,
+        "note": "best_frac is applied as k=round(best_frac*N_train_fold) (clipped to [1,N_train_fold])",
+    }
+
+
 def evaluate_task_tabicl(
     task_id: int,
     device: str,
     checkpoint: str,
     n_estimators: int,
+    batch_size: int,
     elliptical_scale_boost: float,
     pdlc_agg: Optional[str],
     pdlc_inference_temperature: Optional[float],
     pdlc_topk: Optional[int],
+    pdlc_topk_tune: bool,
+    pdlc_topk_tune_metric: str,
+    pdlc_topk_tune_val_frac: float,
+    pdlc_topk_tune_abs: str,
+    pdlc_topk_tune_fracs: str,
+    pdlc_topk_tune_cache: Optional[str],
     n_rows: int,
     max_features: int,
     max_classes: int,
     seed: int,
+    folds: int,
 ) -> List[Dict[str, Any]]:
     from tabicl import TabICLClassifier
 
@@ -232,14 +475,54 @@ def evaluate_task_tabicl(
 
     fold_rows: List[Dict[str, Any]] = []
     valid_folds = 0
-    for fold in range(10):
+
+    tuned_best_frac: Optional[float] = None
+    if bool(pdlc_topk_tune):
+        cache_path = None if pdlc_topk_tune_cache is None else Path(str(pdlc_topk_tune_cache))
+        cache: Dict[str, Any] = {} if cache_path is None else _load_json(cache_path)
+        cache_key = str(int(dataset.dataset_id))
+        if cache_key in cache:
+            tuned_best_frac = cache[cache_key].get("best_frac")
+            print(f"[TOPK-TUNE] Dataset {dataset.dataset_id} cached best_frac={tuned_best_frac}")
+        else:
+            try:
+                train_idx0, _ = task.get_train_test_split_indices(repeat=0, fold=0, sample=0)
+                tuned = _tune_pdlc_topk_for_task_fold0(
+                    X_train0=X.iloc[train_idx0],
+                    y_train0=y.iloc[train_idx0],
+                    device=device,
+                    checkpoint=checkpoint,
+                    batch_size=int(batch_size),
+                    elliptical_scale_boost=float(elliptical_scale_boost),
+                    pdlc_agg=pdlc_agg,
+                    pdlc_inference_temperature=pdlc_inference_temperature,
+                    metric=str(pdlc_topk_tune_metric),
+                    val_frac=float(pdlc_topk_tune_val_frac),
+                    abs_candidates=_parse_int_list(pdlc_topk_tune_abs),
+                    frac_candidates=_parse_float_list(pdlc_topk_tune_fracs),
+                    seed=int(seed),
+                )
+                tuned_best_frac = tuned.get("best_frac")
+                print(
+                    f"[TOPK-TUNE] Dataset {dataset.dataset_id} best_frac={tuned_best_frac} "
+                    f"(best_k_support={tuned.get('best_k_support')}, support_n={tuned.get('support_n')})"
+                )
+                if cache_path is not None:
+                    cache[cache_key] = tuned
+                    _save_json(cache_path, cache)
+            except Exception as e:
+                print(f"[WARN] Top-k tuning failed for dataset {dataset.dataset_id}: {e}")
+    n_folds = int(folds)
+    if not (1 <= n_folds <= 10):
+        raise ValueError(f"--folds must be in [1,10], got {n_folds}")
+    for fold in range(n_folds):
         try:
             train_idx, test_idx = task.get_train_test_split_indices(repeat=0, fold=fold, sample=0)
         except Exception as e:
             print(f"[SKIP] Task {task_id} fold {fold+1}: split error: {e}")
             continue
 
-        print(f"  Running Task {task_id} Fold {fold+1}/10...")
+        print(f"  Running Task {task_id} Fold {fold+1}/{n_folds}...")
         X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
         y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
 
@@ -247,25 +530,57 @@ def evaluate_task_tabicl(
             print(f"[SKIP] Task {task_id} fold {fold+1}: missing classes in train.")
             continue
 
+        # Determine effective top-k for this fold.
+        pdlc_topk_eff: Optional[int] = pdlc_topk
+        if bool(pdlc_topk_tune) and tuned_best_frac is not None:
+            N_fold = int(len(train_idx))
+            k = int(round(float(tuned_best_frac) * float(N_fold)))
+            k = max(1, min(N_fold, k))
+            pdlc_topk_eff = int(k)
+
         clf = TabICLClassifier(
             device=device,
             model_path=checkpoint,
             allow_auto_download=False,
             use_hierarchical=True,
             n_estimators=n_estimators,
+            batch_size=int(batch_size),
             elliptical_scale_boost=elliptical_scale_boost,
             random_state=seed,
             pdlc_agg=pdlc_agg,
             pdlc_inference_temperature=pdlc_inference_temperature,
-            pdlc_topk=pdlc_topk,
+            pdlc_topk=pdlc_topk_eff,
         )
         t0 = time.perf_counter()
-        clf.fit(X_train, y_train)
-        t1 = time.perf_counter()
-        y_pred = clf.predict(X_test)
-        t2 = time.perf_counter()
-        y_prob = clf.predict_proba(X_test)
-        t3 = time.perf_counter()
+        try:
+            clf.fit(X_train, y_train)
+            t1 = time.perf_counter()
+            y_pred = clf.predict(X_test)
+            t2 = time.perf_counter()
+            y_prob = clf.predict_proba(X_test)
+            t3 = time.perf_counter()
+        except Exception as e:
+            if _is_oom_error(e):
+                _cleanup_after_oom()
+                print(f"[OOM] Task {task_id} fold {fold+1}: {e}")
+                fold_rows.append(
+                    {
+                        "task_id": task_id,
+                        "dataset_id": int(dataset.dataset_id),
+                        "dataset_name": dataset.name,
+                        "fold": int(fold),
+                        "task_type": "Binary" if len(np.unique(y)) == 2 else "Multiclass",
+                        **meta_cols,
+                        "n_train": int(len(train_idx)),
+                        "n_test": int(len(test_idx)),
+                        "error": f"OOM: {e}",
+                        "seed": int(seed),
+                        "pdlc_topk_effective": (None if pdlc_topk_eff is None else int(pdlc_topk_eff)),
+                        "pdlc_topk_tuned_best_frac": tuned_best_frac,
+                    }
+                )
+                continue
+            raise
 
         metrics = compute_metrics(y_test, y_pred, y_prob, classes=clf.classes_)
         metrics.update(
@@ -285,6 +600,8 @@ def evaluate_task_tabicl(
             **meta_cols,
             **metrics,
             "seed": int(seed),
+            "pdlc_topk_effective": (None if pdlc_topk_eff is None else int(pdlc_topk_eff)),
+            "pdlc_topk_tuned_best_frac": tuned_best_frac,
         }
         fold_rows.append(row)
         valid_folds += 1
@@ -315,6 +632,7 @@ def evaluate_task_tabpfn(
     max_features: int,
     max_classes: int,
     seed: int,
+    folds: int,
 ) -> List[Dict[str, Any]]:
     try:
         from tabpfn import TabPFNClassifier  # type: ignore
@@ -398,7 +716,10 @@ def evaluate_task_tabpfn(
 
     fold_rows: List[Dict[str, Any]] = []
     valid_folds = 0
-    for fold in range(10):
+    n_folds = int(folds)
+    if not (1 <= n_folds <= 10):
+        raise ValueError(f"--folds must be in [1,10], got {n_folds}")
+    for fold in range(n_folds):
         try:
             train_idx, test_idx = task.get_train_test_split_indices(repeat=0, fold=fold, sample=0)
         except Exception as e:
@@ -508,7 +829,7 @@ def main():
     task_ids = list(suite.tasks)
     if args.limit is not None:
         task_ids = task_ids[: args.limit]
-    print(f"OpenML-CC18: evaluating {len(task_ids)} tasks with 10-fold CV")
+    print(f"OpenML-CC18: evaluating {len(task_ids)} tasks with {int(args.folds)}-fold CV")
 
     results = []
     for i, tid in enumerate(task_ids, 1):
@@ -520,14 +841,22 @@ def main():
                     device=device,
                     checkpoint=args.checkpoint,
                     n_estimators=args.n_estimators,
+                    batch_size=args.batch_size,
                     elliptical_scale_boost=args.elliptical_scale_boost,
                     pdlc_agg=args.pdlc_agg,
                     pdlc_inference_temperature=args.pdlc_inference_temperature,
                     pdlc_topk=args.pdlc_topk,
+                    pdlc_topk_tune=bool(args.pdlc_topk_tune),
+                    pdlc_topk_tune_metric=str(args.pdlc_topk_tune_metric),
+                    pdlc_topk_tune_val_frac=float(args.pdlc_topk_tune_val_frac),
+                    pdlc_topk_tune_abs=str(args.pdlc_topk_tune_abs),
+                    pdlc_topk_tune_fracs=str(args.pdlc_topk_tune_fracs),
+                    pdlc_topk_tune_cache=args.pdlc_topk_tune_cache,
                     n_rows=args.n_rows,
                     max_features=args.max_features,
                     max_classes=args.max_classes,
                     seed=args.seed,
+                    folds=int(args.folds),
                 )
             else:
                 res_rows = evaluate_task_tabpfn(
@@ -537,6 +866,7 @@ def main():
                     max_features=args.max_features,
                     max_classes=args.max_classes,
                     seed=args.seed,
+                    folds=int(args.folds),
                 )
         except Exception as e:
             res_rows = [
@@ -556,7 +886,7 @@ def main():
         results.extend(res_rows)
 
     df = pd.DataFrame(results)
-    out_dir = ROOT / "results"
+    out_dir = REPO_ROOT / "results"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     if args.output is not None:

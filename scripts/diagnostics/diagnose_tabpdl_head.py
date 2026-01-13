@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import gc
 import json
 import math
 import sys
@@ -455,7 +456,28 @@ def print_recall_and_confusion(name: str, labels: Sequence[str], diag: BasicDiag
 
 def encode_y_true_for_index(clf, y: pd.Series, index: Sequence[Any]) -> np.ndarray:
     """Encode y for an explicit index selection, asserting ordering integrity."""
-    y_sub = y.loc[list(index)]
+    idx = list(index)
+    try:
+        y_sub = y.loc[idx]
+    except KeyError:
+        # Robust fallback: some parts of this script store episode indices as strings for JSON safety,
+        # while y/X splits may preserve their original (e.g. int) index dtype.
+        # If direct .loc fails, try to map stringified indices back onto y.index.
+        str_to_orig = {str(i): i for i in list(y.index)}
+        mapped = []
+        missing = []
+        for i in idx:
+            key = str(i)
+            if key in str_to_orig:
+                mapped.append(str_to_orig[key])
+            else:
+                missing.append(key)
+        if missing:
+            raise KeyError(
+                f"None of the provided indices are in y.index (example missing={missing[:5]}). "
+                "This likely indicates a mismatch between stored episode indices and the current split."
+            )
+        y_sub = y.loc[mapped]
     assert len(y_sub) == len(index), "Indexing y changed the number of rows; check duplicates/missing indices."
     assert [str(i) for i in list(y_sub.index)] == [str(i) for i in list(index)], "y_sub index order mismatch."
     y_enc = clf.y_encoder_.transform(y_sub)
@@ -1494,6 +1516,56 @@ def _maybe_write_csv(path: Path, df: pd.DataFrame, no_save: bool) -> None:
     df.to_csv(path, index=False)
 
 
+def _is_oom_error(err: BaseException) -> bool:
+    if isinstance(err, torch.OutOfMemoryError):
+        return True
+    msg = str(err).lower()
+    return ("out of memory" in msg) or ("cuda out of memory" in msg) or ("hip out of memory" in msg)
+
+
+def _cleanup_after_oom() -> None:
+    # Best-effort cleanup; safe to call on CPU too.
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    try:
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _safe_auc(y_true: np.ndarray, scores: np.ndarray) -> float:
+    y = np.asarray(y_true).astype(np.int64)
+    s = np.asarray(scores).astype(np.float64)
+    if y.size == 0:
+        return float("nan")
+    if int(np.unique(y).size) < 2:
+        return float("nan")
+    return float(roc_auc_score(y, s))
+
+
+def _safe_ap(y_true: np.ndarray, scores: np.ndarray) -> float:
+    y = np.asarray(y_true).astype(np.int64)
+    s = np.asarray(scores).astype(np.float64)
+    if y.size == 0:
+        return float("nan")
+    if int(np.unique(y).size) < 2:
+        return float("nan")
+    return float(average_precision_score(y, s))
+
+
+def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
+    x = np.asarray(a).astype(np.float64)
+    y = np.asarray(b).astype(np.float64)
+    if x.size == 0 or y.size == 0:
+        return float("nan")
+    if float(np.nanstd(x)) < 1e-12 or float(np.nanstd(y)) < 1e-12:
+        return float("nan")
+    return float(np.corrcoef(x, y)[0, 1])
+
+
 def main() -> None:
     args = make_parser().parse_args()
     device = resolve_device(args.device)
@@ -1518,6 +1590,21 @@ def main() -> None:
 
     if args.sa_checkpoint is None and args.pdl_checkpoint is None:
         raise SystemExit("Provide at least one of --sa_checkpoint or --pdl_checkpoint.")
+
+    def _validate_checkpoint_path(flag: str, path: Optional[str]) -> None:
+        if path is None:
+            return
+        p = Path(path)
+        if not p.exists():
+            raise SystemExit(f"{flag} path does not exist: {path!r}")
+        if not p.is_file():
+            raise SystemExit(
+                f"{flag} must be a checkpoint file, but got: {path!r}. "
+                "If you passed an env var, make sure it is set and points to a .ckpt file."
+            )
+
+    _validate_checkpoint_path("--sa_checkpoint", args.sa_checkpoint)
+    _validate_checkpoint_path("--pdl_checkpoint", args.pdl_checkpoint)
 
     overall: Dict[str, Any] = {
         "args": vars(args),
@@ -1544,6 +1631,7 @@ def main() -> None:
             "n_features": int(X.shape[1]),
             "split": split_info,
             "models": {},
+            "errors": [],
             "pdl_gamma": None,
             "variant": None,
             "variant_runs": [],
@@ -1597,76 +1685,124 @@ def main() -> None:
         # A/C on sklearn wrapper outputs
         # -------------------------------
         if args.sa_checkpoint is not None:
-            sa = TabICLClassifier(
-                n_estimators=int(args.n_estimators),
-                batch_size=int(args.batch_size),
-                use_amp=bool(args.use_amp),
-                verbose=bool(args.verbose),
-                model_path=args.sa_checkpoint,
-                allow_auto_download=False,
-                device=str(device),
-                softmax_temperature=float(args.softmax_temperature),
-                average_logits=True,
-            )
-            sa.fit(X_train, y_train)
-            y_true_sa = encode_y_true_for_index(sa, y_test, X_test.index)
-            proba_sa = sa.predict_proba(X_test)
-            diag_sa, _, margin_sa = compute_basic_diagnostics(y_true_sa, proba_sa)
-            print_basic("SA", list(map(str, sa.classes_)), diag_sa)
-            print_recall_and_confusion("SA", list(map(str, sa.classes_)), diag_sa)
-            ds_out["models"]["sa"] = asdict(diag_sa)
+            sa = None
+            try:
+                sa = TabICLClassifier(
+                    n_estimators=int(args.n_estimators),
+                    batch_size=int(args.batch_size),
+                    use_amp=bool(args.use_amp),
+                    verbose=bool(args.verbose),
+                    model_path=args.sa_checkpoint,
+                    allow_auto_download=False,
+                    device=str(device),
+                    softmax_temperature=float(args.softmax_temperature),
+                    average_logits=True,
+                )
+                sa.fit(X_train, y_train)
+                y_true_sa = encode_y_true_for_index(sa, y_test, X_test.index)
+                proba_sa = sa.predict_proba(X_test)
+                diag_sa, _, margin_sa = compute_basic_diagnostics(y_true_sa, proba_sa)
+                print_basic("SA", list(map(str, sa.classes_)), diag_sa)
+                print_recall_and_confusion("SA", list(map(str, sa.classes_)), diag_sa)
+                ds_out["models"]["sa"] = asdict(diag_sa)
 
-            if not args.no_save:
-                base = out_dir / ds_name / "sa"
-                _maybe_write_csv(base / "pred_counts.csv", pd.DataFrame({"class": sa.classes_, "count": diag_sa.pred_counts}), args.no_save)
-                _maybe_write_csv(base / "per_class_recall.csv", pd.DataFrame({"class": sa.classes_, "recall": diag_sa.per_class_recall}), args.no_save)
-                _maybe_write_csv(base / "confusion.csv", pd.DataFrame(diag_sa.confusion, columns=list(sa.classes_)), args.no_save)
-                np.savez(base / "margins.npz", margin=margin_sa.astype(np.float32))
+                if not args.no_save:
+                    base = out_dir / ds_name / "sa"
+                    _maybe_write_csv(
+                        base / "pred_counts.csv",
+                        pd.DataFrame({"class": sa.classes_, "count": diag_sa.pred_counts}),
+                        args.no_save,
+                    )
+                    _maybe_write_csv(
+                        base / "per_class_recall.csv",
+                        pd.DataFrame({"class": sa.classes_, "recall": diag_sa.per_class_recall}),
+                        args.no_save,
+                    )
+                    _maybe_write_csv(
+                        base / "confusion.csv",
+                        pd.DataFrame(diag_sa.confusion, columns=list(sa.classes_)),
+                        args.no_save,
+                    )
+                    np.savez(base / "margins.npz", margin=margin_sa.astype(np.float32))
+            except Exception as e:
+                if _is_oom_error(e):
+                    _cleanup_after_oom()
+                    print(f"[oom] SA ran out of memory on {ds_name} (skipping SA): {e}")
+                    ds_out["errors"].append({"model": "sa", "stage": "fit/predict_proba", "error": str(e)})
+                else:
+                    raise
+            finally:
+                # Release GPU memory ASAP.
+                try:
+                    del sa
+                except Exception:
+                    pass
 
         pdl_clf = None
         if args.pdl_checkpoint is not None:
-            pdl_clf = TabICLClassifier(
-                n_estimators=int(args.n_estimators),
-                batch_size=int(args.batch_size),
-                use_amp=bool(args.use_amp),
-                verbose=bool(args.verbose),
-                model_path=args.pdl_checkpoint,
-                allow_auto_download=False,
-                device=str(device),
-                softmax_temperature=float(args.softmax_temperature),
-                average_logits=True,
-                pdlc_agg=str(args.pdlc_agg) if args.pdlc_agg is not None else None,
-                pdlc_inference_temperature=args.pdlc_inference_temperature,
-                pdlc_topk=pdlc_topk_effective,
-                pdlc_bilinear=args.pdlc_bilinear,
-                pdlc_tau_override=args.pdlc_tau_override,
-            )
-            pdl_clf.fit(X_train, y_train)
-            # Log the effective PDLC head config after applying wrapper overrides.
             try:
-                head = pdl_clf.model_.icl_predictor.pdlc_head
-                cfg = getattr(head, "cfg", None)
-                if cfg is not None:
-                    print(
-                        f"[PDL cfg] agg={getattr(cfg, 'agg', None)} topk={getattr(cfg, 'topk', None)} "
-                        f"embed_norm={getattr(cfg, 'embed_norm', None)} "
-                        f"Inference_temperature={getattr(cfg, 'Inference_temperature', None)}"
-                    )
-            except Exception:
-                pass
-            y_true_pdl = encode_y_true_for_index(pdl_clf, y_test, X_test.index)
-            proba_pdl = pdl_clf.predict_proba(X_test)
-            diag_pdl, _, margin_pdl = compute_basic_diagnostics(y_true_pdl, proba_pdl)
-            print_basic("PDL", list(map(str, pdl_clf.classes_)), diag_pdl)
-            print_recall_and_confusion("PDL", list(map(str, pdl_clf.classes_)), diag_pdl)
-            ds_out["models"]["pdl"] = asdict(diag_pdl)
+                pdl_clf = TabICLClassifier(
+                    n_estimators=int(args.n_estimators),
+                    batch_size=int(args.batch_size),
+                    use_amp=bool(args.use_amp),
+                    verbose=bool(args.verbose),
+                    model_path=args.pdl_checkpoint,
+                    allow_auto_download=False,
+                    device=str(device),
+                    softmax_temperature=float(args.softmax_temperature),
+                    average_logits=True,
+                    pdlc_agg=str(args.pdlc_agg) if args.pdlc_agg is not None else None,
+                    pdlc_inference_temperature=args.pdlc_inference_temperature,
+                    pdlc_topk=pdlc_topk_effective,
+                    pdlc_bilinear=args.pdlc_bilinear,
+                    pdlc_tau_override=args.pdlc_tau_override,
+                )
+                pdl_clf.fit(X_train, y_train)
+                # Log the effective PDLC head config after applying wrapper overrides.
+                try:
+                    head = pdl_clf.model_.icl_predictor.pdlc_head
+                    cfg = getattr(head, "cfg", None)
+                    if cfg is not None:
+                        print(
+                            f"[PDL cfg] agg={getattr(cfg, 'agg', None)} topk={getattr(cfg, 'topk', None)} "
+                            f"embed_norm={getattr(cfg, 'embed_norm', None)} "
+                            f"Inference_temperature={getattr(cfg, 'Inference_temperature', None)}"
+                        )
+                except Exception:
+                    pass
+                y_true_pdl = encode_y_true_for_index(pdl_clf, y_test, X_test.index)
+                proba_pdl = pdl_clf.predict_proba(X_test)
+                diag_pdl, _, margin_pdl = compute_basic_diagnostics(y_true_pdl, proba_pdl)
+                print_basic("PDL", list(map(str, pdl_clf.classes_)), diag_pdl)
+                print_recall_and_confusion("PDL", list(map(str, pdl_clf.classes_)), diag_pdl)
+                ds_out["models"]["pdl"] = asdict(diag_pdl)
 
-            if not args.no_save:
-                base = out_dir / ds_name / "pdl"
-                _maybe_write_csv(base / "pred_counts.csv", pd.DataFrame({"class": pdl_clf.classes_, "count": diag_pdl.pred_counts}), args.no_save)
-                _maybe_write_csv(base / "per_class_recall.csv", pd.DataFrame({"class": pdl_clf.classes_, "recall": diag_pdl.per_class_recall}), args.no_save)
-                _maybe_write_csv(base / "confusion.csv", pd.DataFrame(diag_pdl.confusion, columns=list(pdl_clf.classes_)), args.no_save)
-                np.savez(base / "margins.npz", margin=margin_pdl.astype(np.float32))
+                if not args.no_save:
+                    base = out_dir / ds_name / "pdl"
+                    _maybe_write_csv(
+                        base / "pred_counts.csv",
+                        pd.DataFrame({"class": pdl_clf.classes_, "count": diag_pdl.pred_counts}),
+                        args.no_save,
+                    )
+                    _maybe_write_csv(
+                        base / "per_class_recall.csv",
+                        pd.DataFrame({"class": pdl_clf.classes_, "recall": diag_pdl.per_class_recall}),
+                        args.no_save,
+                    )
+                    _maybe_write_csv(
+                        base / "confusion.csv",
+                        pd.DataFrame(diag_pdl.confusion, columns=list(pdl_clf.classes_)),
+                        args.no_save,
+                    )
+                    np.savez(base / "margins.npz", margin=margin_pdl.astype(np.float32))
+            except Exception as e:
+                if _is_oom_error(e):
+                    _cleanup_after_oom()
+                    print(f"[oom] PDL ran out of memory on {ds_name} (skipping PDL): {e}")
+                    ds_out["errors"].append({"model": "pdl", "stage": "fit/predict_proba", "error": str(e)})
+                    pdl_clf = None
+                else:
+                    raise
 
         # -------------------------------
         # B/E on a single variant episode
@@ -1691,7 +1827,22 @@ def main() -> None:
             infer_cfg = pdl_clf.inference_config_
             pdl_model = pdl_clf.model_
             pdl_model.eval()
-            src = compute_icl_embeddings(pdl_model, episode, infer_cfg, device=device)
+            try:
+                src = compute_icl_embeddings(pdl_model, episode, infer_cfg, device=device)
+            except Exception as e:
+                if _is_oom_error(e):
+                    _cleanup_after_oom()
+                    print(f"[oom] PDL single-variant embedding OOM on {ds_name} (skipping B/E diagnostics): {e}")
+                    ds_out["errors"].append({"model": "pdl", "stage": "single_variant_embeddings", "error": str(e)})
+                    src = None
+                else:
+                    raise
+
+            if src is None:
+                # Can't run any single-variant diagnostics without embeddings.
+                overall["datasets"].append(ds_out)
+                _maybe_write_json(out_dir / ds_name / "summary.json", ds_out, args.no_save)
+                continue
 
             # Compute gamma separation on supports
             gamma_sep = compute_support_support_gamma_auc(
@@ -1722,6 +1873,71 @@ def main() -> None:
                         f"TU={u.tu_mean:.3f} AU={u.au_mean:.3f} EU={u.eu_mean:.3f} "
                         f"(norm TU/AU/EU={u.tu_norm_mean:.3f}/{u.au_norm_mean:.3f}/{u.eu_norm_mean:.3f})"
                     )
+
+                    # Check whether TU/AU/EU behave meaningfully as *error predictors* on this episode.
+                    # We use the same single-variant predictions (not the full ensemble).
+                    try:
+                        logits_sv = pdl_variant_logits_from_embeddings(
+                            pdl_model,
+                            src=src,
+                            episode=episode,
+                            agg=str(getattr(pdl_model.icl_predictor.pdlc_head.cfg, "agg", "posterior_avg")),
+                            topk=getattr(pdl_model.icl_predictor.pdlc_head.cfg, "topk", None),
+                            embed_norm=str(getattr(pdl_model.icl_predictor.pdlc_head.cfg, "embed_norm", "none")),
+                            infer_temp=getattr(pdl_model.icl_predictor.pdlc_head.cfg, "Inference_temperature", None),
+                            device=device,
+                        )
+                        proba_sv = logits_to_proba(logits_sv)
+                        # The single-variant episode is materialized from the same (X_train, X_test) split.
+                        # Use the actual test split index (not the stringified episode.test_index) to avoid
+                        # dtype mismatches when indexing y_test.
+                        y_true_sv = encode_y_true_for_index(pdl_clf, y_test, X_test.index)
+                        assert int(y_true_sv.shape[0]) == int(proba_sv.shape[0]) == int(tu.shape[0])
+
+                        diag_sv, y_pred_sv, margin_sv = compute_basic_diagnostics(y_true_sv, proba_sv)
+                        err = (y_pred_sv != y_true_sv).astype(np.int64)
+
+                        # Basic sanity invariants.
+                        eu_resid = tu - (au + eu)
+                        frac_eu_neg = float(np.mean(eu < (-1e-6)))
+
+                        ueval = {
+                            "n": int(err.size),
+                            "err_rate": float(err.mean()),
+                            "tu_err_auc": _safe_auc(err, tu),
+                            "au_err_auc": _safe_auc(err, au),
+                            "eu_err_auc": _safe_auc(err, eu),
+                            "tu_err_ap": _safe_ap(err, tu),
+                            "au_err_ap": _safe_ap(err, au),
+                            "eu_err_ap": _safe_ap(err, eu),
+                            "tu_mean_correct": float(np.mean(tu[err == 0])) if np.any(err == 0) else float("nan"),
+                            "tu_mean_wrong": float(np.mean(tu[err == 1])) if np.any(err == 1) else float("nan"),
+                            "au_mean_correct": float(np.mean(au[err == 0])) if np.any(err == 0) else float("nan"),
+                            "au_mean_wrong": float(np.mean(au[err == 1])) if np.any(err == 1) else float("nan"),
+                            "eu_mean_correct": float(np.mean(eu[err == 0])) if np.any(err == 0) else float("nan"),
+                            "eu_mean_wrong": float(np.mean(eu[err == 1])) if np.any(err == 1) else float("nan"),
+                            "corr_tu_margin": _safe_corr(tu, margin_sv),
+                            "corr_au_margin": _safe_corr(au, margin_sv),
+                            "corr_eu_margin": _safe_corr(eu, margin_sv),
+                            "corr_kept_tu": _safe_corr(kept, tu),
+                            "corr_kept_eu": _safe_corr(kept, eu),
+                            "eu_resid_abs_mean": float(np.mean(np.abs(eu_resid))),
+                            "eu_min": float(np.min(eu)),
+                            "frac_eu_negative": frac_eu_neg,
+                            "single_variant_acc": float(diag_sv.acc),
+                            "single_variant_macro_f1": float(diag_sv.macro_f1),
+                        }
+                        ds_out["pdl_anchor_uncertainty_eval"] = ueval
+                        print(
+                            f"[PDL uncertainty eval] err_auc TU/AU/EU="
+                            f"{ueval['tu_err_auc']:.3f}/{ueval['au_err_auc']:.3f}/{ueval['eu_err_auc']:.3f} "
+                            f"| TU(wrong/correct)={ueval['tu_mean_wrong']:.3f}/{ueval['tu_mean_correct']:.3f} "
+                            f"| corr(TU,margin)={ueval['corr_tu_margin']:.3f} "
+                            f"| frac(EU<0)={ueval['frac_eu_negative']:.3f}"
+                        )
+                    except Exception as e:
+                        print(f"[warn] Failed to evaluate uncertainty meaningfulness: {e}")
+
                     if not args.no_save:
                         base = out_dir / ds_name / "pdl_anchor_uncertainty"
                         base.mkdir(parents=True, exist_ok=True)
