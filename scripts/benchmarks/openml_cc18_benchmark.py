@@ -85,6 +85,15 @@ def parse_args() -> argparse.Namespace:
             "a checkpoint trained with the TabPDL head. Ignored for standard TabICL."
         ),
     )
+    p.add_argument(
+        "--pdlc_topk",
+        type=int,
+        default=None,
+        help=(
+            "Optional override for PDLC top-k gating at inference when using "
+            "a checkpoint trained with the TabPDL head. Set <=0 to disable gating."
+        ),
+    )
     # Deprecated: PDLC symmetrization is no longer supported and this flag is ignored.
     # p.add_argument(
     #     "--pdlc_symmetrize",
@@ -151,6 +160,7 @@ def evaluate_task_tabicl(
     elliptical_scale_boost: float,
     pdlc_agg: Optional[str],
     pdlc_inference_temperature: Optional[float],
+    pdlc_topk: Optional[int],
     n_rows: int,
     max_features: int,
     max_classes: int,
@@ -247,6 +257,7 @@ def evaluate_task_tabicl(
             random_state=seed,
             pdlc_agg=pdlc_agg,
             pdlc_inference_temperature=pdlc_inference_temperature,
+            pdlc_topk=pdlc_topk,
         )
         t0 = time.perf_counter()
         clf.fit(X_train, y_train)
@@ -512,6 +523,7 @@ def main():
                     elliptical_scale_boost=args.elliptical_scale_boost,
                     pdlc_agg=args.pdlc_agg,
                     pdlc_inference_temperature=args.pdlc_inference_temperature,
+                    pdlc_topk=args.pdlc_topk,
                     n_rows=args.n_rows,
                     max_features=args.max_features,
                     max_classes=args.max_classes,

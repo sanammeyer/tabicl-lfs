@@ -202,6 +202,9 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         elliptical_scale_boost: float = 1.0,
         pdlc_agg: Optional[str] = None,
         pdlc_inference_temperature: Optional[float] = None,
+        pdlc_topk: Optional[int] = None,
+        pdlc_bilinear: Optional[str] = None,
+        pdlc_tau_override: Optional[float] = None,
         # Deprecated: PDLC symmetrization is no longer supported; kept for API compatibility.
         pdlc_symmetrize: Optional[bool] = None,
     ):
@@ -228,6 +231,16 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
         self.pdlc_agg: Optional[str] = pdlc_agg
         # Optional override for PDLC inference-time temperature (for PDL head checkpoints)
         self.pdlc_inference_temperature: Optional[float] = pdlc_inference_temperature
+        # Optional override for PDLC top-k gating at inference (for PDL head checkpoints)
+        self.pdlc_topk: Optional[int] = pdlc_topk
+        # Optional override for the bilinear similarity at inference (for PDL head checkpoints).
+        # Supported values:
+        #  - None / "learned": keep checkpoint weights
+        #  - "identity": set W_Q = I and W_K = I (dot-product after LN / optional L2)
+        self.pdlc_bilinear: Optional[str] = pdlc_bilinear
+        # Optional override for tau at inference (for PDL head checkpoints).
+        # This sets the underlying _tau_param so that softplus(_tau_param)+1e-6 ~= tau_override.
+        self.pdlc_tau_override: Optional[float] = pdlc_tau_override
         # Optional override for PDLC symmetrization at inference (for PDL head checkpoints)
         self.pdlc_symmetrize: Optional[bool] = pdlc_symmetrize
 
@@ -372,6 +385,9 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
                     pdlc_conf["agg"] = self.pdlc_agg
                 if getattr(self, "pdlc_inference_temperature", None) is not None:
                     pdlc_conf["Inference_temperature"] = float(self.pdlc_inference_temperature)
+                if getattr(self, "pdlc_topk", None) is not None:
+                    k = int(self.pdlc_topk)
+                    pdlc_conf["topk"] = None if k <= 0 else k
                 # PDLC symmetrization is ignored.
                 cfg = dict(cfg)
                 cfg["pdlc_config"] = pdlc_conf
@@ -387,6 +403,41 @@ class TabICLClassifier(ClassifierMixin, BaseEstimator):
             self.icl_head = "tabicl"
         self.model_.load_state_dict(checkpoint["state_dict"])
         self.model_.eval()
+
+        # Optional: bilinear / tau ablations for TabPDL head at inference.
+        try:
+            icl_head = getattr(self.model_, "icl_head", "tabicl")
+            if icl_head == "tabpdl":
+                head = getattr(self.model_.icl_predictor, "pdlc_head", None)
+                if head is not None:
+                    mode = getattr(self, "pdlc_bilinear", None)
+                    if mode is not None:
+                        mode = str(mode).lower()
+                    if mode in {"identity"}:
+                        with torch.no_grad():
+                            d = int(head.W_Q.weight.shape[0])
+                            eye = torch.eye(d, dtype=head.W_Q.weight.dtype, device=head.W_Q.weight.device)
+                            head.W_Q.weight.copy_(eye)
+                            head.W_K.weight.copy_(eye)
+                    elif mode in {None, "learned"}:
+                        pass
+                    else:
+                        raise ValueError(f"Unknown pdlc_bilinear={mode!r}. Expected 'learned' or 'identity'.")
+
+                    tau_override = getattr(self, "pdlc_tau_override", None)
+                    if tau_override is not None:
+                        tau_tgt = float(tau_override)
+                        if not (tau_tgt > 0):
+                            raise ValueError("pdlc_tau_override must be > 0.")
+                        # Invert: tau = softplus(x) + 1e-6  =>  x = log(exp(tau-1e-6) - 1)
+                        eps = 1e-6
+                        z = max(tau_tgt - eps, 1e-12)
+                        x = float(np.log(np.expm1(z)))
+                        with torch.no_grad():
+                            head._tau_param.copy_(torch.tensor(x, dtype=head._tau_param.dtype, device=head._tau_param.device))
+        except Exception:
+            # Keep sklearn wrapper robust; diagnostics script can print effective cfg separately.
+            pass
         # Optional: set an extra multiplicative factor for elliptical scaling (diagnostics)
         try:
             self.model_.set_icl_elliptical_scale_boost(self.elliptical_scale_boost)

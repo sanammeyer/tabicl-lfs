@@ -13,8 +13,9 @@ Optional:
 """
 
 import argparse
+import math
 from pathlib import Path
-from typing import Dict
+from typing import Dict, Tuple
 
 import numpy as np
 import torch
@@ -44,6 +45,20 @@ def make_parser() -> argparse.ArgumentParser:
         "--print_full",
         action="store_true",
         help="If set, print full tensors for small parameters (use with care).",
+    )
+    p.add_argument(
+        "--analyze_bilinear",
+        action="store_true",
+        help=(
+            "If set, compute diagnostics for the learned bilinear similarity "
+            "(W_Q, W_K, tau, and the effective metric M=W_Q^T W_K)."
+        ),
+    )
+    p.add_argument(
+        "--svd_topk",
+        type=int,
+        default=8,
+        help="How many top singular values to print for each matrix (default: 8).",
     )
     return p
 
@@ -93,6 +108,106 @@ def load_model_and_head(ckpt_path: Path, device: torch.device):
 
     head.eval()
     return model, head
+
+
+def _svdvals(x: np.ndarray) -> np.ndarray:
+    # Use numpy for broad compatibility across torch builds.
+    x = np.asarray(x, dtype=np.float64)
+    try:
+        s = np.linalg.svd(x, compute_uv=False)
+    except np.linalg.LinAlgError:
+        # Fallback: eigvals of X^T X (can be less stable)
+        xtx = x.T @ x
+        evals = np.linalg.eigvalsh(xtx)
+        s = np.sqrt(np.clip(evals, a_min=0.0, a_max=None))[::-1]
+    return np.asarray(s, dtype=np.float64)
+
+
+def _effective_rank(s: np.ndarray, eps: float = 1e-12) -> float:
+    s = np.asarray(s, dtype=np.float64)
+    if s.size == 0:
+        return float("nan")
+    z = s / max(float(s.sum()), eps)
+    z = z[z > 0]
+    h = float(-(z * np.log(z)).sum())
+    return float(np.exp(h))
+
+
+def _matrix_summary(name: str, w: np.ndarray, *, svd_topk: int = 8) -> Dict[str, float]:
+    w = np.asarray(w, dtype=np.float64)
+    if w.ndim != 2:
+        raise ValueError(f"{name} expected 2D weight matrix, got shape={w.shape}")
+    s = _svdvals(w)
+    smax = float(s[0]) if s.size else float("nan")
+    smin = float(s[-1]) if s.size else float("nan")
+    cond = float(smax / max(smin, 1e-12)) if np.isfinite(smax) and np.isfinite(smin) else float("nan")
+    fro = float(np.linalg.norm(w, ord="fro"))
+    erank = _effective_rank(s)
+
+    print(f"\n[{name}] shape={w.shape}")
+    print(f"[{name}] ||W||_F={fro:.4f}  sigma_max={smax:.4f}  sigma_min={smin:.4f}  cond~={cond:.2e}  eff_rank~={erank:.2f}")
+    if s.size:
+        k = max(1, min(int(svd_topk), int(s.size)))
+        top = ", ".join(f"{float(x):.4f}" for x in s[:k])
+        print(f"[{name}] top-{k} singular values: [{top}]")
+
+    if w.shape[0] == w.shape[1]:
+        d = w.shape[0]
+        eye = np.eye(d, dtype=np.float64)
+        rel_eye = float(np.linalg.norm(w - eye, ord="fro") / max(np.linalg.norm(eye, ord="fro"), 1e-12))
+        rel_zero = float(np.linalg.norm(w, ord="fro") / max(np.linalg.norm(eye, ord="fro"), 1e-12))
+        print(f"[{name}] ||W-I||_F/||I||_F={rel_eye:.4f}  ||W||_F/||I||_F={rel_zero:.4f}")
+    return {
+        "fro": fro,
+        "sigma_max": smax,
+        "sigma_min": smin,
+        "cond_approx": cond,
+        "effective_rank": erank,
+    }
+
+
+def analyze_bilinear_similarity(head: torch.nn.Module, *, svd_topk: int = 8) -> Dict[str, Dict[str, float]]:
+    """Diagnose whether W_Q/W_K define a non-trivial bilinear similarity."""
+    out: Dict[str, Dict[str, float]] = {}
+
+    W_Q = getattr(head, "W_Q", None)
+    W_K = getattr(head, "W_K", None)
+    if W_Q is None or W_K is None:
+        raise RuntimeError("Head has no W_Q/W_K; cannot analyze bilinear similarity.")
+
+    Wq = W_Q.weight.detach().cpu().numpy()
+    Wk = W_K.weight.detach().cpu().numpy()
+    out["W_Q"] = _matrix_summary("W_Q", Wq, svd_topk=svd_topk)
+    out["W_K"] = _matrix_summary("W_K", Wk, svd_topk=svd_topk)
+
+    # Effective bilinear form in the original embedding space:
+    #   (W_Q h_q) · (W_K h_s) = h_q^T (W_Q^T W_K) h_s
+    M = Wq.T @ Wk
+    out["M"] = _matrix_summary("M = W_Q^T W_K", M, svd_topk=svd_topk)
+
+    # Symmetry / skew: M need not be symmetric, but if it's close to I or symmetric,
+    # then the similarity is close to a standard dot-product metric.
+    sym = 0.5 * (M + M.T)
+    skew = 0.5 * (M - M.T)
+    sym_f = float(np.linalg.norm(sym, ord="fro"))
+    skew_f = float(np.linalg.norm(skew, ord="fro"))
+    rel_skew = float(skew_f / max(sym_f, 1e-12))
+    print(f"\n[M] symmetry check: ||skew||_F / ||sym||_F = {rel_skew:.4f}")
+
+    # Tau and bias scale the logits; if tau is tiny, the learned bilinear form is effectively muted.
+    tau = getattr(head, "tau", None)
+    tau_val = tau() if callable(tau) else tau
+    if tau_val is not None:
+        tau_f = float(tau_val.detach().cpu().item())
+        print(f"[PDL] tau={tau_f:.6f}")
+        out["tau"] = {"value": tau_f}
+    bias = getattr(head, "bias", None)
+    if bias is not None:
+        b = bias.detach().cpu().numpy()
+        print(f"[PDL] bias: shape={b.shape} mean={float(b.mean()):+.6f} std={float(b.std()):.6f}")
+        out["bias"] = {"mean": float(b.mean()), "std": float(b.std())}
+
+    return out
 
 
 def summarize_head(head: torch.nn.Module, print_full: bool = False) -> Dict[str, np.ndarray]:
@@ -157,6 +272,10 @@ def main() -> None:
 
     _, head = load_model_and_head(ckpt_path, device)
     np_params = summarize_head(head, print_full=args.print_full)
+
+    if args.analyze_bilinear:
+        print("\n=== Bilinear similarity diagnostics ===")
+        _ = analyze_bilinear_similarity(head, svd_topk=int(args.svd_topk))
 
     if args.save_npz is not None:
         out_path = Path(args.save_npz).expanduser()
