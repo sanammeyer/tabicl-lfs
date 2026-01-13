@@ -49,6 +49,8 @@ TOPK_TUNE_METRIC="${TOPK_TUNE_METRIC:-f1_macro}"
 TOPK_TUNE_VAL_FRAC="${TOPK_TUNE_VAL_FRAC:-0.2}"
 TOPK_TUNE_ABS="${TOPK_TUNE_ABS:-8,16,32,64,128,256,512,1024,2048}"
 TOPK_TUNE_FRACS="${TOPK_TUNE_FRACS:-0,0.001,0.002,0.005,0.01,0.02,0.05,0.1}"
+TOPK_TUNE_PER_FOLD="${TOPK_TUNE_PER_FOLD:-1}"
+TOPK_TUNE_N_ESTIMATORS="${TOPK_TUNE_N_ESTIMATORS:-$N_ESTIMATORS}"
 
 RUN_TAG="${RUN_TAG:-${SLURM_JOB_ID:-manual}}"
 
@@ -113,15 +115,21 @@ srun -u python -u scripts/benchmarks/openml_cc18_benchmark.py \
   --output "$OUT_DIR/cc18_pdl_topk${TOPK_FIXED}_${RUN_TAG}.csv"
 
 echo "[INFO] Run 2/2: per-dataset tuned top-k (scaled with dataset size)"
+tune_args=(
+  --pdlc_topk_tune
+  --pdlc_topk_tune_n_estimators "$TOPK_TUNE_N_ESTIMATORS"
+  --pdlc_topk_tune_metric "$TOPK_TUNE_METRIC"
+  --pdlc_topk_tune_val_frac "$TOPK_TUNE_VAL_FRAC"
+  --pdlc_topk_tune_abs "$TOPK_TUNE_ABS"
+  --pdlc_topk_tune_fracs "$TOPK_TUNE_FRACS"
+  --pdlc_topk_tune_cache "$OUT_DIR/cc18_pdl_topk_tuned_cache_${RUN_TAG}.json"
+)
+if [[ "$TOPK_TUNE_PER_FOLD" == "1" ]]; then
+  tune_args+=( --pdlc_topk_tune_per_fold )
+fi
 srun -u python -u scripts/benchmarks/openml_cc18_benchmark.py \
   "${common_args[@]}" \
-  --pdlc_topk_tune \
-  --pdlc_topk_tune_metric "$TOPK_TUNE_METRIC" \
-  --pdlc_topk_tune_val_frac "$TOPK_TUNE_VAL_FRAC" \
-  --pdlc_topk_tune_abs "$TOPK_TUNE_ABS" \
-  --pdlc_topk_tune_fracs "$TOPK_TUNE_FRACS" \
-  --pdlc_topk_tune_cache "$OUT_DIR/cc18_pdl_topk_tuned_cache_${RUN_TAG}.json" \
+  "${tune_args[@]}" \
   --output "$OUT_DIR/cc18_pdl_topk_tuned_${RUN_TAG}.csv"
 
 echo "[INFO] Done."
-

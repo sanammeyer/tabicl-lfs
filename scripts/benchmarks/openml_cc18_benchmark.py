@@ -110,6 +110,23 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument(
+        "--pdlc_topk_tune_per_fold",
+        action="store_true",
+        help=(
+            "Rigorous (nested) tuning: tune PDLC top-k separately inside each CV fold using only that fold's "
+            "train split (inner support/val split), then evaluate on the fold's test split."
+        ),
+    )
+    p.add_argument(
+        "--pdlc_topk_tune_n_estimators",
+        type=int,
+        default=None,
+        help=(
+            "Ensemble size used during top-k tuning. If omitted, uses n_estimators for --pdlc_topk_tune_per_fold "
+            "and uses 1 for dataset-level tuning."
+        ),
+    )
+    p.add_argument(
         "--pdlc_topk_tune_metric",
         type=str,
         default="f1_macro",
@@ -280,8 +297,14 @@ def _tune_pdlc_topk_for_task_fold0(
     abs_candidates: List[int],
     frac_candidates: List[float],
     seed: int,
+    n_estimators_tune: int,
 ) -> Dict[str, Any]:
-    """Tune PDLC top-k on fold-0 train split; returns best_frac to scale k with dataset size."""
+    """Tune PDLC top-k on a fold train split (inner support/val split).
+
+    Returns `best_frac` intended to be applied as:
+      k_fold = round(best_frac * N_train_fold)
+    so that the tuned setting naturally scales with the fold train size.
+    """
     from tabicl import TabICLClassifier
     from sklearn.model_selection import train_test_split
 
@@ -306,30 +329,37 @@ def _tune_pdlc_topk_for_task_fold0(
             shuffle=True,
         )
 
+    N_train0 = int(len(X_train0))
     N_support = int(len(Xa))
-    candidates: List[Optional[int]] = []
+
+    # Candidates are defined relative to the *fold train size* (N_train0), then
+    # clipped to the actual support size (N_support) during inner-tuning.
+    #
+    # This avoids an implicit (1 - val_frac) scaling that would otherwise change
+    # the meaning of "k as a fraction of available supports".
+    candidates_total: List[Optional[int]] = []
     # Fractions: 0 -> None (no gating)
     for frac in frac_candidates:
         if float(frac) <= 0:
-            candidates.append(None)
+            candidates_total.append(None)
             continue
-        k = int(round(float(frac) * float(N_support)))
-        k = max(1, min(N_support, k))
-        candidates.append(k)
-    # Absolutes
+        k_total = int(round(float(frac) * float(N_train0)))
+        k_total = max(1, min(N_train0, k_total))
+        candidates_total.append(k_total)
+    # Absolutes (also in terms of fold train size)
     for k in abs_candidates:
         if int(k) <= 0:
-            candidates.append(None)
+            candidates_total.append(None)
         else:
-            candidates.append(min(N_support, int(k)))
-    candidates = _dedup_preserve_order(candidates)
+            candidates_total.append(min(N_train0, int(k)))
+    candidates_total = _dedup_preserve_order(candidates_total)
 
     clf = TabICLClassifier(
         device=device,
         model_path=checkpoint,
         allow_auto_download=False,
         use_hierarchical=True,
-        n_estimators=1,
+        n_estimators=int(n_estimators_tune),
         batch_size=int(batch_size),
         elliptical_scale_boost=float(elliptical_scale_boost),
         random_state=int(seed),
@@ -351,39 +381,54 @@ def _tune_pdlc_topk_for_task_fold0(
     rows: List[Dict[str, Any]] = []
     best_score = float("-inf")
     best_acc = float("-inf")
-    best_k: Optional[int] = None
+    best_k_total: Optional[int] = None
 
     old_topk = getattr(pdlc_head.cfg, "topk", None)
     try:
-        for k in candidates:
-            pdlc_head.cfg.topk = k
+        for k_total in candidates_total:
+            k_support = None if k_total is None else min(int(k_total), int(N_support))
+            pdlc_head.cfg.topk = k_support
             y_pred = clf.predict(Xv)
             y_prob = clf.predict_proba(Xv)
             m = compute_metrics(yv, y_pred, y_prob, classes=clf.classes_)
             score = float(m.get(metric_key, float("nan")))
             acc = float(m.get("accuracy", float("nan")))
-            rows.append({"topk": k, "support_n": N_support, "val_n": int(len(Xv)), **m})
+            rows.append(
+                {
+                    "topk_train": k_total,
+                    "topk_support_applied": k_support,
+                    "train_n": N_train0,
+                    "support_n": N_support,
+                    "val_n": int(len(Xv)),
+                    **m,
+                }
+            )
 
-            k_rank = int(k) if k is not None else -1
-            best_rank = int(best_k) if best_k is not None else -1
+            k_rank = int(k_total) if k_total is not None else -1
+            best_rank = int(best_k_total) if best_k_total is not None else -1
             if (score > best_score) or (score == best_score and acc > best_acc) or (
                 score == best_score and acc == best_acc and k_rank < best_rank
             ):
                 best_score = float(score)
                 best_acc = float(acc)
-                best_k = k
+                best_k_total = k_total
     finally:
         pdlc_head.cfg.topk = old_topk
 
-    best_frac = None if best_k is None else float(best_k) / float(N_support)
+    best_frac = None if best_k_total is None else float(best_k_total) / float(N_train0)
     return {
         "best_frac": best_frac,
-        "best_k_support": best_k,
+        "best_k_train": best_k_total,
+        "train_n": N_train0,
         "support_n": N_support,
         "val_n": int(len(Xv)),
         "metric": metric_key,
         "rows": rows,
-        "note": "best_frac is applied as k=round(best_frac*N_train_fold) (clipped to [1,N_train_fold])",
+        "note": (
+            "best_frac is defined over the fold train size (N_train0) and applied as "
+            "k=round(best_frac*N_train_fold) (clipped to [1,N_train_fold]). During tuning we apply "
+            "min(k, N_support) because the inner support set is smaller due to the held-out val split."
+        ),
     }
 
 
@@ -403,6 +448,8 @@ def evaluate_task_tabicl(
     pdlc_topk_tune_abs: str,
     pdlc_topk_tune_fracs: str,
     pdlc_topk_tune_cache: Optional[str],
+    pdlc_topk_tune_per_fold: bool,
+    pdlc_topk_tune_n_estimators: Optional[int],
     n_rows: int,
     max_features: int,
     max_classes: int,
@@ -476,17 +523,19 @@ def evaluate_task_tabicl(
     fold_rows: List[Dict[str, Any]] = []
     valid_folds = 0
 
-    tuned_best_frac: Optional[float] = None
-    if bool(pdlc_topk_tune):
+    tuned_best_frac_dataset: Optional[float] = None
+    # Dataset-level tuning (fast, but not fully rigorous): tune on fold-0 train, reuse for all folds.
+    if bool(pdlc_topk_tune) and not bool(pdlc_topk_tune_per_fold):
         cache_path = None if pdlc_topk_tune_cache is None else Path(str(pdlc_topk_tune_cache))
         cache: Dict[str, Any] = {} if cache_path is None else _load_json(cache_path)
         cache_key = str(int(dataset.dataset_id))
         if cache_key in cache:
-            tuned_best_frac = cache[cache_key].get("best_frac")
-            print(f"[TOPK-TUNE] Dataset {dataset.dataset_id} cached best_frac={tuned_best_frac}")
+            tuned_best_frac_dataset = cache[cache_key].get("best_frac")
+            print(f"[TOPK-TUNE] Dataset {dataset.dataset_id} cached best_frac={tuned_best_frac_dataset}")
         else:
             try:
                 train_idx0, _ = task.get_train_test_split_indices(repeat=0, fold=0, sample=0)
+                n_est_tune = int(pdlc_topk_tune_n_estimators) if pdlc_topk_tune_n_estimators is not None else 1
                 tuned = _tune_pdlc_topk_for_task_fold0(
                     X_train0=X.iloc[train_idx0],
                     y_train0=y.iloc[train_idx0],
@@ -501,10 +550,11 @@ def evaluate_task_tabicl(
                     abs_candidates=_parse_int_list(pdlc_topk_tune_abs),
                     frac_candidates=_parse_float_list(pdlc_topk_tune_fracs),
                     seed=int(seed),
+                    n_estimators_tune=n_est_tune,
                 )
-                tuned_best_frac = tuned.get("best_frac")
+                tuned_best_frac_dataset = tuned.get("best_frac")
                 print(
-                    f"[TOPK-TUNE] Dataset {dataset.dataset_id} best_frac={tuned_best_frac} "
+                    f"[TOPK-TUNE] Dataset {dataset.dataset_id} best_frac={tuned_best_frac_dataset} "
                     f"(best_k_support={tuned.get('best_k_support')}, support_n={tuned.get('support_n')})"
                 )
                 if cache_path is not None:
@@ -532,9 +582,53 @@ def evaluate_task_tabicl(
 
         # Determine effective top-k for this fold.
         pdlc_topk_eff: Optional[int] = pdlc_topk
-        if bool(pdlc_topk_tune) and tuned_best_frac is not None:
+        tuned_best_frac_fold: Optional[float] = None
+
+        if bool(pdlc_topk_tune):
+            if bool(pdlc_topk_tune_per_fold):
+                # Rigorous (nested) per-fold tuning: tune on this fold's train split only.
+                cache_path = None if pdlc_topk_tune_cache is None else Path(str(pdlc_topk_tune_cache))
+                cache: Dict[str, Any] = {} if cache_path is None else _load_json(cache_path)
+                cache_key = f"{int(dataset.dataset_id)}:{int(fold)}"
+                if cache_key in cache:
+                    tuned_best_frac_fold = cache[cache_key].get("best_frac")
+                    print(f"[TOPK-TUNE] Dataset {dataset.dataset_id} fold {fold}: cached best_frac={tuned_best_frac_fold}")
+                else:
+                    try:
+                        n_est_tune = int(pdlc_topk_tune_n_estimators) if pdlc_topk_tune_n_estimators is not None else int(n_estimators)
+                        tuned = _tune_pdlc_topk_for_task_fold0(
+                            X_train0=X_train,
+                            y_train0=y_train,
+                            device=device,
+                            checkpoint=checkpoint,
+                            batch_size=int(batch_size),
+                            elliptical_scale_boost=float(elliptical_scale_boost),
+                            pdlc_agg=pdlc_agg,
+                            pdlc_inference_temperature=pdlc_inference_temperature,
+                            metric=str(pdlc_topk_tune_metric),
+                            val_frac=float(pdlc_topk_tune_val_frac),
+                            abs_candidates=_parse_int_list(pdlc_topk_tune_abs),
+                            frac_candidates=_parse_float_list(pdlc_topk_tune_fracs),
+                            seed=int(seed) + int(fold),
+                            n_estimators_tune=n_est_tune,
+                        )
+                        tuned_best_frac_fold = tuned.get("best_frac")
+                        print(
+                            f"[TOPK-TUNE] Dataset {dataset.dataset_id} fold {fold}: best_frac={tuned_best_frac_fold} "
+                            f"(best_k_support={tuned.get('best_k_support')}, support_n={tuned.get('support_n')})"
+                        )
+                        if cache_path is not None:
+                            cache[cache_key] = tuned
+                            _save_json(cache_path, cache)
+                    except Exception as e:
+                        print(f"[WARN] Top-k tuning failed for dataset {dataset.dataset_id} fold {fold}: {e}")
+                        tuned_best_frac_fold = None
+            else:
+                tuned_best_frac_fold = tuned_best_frac_dataset
+
+        if tuned_best_frac_fold is not None:
             N_fold = int(len(train_idx))
-            k = int(round(float(tuned_best_frac) * float(N_fold)))
+            k = int(round(float(tuned_best_frac_fold) * float(N_fold)))
             k = max(1, min(N_fold, k))
             pdlc_topk_eff = int(k)
 
@@ -576,7 +670,7 @@ def evaluate_task_tabicl(
                         "error": f"OOM: {e}",
                         "seed": int(seed),
                         "pdlc_topk_effective": (None if pdlc_topk_eff is None else int(pdlc_topk_eff)),
-                        "pdlc_topk_tuned_best_frac": tuned_best_frac,
+                        "pdlc_topk_tuned_best_frac": tuned_best_frac_fold,
                     }
                 )
                 continue
@@ -601,7 +695,7 @@ def evaluate_task_tabicl(
             **metrics,
             "seed": int(seed),
             "pdlc_topk_effective": (None if pdlc_topk_eff is None else int(pdlc_topk_eff)),
-            "pdlc_topk_tuned_best_frac": tuned_best_frac,
+            "pdlc_topk_tuned_best_frac": tuned_best_frac_fold,
         }
         fold_rows.append(row)
         valid_folds += 1
@@ -852,6 +946,8 @@ def main():
                     pdlc_topk_tune_abs=str(args.pdlc_topk_tune_abs),
                     pdlc_topk_tune_fracs=str(args.pdlc_topk_tune_fracs),
                     pdlc_topk_tune_cache=args.pdlc_topk_tune_cache,
+                    pdlc_topk_tune_per_fold=bool(args.pdlc_topk_tune_per_fold),
+                    pdlc_topk_tune_n_estimators=args.pdlc_topk_tune_n_estimators,
                     n_rows=args.n_rows,
                     max_features=args.max_features,
                     max_classes=args.max_classes,
