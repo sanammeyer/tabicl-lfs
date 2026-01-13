@@ -415,10 +415,12 @@ def _tune_pdlc_topk_for_task_fold0(
     finally:
         pdlc_head.cfg.topk = old_topk
 
+    best_k_support = None if best_k_total is None else min(int(best_k_total), int(N_support))
     best_frac = None if best_k_total is None else float(best_k_total) / float(N_train0)
     return {
         "best_frac": best_frac,
         "best_k_train": best_k_total,
+        "best_k_support": best_k_support,
         "train_n": N_train0,
         "support_n": N_support,
         "val_n": int(len(Xv)),
@@ -555,7 +557,8 @@ def evaluate_task_tabicl(
                 tuned_best_frac_dataset = tuned.get("best_frac")
                 print(
                     f"[TOPK-TUNE] Dataset {dataset.dataset_id} best_frac={tuned_best_frac_dataset} "
-                    f"(best_k_support={tuned.get('best_k_support')}, support_n={tuned.get('support_n')})"
+                    f"(best_k_train={tuned.get('best_k_train')}, best_k_support={tuned.get('best_k_support')}, "
+                    f"train_n={tuned.get('train_n')}, support_n={tuned.get('support_n')})"
                 )
                 if cache_path is not None:
                     cache[cache_key] = tuned
@@ -615,7 +618,8 @@ def evaluate_task_tabicl(
                         tuned_best_frac_fold = tuned.get("best_frac")
                         print(
                             f"[TOPK-TUNE] Dataset {dataset.dataset_id} fold {fold}: best_frac={tuned_best_frac_fold} "
-                            f"(best_k_support={tuned.get('best_k_support')}, support_n={tuned.get('support_n')})"
+                            f"(best_k_train={tuned.get('best_k_train')}, best_k_support={tuned.get('best_k_support')}, "
+                            f"train_n={tuned.get('train_n')}, support_n={tuned.get('support_n')})"
                         )
                         if cache_path is not None:
                             cache[cache_key] = tuned
