@@ -23,7 +23,7 @@
 #SBATCH --gpus=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=128G
+#SBATCH --mem=32G
 #SBATCH --time=120:00:00
 
 set -euo pipefail
@@ -108,13 +108,13 @@ if [[ -n "$LIMIT" ]]; then
   common_args+=( --limit "$LIMIT" )
 fi
 
-echo "[INFO] Run 1/2: fixed top-k=$TOPK_FIXED"
-srun -u python -u scripts/benchmarks/openml_cc18_benchmark.py \
-  "${common_args[@]}" \
-  --pdlc_topk "$TOPK_FIXED" \
-  --output "$OUT_DIR/cc18_pdl_topk${TOPK_FIXED}_${RUN_TAG}.csv"
+#echo "[INFO] Run 1/2: fixed top-k=$TOPK_FIXED"
+#srun -u python -u scripts/benchmarks/openml_cc18_benchmark.py \
+  #"${common_args[@]}" \
+  #--pdlc_topk "$TOPK_FIXED" \
+  #--output "$OUT_DIR/cc18_pdl_topk${TOPK_FIXED}_${RUN_TAG}.csv"
 
-echo "[INFO] Run 2/2: per-dataset tuned top-k (scaled with dataset size)"
+echo "[INFO] Run 1/2: per-dataset tuned top-k (scaled with dataset size)"
 tune_args=(
   --pdlc_topk_tune
   --pdlc_topk_tune_n_estimators "$TOPK_TUNE_N_ESTIMATORS"
