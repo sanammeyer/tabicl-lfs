@@ -1,0 +1,2 @@
+task_id,dataset_id,dataset_name,fold,task_type,n_rows,n_features,n_classes,imbalance_ratio,accuracy,f1_macro,f1_micro,precision_macro,recall_macro,roc_auc,log_loss,fit_seconds,predict_seconds,n_train,n_test,seed,pdlc_topk_effective,pdlc_topk_tuned_best_frac,n_valid_folds
+3,3,kr-vs-kp,0,Binary,3196,36,2,1.0929927963326784,0.9,0.8999648313860342,0.9,0.9001523497011602,0.9009040742045321,0.9739736213846817,0.2536969324805457,0.5701533829997061,7.078548294994107,2876,320,42,32,,1

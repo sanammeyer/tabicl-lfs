@@ -1,0 +1,98 @@
+{
+  "3:0": {
+    "best_frac": 0.001043115438108484,
+    "best_k_support": 3,
+    "best_k_train": 3,
+    "metric": "f1_macro",
+    "note": "best_frac is defined over the fold train size (N_train0) and applied as k=round(best_frac*N_train_fold) (clipped to [1,N_train_fold]). During tuning we apply min(k, N_support) because the inner support set is smaller due to the held-out val split.",
+    "rows": [
+      {
+        "accuracy": 0.9027777777777778,
+        "f1_macro": 0.9027203088244165,
+        "f1_micro": 0.9027777777777778,
+        "log_loss": 0.2720625577809018,
+        "precision_macro": 0.9084838533114394,
+        "recall_macro": 0.9057203261854425,
+        "roc_auc": 0.9680096647538508,
+        "support_n": 2300,
+        "topk_support_applied": null,
+        "topk_train": null,
+        "train_n": 2876,
+        "val_n": 576
+      },
+      {
+        "accuracy": 0.90625,
+        "f1_macro": 0.9061945835092586,
+        "f1_micro": 0.90625,
+        "log_loss": 0.2744714116570408,
+        "precision_macro": 0.9119868637110016,
+        "recall_macro": 0.9091996375717306,
+        "roc_auc": 0.9682029598308668,
+        "support_n": 2300,
+        "topk_support_applied": 3,
+        "topk_train": 3,
+        "train_n": 2876,
+        "val_n": 576
+      },
+      {
+        "accuracy": 0.90625,
+        "f1_macro": 0.9061945835092586,
+        "f1_micro": 0.90625,
+        "log_loss": 0.2765231821987005,
+        "precision_macro": 0.9119868637110016,
+        "recall_macro": 0.9091996375717306,
+        "roc_auc": 0.9683600120809424,
+        "support_n": 2300,
+        "topk_support_applied": 29,
+        "topk_train": 29,
+        "train_n": 2876,
+        "val_n": 576
+      },
+      {
+        "accuracy": 0.90625,
+        "f1_macro": 0.9061945835092586,
+        "f1_micro": 0.90625,
+        "log_loss": 0.2752521021866052,
+        "precision_macro": 0.9119868637110016,
+        "recall_macro": 0.9091996375717306,
+        "roc_auc": 0.9682754454847479,
+        "support_n": 2300,
+        "topk_support_applied": 8,
+        "topk_train": 8,
+        "train_n": 2876,
+        "val_n": 576
+      },
+      {
+        "accuracy": 0.90625,
+        "f1_macro": 0.9061945835092586,
+        "f1_micro": 0.90625,
+        "log_loss": 0.27590216692134384,
+        "precision_macro": 0.9119868637110016,
+        "recall_macro": 0.9091996375717306,
+        "roc_auc": 0.9683600120809422,
+        "support_n": 2300,
+        "topk_support_applied": 16,
+        "topk_train": 16,
+        "train_n": 2876,
+        "val_n": 576
+      },
+      {
+        "accuracy": 0.90625,
+        "f1_macro": 0.9061945835092586,
+        "f1_micro": 0.90625,
+        "log_loss": 0.2766367101006533,
+        "precision_macro": 0.9119868637110016,
+        "recall_macro": 0.9091996375717306,
+        "roc_auc": 0.9683720930232559,
+        "support_n": 2300,
+        "topk_support_applied": 32,
+        "topk_train": 32,
+        "train_n": 2876,
+        "val_n": 576
+      }
+    ],
+    "support_n": 2300,
+    "train_n": 2876,
+    "val_n": 576
+  }
+}

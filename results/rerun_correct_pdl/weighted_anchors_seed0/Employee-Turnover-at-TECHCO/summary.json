@@ -1,0 +1,24 @@
+{
+  "dataset_id": 43551,
+  "dataset_name": "Employee-Turnover-at-TECHCO",
+  "errors": [
+    {
+      "error": "HIP out of memory. Tried to allocate 4.42 GiB. GPU 0 has a total capacity of 15.98 GiB of which 2.10 GiB is free. Of the allocated memory 12.94 GiB is allocated by PyTorch, and 527.34 MiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_HIP_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)",
+      "model": "pdl",
+      "stage": "fit/predict_proba"
+    }
+  ],
+  "head_swap": null,
+  "models": {},
+  "n_features": 9,
+  "n_rows": 34452,
+  "pdl_gamma": null,
+  "pdlc_topk_tune": null,
+  "split": {
+    "kind": "random_stratified",
+    "seed": 0,
+    "test_size": 0.5
+  },
+  "variant": null,
+  "variant_runs": []
+}

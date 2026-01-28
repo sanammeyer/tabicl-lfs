@@ -1,0 +1,169 @@
+{
+  "dataset_id": 1497,
+  "dataset_name": "wall-robot-navigation",
+  "head_swap": null,
+  "models": {
+    "pdl": {
+      "acc": 0.8786656891495601,
+      "confusion": [
+        [
+          1068,
+          32,
+          0,
+          3
+        ],
+        [
+          27,
+          1021,
+          0,
+          0
+        ],
+        [
+          84,
+          80,
+          0,
+          0
+        ],
+        [
+          95,
+          10,
+          0,
+          308
+        ]
+      ],
+      "margin_mean": 0.48244520471242863,
+      "margin_median": 0.6235888451337814,
+      "margin_p10": 0.06790571510791779,
+      "margin_p90": 0.6496335789561272,
+      "n_classes": 4,
+      "n_predicted_classes": 3,
+      "n_test": 2728,
+      "per_class_recall": [
+        0.9682683590208522,
+        0.9742366412213741,
+        0.0,
+        0.7457627118644068
+      ],
+      "pred_counts": [
+        1274,
+        1143,
+        0,
+        311
+      ],
+      "pred_entropy": 0.9676278398440284,
+      "pred_top1_frac": 0.4670087976539589,
+      "pred_top2_frac": 0.4189882697947214
+    },
+    "sa": {
+      "acc": 0.9618768328445748,
+      "confusion": [
+        [
+          1052,
+          31,
+          4,
+          16
+        ],
+        [
+          27,
+          1019,
+          2,
+          0
+        ],
+        [
+          5,
+          4,
+          155,
+          0
+        ],
+        [
+          13,
+          2,
+          0,
+          398
+        ]
+      ],
+      "margin_mean": 0.9378478070675738,
+      "margin_median": 0.9988930277177133,
+      "margin_p10": 0.8133096061646938,
+      "margin_p90": 0.9999729860534898,
+      "n_classes": 4,
+      "n_predicted_classes": 4,
+      "n_test": 2728,
+      "per_class_recall": [
+        0.9537624660018132,
+        0.9723282442748091,
+        0.9451219512195121,
+        0.9636803874092009
+      ],
+      "pred_counts": [
+        1097,
+        1056,
+        161,
+        414
+      ],
+      "pred_entropy": 1.1868699804321134,
+      "pred_top1_frac": 0.40212609970674484,
+      "pred_top2_frac": 0.3870967741935484
+    }
+  },
+  "n_features": 24,
+  "n_rows": 5456,
+  "pdl_gamma": {
+    "ap": 0.8035733307174134,
+    "auc": 0.9174515597459518,
+    "gamma_diff_mean": 0.322939556360424,
+    "gamma_diff_p10": 0.03712297379970551,
+    "gamma_diff_p90": 0.78231407403946,
+    "gamma_same_mean": 0.8186526174933025,
+    "gamma_same_p10": 0.5910567879676819,
+    "gamma_same_p90": 0.9611030101776123,
+    "n_pairs_used": 250000,
+    "n_support": 2728
+  },
+  "split": {
+    "kind": "random_stratified",
+    "seed": 42,
+    "test_size": 0.5
+  },
+  "variant": {
+    "X_shape": [
+      5456,
+      24
+    ],
+    "class_shift_offset": 3,
+    "feature_permutation": [
+      6,
+      7,
+      4,
+      2,
+      13,
+      8,
+      18,
+      19,
+      22,
+      9,
+      20,
+      3,
+      15,
+      23,
+      10,
+      17,
+      1,
+      21,
+      11,
+      0,
+      14,
+      16,
+      5,
+      12
+    ],
+    "norm_method": "none",
+    "test_size": 2728,
+    "train_size": 2728,
+    "variant_index": 0,
+    "y_train_shifted_shape": [
+      2728
+    ]
+  },
+  "variant_runs": []
+}

@@ -1,0 +1,84 @@
+{
+  "3": {
+    "best_frac": null,
+    "best_k_support": null,
+    "metric": "f1_macro",
+    "note": "best_frac is applied as k=round(best_frac*N_train_fold) (clipped to [1,N_train_fold])",
+    "rows": [
+      {
+        "accuracy": 0.9704861111111112,
+        "f1_macro": 0.970466082141209,
+        "f1_micro": 0.9704861111111112,
+        "log_loss": 0.10699989318453175,
+        "precision_macro": 0.9703520617313721,
+        "recall_macro": 0.9712896405919662,
+        "roc_auc": 0.9922561159770462,
+        "support_n": 2300,
+        "topk": null,
+        "val_n": 576
+      },
+      {
+        "accuracy": 0.9618055555555556,
+        "f1_macro": 0.9617760617760618,
+        "f1_micro": 0.9618055555555556,
+        "log_loss": 0.11044152796968419,
+        "precision_macro": 0.961620546210888,
+        "recall_macro": 0.9625128360012081,
+        "roc_auc": 0.9918936877076412,
+        "support_n": 2300,
+        "topk": 23,
+        "val_n": 576
+      },
+      {
+        "accuracy": 0.9618055555555556,
+        "f1_macro": 0.9617760617760618,
+        "f1_micro": 0.9618055555555556,
+        "log_loss": 0.11113918998931285,
+        "precision_macro": 0.961620546210888,
+        "recall_macro": 0.9625128360012081,
+        "roc_auc": 0.9918816067653278,
+        "support_n": 2300,
+        "topk": 46,
+        "val_n": 576
+      },
+      {
+        "accuracy": 0.9618055555555556,
+        "f1_macro": 0.9617760617760618,
+        "f1_micro": 0.9618055555555556,
+        "log_loss": 0.10932950908139438,
+        "precision_macro": 0.961620546210888,
+        "recall_macro": 0.9625128360012081,
+        "roc_auc": 0.9918936877076412,
+        "support_n": 2300,
+        "topk": 8,
+        "val_n": 576
+      },
+      {
+        "accuracy": 0.9618055555555556,
+        "f1_macro": 0.9617760617760618,
+        "f1_micro": 0.9618055555555556,
+        "log_loss": 0.11006197954235136,
+        "precision_macro": 0.961620546210888,
+        "recall_macro": 0.9625128360012081,
+        "roc_auc": 0.9918695258230141,
+        "support_n": 2300,
+        "topk": 16,
+        "val_n": 576
+      },
+      {
+        "accuracy": 0.9618055555555556,
+        "f1_macro": 0.9617760617760618,
+        "f1_micro": 0.9618055555555556,
+        "log_loss": 0.1107726946451185,
+        "precision_macro": 0.961620546210888,
+        "recall_macro": 0.9625128360012081,
+        "roc_auc": 0.9918695258230141,
+        "support_n": 2300,
+        "topk": 32,
+        "val_n": 576
+      }
+    ],
+    "support_n": 2300,
+    "val_n": 576
+  }
+}
