@@ -1,0 +1,11 @@
+dataset_key,dataset_name,input_spec,resolved_dataset_id,resolved_task_id,dataset_version,n_rows,n_features,n_classes
+openml_1590_v2__adult,adult,7592,1590,7592.0,2,48842,14,2
+openml_1461_v1__bank_marketing,bank-marketing,14965,1461,14965.0,1,45211,16,2
+openml_1485_v1__madelon,madelon,9976,1485,9976.0,1,2600,500,2
+openml_4534_v1__PhishingWebsites,PhishingWebsites,14952,4534,14952.0,1,11055,30,2
+openml_4538_v1__GesturePhaseSegmentationProcessed,GesturePhaseSegmentationProcessed,14969,4538,14969.0,1,9873,32,5
+openml_32_v1__pendigits,pendigits,32,32,,1,10992,16,10
+openml_40975_v3__car,car,146821,40975,146821.0,3,1728,6,4
+openml_1487_v1__ozone_level_8hr,ozone-level-8hr,9978,1487,9978.0,1,2534,72,2
+openml_43_v1__haberman,haberman,43,43,,1,306,3,2
+openml_1497_v1__wall_robot_navigation,wall-robot-navigation,9960,1497,9960.0,1,5456,24,4

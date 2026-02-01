@@ -1,0 +1,402 @@
+[
+  {
+    "dataset_key": "openml_1590_v2__adult",
+    "n_test": 9769,
+    "n_train": 39073,
+    "seed": 42,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_1590_v2__adult",
+    "n_test": 9769,
+    "n_train": 39073,
+    "seed": 43,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_1590_v2__adult",
+    "n_test": 9769,
+    "n_train": 39073,
+    "seed": 44,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_1590_v2__adult",
+    "n_test": 9769,
+    "n_train": 39073,
+    "seed": 45,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_1590_v2__adult",
+    "n_test": 9769,
+    "n_train": 39073,
+    "seed": 46,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_1461_v1__bank_marketing",
+    "n_test": 9043,
+    "n_train": 36168,
+    "seed": 42,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_1461_v1__bank_marketing",
+    "n_test": 9043,
+    "n_train": 36168,
+    "seed": 43,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_1461_v1__bank_marketing",
+    "n_test": 9043,
+    "n_train": 36168,
+    "seed": 44,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_1461_v1__bank_marketing",
+    "n_test": 9043,
+    "n_train": 36168,
+    "seed": 45,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_1461_v1__bank_marketing",
+    "n_test": 9043,
+    "n_train": 36168,
+    "seed": 46,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_1485_v1__madelon",
+    "n_test": 520,
+    "n_train": 2080,
+    "seed": 42,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_1485_v1__madelon",
+    "n_test": 520,
+    "n_train": 2080,
+    "seed": 43,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_1485_v1__madelon",
+    "n_test": 520,
+    "n_train": 2080,
+    "seed": 44,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_1485_v1__madelon",
+    "n_test": 520,
+    "n_train": 2080,
+    "seed": 45,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_1485_v1__madelon",
+    "n_test": 520,
+    "n_train": 2080,
+    "seed": 46,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_4534_v1__PhishingWebsites",
+    "n_test": 2211,
+    "n_train": 8844,
+    "seed": 42,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_4534_v1__PhishingWebsites",
+    "n_test": 2211,
+    "n_train": 8844,
+    "seed": 43,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_4534_v1__PhishingWebsites",
+    "n_test": 2211,
+    "n_train": 8844,
+    "seed": 44,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_4534_v1__PhishingWebsites",
+    "n_test": 2211,
+    "n_train": 8844,
+    "seed": 45,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_4534_v1__PhishingWebsites",
+    "n_test": 2211,
+    "n_train": 8844,
+    "seed": 46,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_4538_v1__GesturePhaseSegmentationProcessed",
+    "n_test": 1975,
+    "n_train": 7898,
+    "seed": 42,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_4538_v1__GesturePhaseSegmentationProcessed",
+    "n_test": 1975,
+    "n_train": 7898,
+    "seed": 43,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_4538_v1__GesturePhaseSegmentationProcessed",
+    "n_test": 1975,
+    "n_train": 7898,
+    "seed": 44,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_4538_v1__GesturePhaseSegmentationProcessed",
+    "n_test": 1975,
+    "n_train": 7898,
+    "seed": 45,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_4538_v1__GesturePhaseSegmentationProcessed",
+    "n_test": 1975,
+    "n_train": 7898,
+    "seed": 46,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_32_v1__pendigits",
+    "n_test": 2199,
+    "n_train": 8793,
+    "seed": 42,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_32_v1__pendigits",
+    "n_test": 2199,
+    "n_train": 8793,
+    "seed": 43,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_32_v1__pendigits",
+    "n_test": 2199,
+    "n_train": 8793,
+    "seed": 44,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_32_v1__pendigits",
+    "n_test": 2199,
+    "n_train": 8793,
+    "seed": 45,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_32_v1__pendigits",
+    "n_test": 2199,
+    "n_train": 8793,
+    "seed": 46,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_40975_v3__car",
+    "n_test": 346,
+    "n_train": 1382,
+    "seed": 42,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_40975_v3__car",
+    "n_test": 346,
+    "n_train": 1382,
+    "seed": 43,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_40975_v3__car",
+    "n_test": 346,
+    "n_train": 1382,
+    "seed": 44,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_40975_v3__car",
+    "n_test": 346,
+    "n_train": 1382,
+    "seed": 45,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_40975_v3__car",
+    "n_test": 346,
+    "n_train": 1382,
+    "seed": 46,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_1487_v1__ozone_level_8hr",
+    "n_test": 507,
+    "n_train": 2027,
+    "seed": 42,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_1487_v1__ozone_level_8hr",
+    "n_test": 507,
+    "n_train": 2027,
+    "seed": 43,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_1487_v1__ozone_level_8hr",
+    "n_test": 507,
+    "n_train": 2027,
+    "seed": 44,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_1487_v1__ozone_level_8hr",
+    "n_test": 507,
+    "n_train": 2027,
+    "seed": 45,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_1487_v1__ozone_level_8hr",
+    "n_test": 507,
+    "n_train": 2027,
+    "seed": 46,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_43_v1__haberman",
+    "n_test": 62,
+    "n_train": 244,
+    "seed": 42,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_43_v1__haberman",
+    "n_test": 62,
+    "n_train": 244,
+    "seed": 43,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_43_v1__haberman",
+    "n_test": 62,
+    "n_train": 244,
+    "seed": 44,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_43_v1__haberman",
+    "n_test": 62,
+    "n_train": 244,
+    "seed": 45,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_43_v1__haberman",
+    "n_test": 62,
+    "n_train": 244,
+    "seed": 46,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_1497_v1__wall_robot_navigation",
+    "n_test": 1092,
+    "n_train": 4364,
+    "seed": 42,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_1497_v1__wall_robot_navigation",
+    "n_test": 1092,
+    "n_train": 4364,
+    "seed": 43,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_1497_v1__wall_robot_navigation",
+    "n_test": 1092,
+    "n_train": 4364,
+    "seed": 44,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_1497_v1__wall_robot_navigation",
+    "n_test": 1092,
+    "n_train": 4364,
+    "seed": 45,
+    "stratified": true,
+    "test_size": 0.2
+  },
+  {
+    "dataset_key": "openml_1497_v1__wall_robot_navigation",
+    "n_test": 1092,
+    "n_train": 4364,
+    "seed": 46,
+    "stratified": true,
+    "test_size": 0.2
+  }
+]

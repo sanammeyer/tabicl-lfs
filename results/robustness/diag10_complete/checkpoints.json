@@ -1,0 +1,17 @@
+[
+  {
+    "name": "SA",
+    "path": "/dss/dsshome1/0E/ra63pux2/Documents/thesis/code/tabicl-lfs/checkpoints/mini_tabicl_stage2_sa/step-1000.ckpt",
+    "sha256": "251f8c768531710493e0ba289c70adbc191c3734ef67ab8e4136a7fb90bc54bf"
+  },
+  {
+    "name": "EA-ICL",
+    "path": "/dss/dsshome1/0E/ra63pux2/Documents/thesis/code/tabicl-lfs/checkpoints/mini_tabicl_stage2_ea_icl_only/step-1000.ckpt",
+    "sha256": "de5d8a3deb6c6faaae22069487ca4a9d38e6e7663e22b80fe8123010b6370a2e"
+  },
+  {
+    "name": "EA-FULL",
+    "path": "/dss/dsshome1/0E/ra63pux2/Documents/thesis/code/tabicl-lfs/checkpoints/mini_tabicl_stage2_ea_row_icl/step-1000.ckpt",
+    "sha256": "0e3a62a7734d264ffad27949abe9c6b2821df9b83b6cb90650d081aba562b9d3"
+  }
+]

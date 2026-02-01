@@ -1,0 +1,58 @@
+{
+  "cases": [
+    {
+      "applies_to": "none",
+      "artifact_kind": null,
+      "case_id": "clean_none_0_0_none",
+      "condition": "clean",
+      "param_type": "none",
+      "param_value": 0.0
+    },
+    {
+      "applies_to": "both",
+      "artifact_kind": "uninformative_features_shuffled",
+      "case_id": "uninformative_features_shuffled_n_add_10_0_both",
+      "condition": "uninformative_features_shuffled",
+      "param_type": "n_add",
+      "param_value": 10.0
+    },
+    {
+      "applies_to": "both",
+      "artifact_kind": "uninformative_features_shuffled",
+      "case_id": "uninformative_features_shuffled_n_add_50_0_both",
+      "condition": "uninformative_features_shuffled",
+      "param_type": "n_add",
+      "param_value": 50.0
+    },
+    {
+      "applies_to": "both",
+      "artifact_kind": "cell_outliers_tabpfn",
+      "case_id": "cell_outliers_tabpfn_outlier_factor_10_0_both",
+      "condition": "cell_outliers_tabpfn",
+      "outlier_factor": 10.0,
+      "p_cell": 0.02,
+      "param_type": "outlier_factor",
+      "param_value": 10.0
+    },
+    {
+      "applies_to": "both",
+      "artifact_kind": "cell_outliers_tabpfn",
+      "case_id": "cell_outliers_tabpfn_outlier_factor_50_0_both",
+      "condition": "cell_outliers_tabpfn",
+      "outlier_factor": 50.0,
+      "p_cell": 0.02,
+      "param_type": "outlier_factor",
+      "param_value": 50.0
+    },
+    {
+      "applies_to": "train",
+      "artifact_kind": "icl_noisy_demo_labels",
+      "case_id": "icl_noisy_demo_labels_frac_0_1_train",
+      "condition": "icl_noisy_demo_labels",
+      "param_type": "frac",
+      "param_value": 0.1
+    }
+  ],
+  "dataset_key": "openml_40975_v3__car",
+  "seed": 45
+}
