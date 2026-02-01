@@ -1,29 +1,39 @@
 #!/usr/bin/env python3
 """
-Literature-aligned robustness diagnostics for a single TabICL checkpoint.
+Thesis-rigorous robustness runner for TabICL checkpoints (auditable runs).
 
 Focuses on perturbations that match existing tabular foundation model robustness evaluations
 (e.g., TabPFN) and common ICL-demonstration corruption tests.
 
 This script:
-  1) Uses TabPFN-style *uninformative feature injection*
-     (append shuffled copies of existing features; preserves marginals + missingness).
-  2) Uses TabPFN-style *cell-wise outliers* for numeric columns
-     (with probability p per cell, multiply by U(0, outlier_factor)).
-  3) Keeps label-flip poisoning (demonstration/ICL corruption).
-  4) Optionally keeps context-outlier-row injection (ICL-specific).
+  - Creates an auditable run directory (env/config/checkpoints/datasets/splits/corruptions).
+  - Evaluates multiple checkpoints under identical splits and corruption realizations.
+  - Logs long-format metrics to run_dir/metrics.csv.
 
-It evaluates a single TabICL checkpoint under these corruptions and logs metrics
-to ./results/compare_mini_tabicl_robustness_lit*.csv (optionally with a postfix).
+Core corruptions (literature-aligned):
+  1) TabPFN-style *uninformative feature injection*
+     (append shuffled copies of existing features; preserves marginals + missingness).
+  2) TabPFN-style *cell-wise outliers* for numeric columns
+     (with probability p per numeric cell, multiply by U(0, outlier_factor)).
+  3) ICL-style *noisy demonstration labels*
+     (flip a fraction of training/context labels to a different class).
+
+Optional extension:
+  - Rotation invariance stress test on a numeric subspace (train+test rotated together).
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
+import gc
+import hashlib
+import json
+import platform
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Literal, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -85,6 +95,74 @@ def set_seed(seed: int = 42) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def ensure_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def save_json(path: Path, obj: Any) -> None:
+    ensure_dir(path.parent)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(obj, f, indent=2, sort_keys=True, default=str)
+
+
+def sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        while True:
+            chunk = f.read(chunk_size)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def get_env_info(device: str) -> Dict[str, Any]:
+    import sklearn
+
+    try:
+        import openml  # noqa: F401
+
+        openml_version = getattr(__import__("openml"), "__version__", None)
+    except Exception:
+        openml_version = None
+
+    info: Dict[str, Any] = {
+        "timestamp_utc": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+        "python": sys.version.replace("\n", " "),
+        "platform": platform.platform(),
+        "numpy": np.__version__,
+        "pandas": pd.__version__,
+        "sklearn": sklearn.__version__,
+        "torch": torch.__version__,
+        "openml": openml_version,
+        "device": device,
+        "cuda_available": bool(torch.cuda.is_available()),
+        "torch_cuda_version": getattr(torch.version, "cuda", None),
+        "torch_cudnn_version": getattr(torch.backends.cudnn, "version", lambda: None)(),
+    }
+    if torch.cuda.is_available():
+        try:
+            info["cuda_device_name"] = torch.cuda.get_device_name(0)
+        except Exception:
+            pass
+    return info
+
+
+def maybe_free_torch_memory() -> None:
+    """Best-effort GPU memory cleanup (CUDA/ROCm share torch.cuda API)."""
+    gc.collect()
+    if torch.cuda.is_available():
+        try:
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        # On some setups this can help with fragmentation; ignore if unsupported.
+        try:
+            torch.cuda.ipc_collect()
+        except Exception:
+            pass
 
 
 def _append_rows_csv(
@@ -152,54 +230,75 @@ def _extract_target_if_missing(
     return X_feat, y_series
 
 
-def fetch_openml_dataset(name_or_id: str | int) -> Tuple[pd.DataFrame, pd.Series, str]:
-    """Load an OpenML dataset by ID or (partial) name, inferring target if needed."""
+@dataclass(frozen=True)
+class DatasetInfo:
+    input_spec: str
+    dataset_name: str
+    resolved_dataset_id: int | None
+    resolved_task_id: int | None
+    dataset_version: int | None
+
+
+def fetch_openml_dataset_with_info(name_or_id: str | int) -> Tuple[pd.DataFrame, pd.Series, DatasetInfo]:
+    """Load an OpenML dataset and return richer identifiers for auditing."""
     import openml
 
-    # By integer ID: try dataset id first, then task id
-    if isinstance(name_or_id, int) or (str(name_or_id).isdigit()):
+    spec = str(name_or_id)
+    resolved_task_id: int | None = None
+    ds = None
+
+    if isinstance(name_or_id, int) or spec.isdigit():
         num_id = int(name_or_id)
-        ds = None
-        # Try as dataset id
         try:
             ds = openml.datasets.get_dataset(num_id)
         except Exception:
             ds = None
-        # If that fails, try as task id and resolve to dataset id
         if ds is None:
-            try:
-                task = openml.tasks.get_task(num_id)
-                ds_id = int(getattr(task, "dataset_id"))
-                ds = openml.datasets.get_dataset(ds_id)
-            except Exception as e:
-                raise ValueError(f"Could not load OpenML dataset or task with id={num_id}: {e}")
-        X, y, _, _ = ds.get_data(
-            target=getattr(ds, "default_target_attribute", None),
-            dataset_format="dataframe",
-        )
-        X, y = _extract_target_if_missing(X, y, ds_name=ds.name)
-        return X, y, ds.name
-
-    # By name: prefer exact match; else substring on name
-    name = str(name_or_id).lower()
-    df = openml.datasets.list_datasets(output_format="dataframe")
-    exact = df[df["name"].str.lower() == name]
-    if len(exact) == 0:
-        contains = df[df["name"].str.lower().str.contains(name)]
-        if len(contains) == 0:
-            raise ValueError(f"OpenML dataset not found: {name_or_id}")
-        row = contains.sort_values("NumberOfInstances").iloc[0]
+            task = openml.tasks.get_task(num_id)
+            resolved_task_id = num_id
+            ds_id = int(getattr(task, "dataset_id"))
+            ds = openml.datasets.get_dataset(ds_id)
     else:
-        row = exact.sort_values("NumberOfInstances").iloc[0]
+        name = spec.lower()
+        df = openml.datasets.list_datasets(output_format="dataframe")
+        exact = df[df["name"].str.lower() == name]
+        if len(exact) == 0:
+            contains = df[df["name"].str.lower().str.contains(name)]
+            if len(contains) == 0:
+                raise ValueError(f"OpenML dataset not found: {name_or_id}")
+            row = contains.sort_values("NumberOfInstances").iloc[0]
+        else:
+            row = exact.sort_values("NumberOfInstances").iloc[0]
+        did = int(row["did"]) if "did" in row else int(row.get("dataset_id", row.get("ID")))
+        ds = openml.datasets.get_dataset(did)
 
-    did = int(row["did"]) if "did" in row else int(row.get("dataset_id", row.get("ID")))
-    ds = openml.datasets.get_dataset(did)
     X, y, _, _ = ds.get_data(
         target=getattr(ds, "default_target_attribute", None),
         dataset_format="dataframe",
     )
     X, y = _extract_target_if_missing(X, y, ds_name=ds.name)
-    return X, y, ds.name
+
+    info = DatasetInfo(
+        input_spec=spec,
+        dataset_name=str(ds.name),
+        resolved_dataset_id=int(getattr(ds, "dataset_id", None)) if getattr(ds, "dataset_id", None) else None,
+        resolved_task_id=resolved_task_id,
+        dataset_version=int(getattr(ds, "version", None)) if getattr(ds, "version", None) else None,
+    )
+
+    if isinstance(name_or_id, int) or spec.isdigit():
+        if resolved_task_id is None:
+            print(
+                f"[openml] Interpreted '{spec}' as dataset id -> {info.resolved_dataset_id} "
+                f"(name={info.dataset_name}, version={info.dataset_version})"
+            )
+        else:
+            print(
+                f"[openml] Interpreted '{spec}' as task id -> dataset id {info.resolved_dataset_id} "
+                f"(name={info.dataset_name}, version={info.dataset_version})"
+            )
+
+    return X, y, info
 
 
 def compute_ece(y_true: np.ndarray, proba: np.ndarray, n_bins: int = 15) -> float:
@@ -260,430 +359,439 @@ def _eval_metrics_from_fitted_clf(
     )
 
 
-def _flip_labels(
+@dataclass(frozen=True)
+class CheckpointSpec:
+    name: str
+    path: str
+    sha256: str
+
+
+def _dedupe_names(names: List[str]) -> List[str]:
+    out: List[str] = []
+    seen: Dict[str, int] = {}
+    for n in names:
+        base = n
+        k = seen.get(base, 0)
+        if k == 0:
+            out.append(base)
+        else:
+            out.append(f"{base}_{k}")
+        seen[base] = k + 1
+    return out
+
+
+def parse_checkpoints(checkpoint_paths: Sequence[str], checkpoint_names: Sequence[str] | None) -> List[CheckpointSpec]:
+    paths = [Path(p).expanduser().resolve() for p in checkpoint_paths]
+    for p in paths:
+        if not p.is_file():
+            raise SystemExit(f"Checkpoint not found: {p}")
+
+    if checkpoint_names is not None and len(checkpoint_names) > 0:
+        if len(checkpoint_names) != len(paths):
+            raise SystemExit(
+                f"--checkpoint_names must match --checkpoints length "
+                f"({len(checkpoint_names)} vs {len(paths)})"
+            )
+        names = list(checkpoint_names)
+    else:
+        names = [p.stem for p in paths]
+    names = _dedupe_names(names)
+
+    out: List[CheckpointSpec] = []
+    for name, p in zip(names, paths):
+        out.append(CheckpointSpec(name=name, path=str(p), sha256=sha256_file(p)))
+    return out
+
+
+def _slug(s: str, max_len: int = 80) -> str:
+    s = str(s)
+    out = []
+    for ch in s:
+        if ch.isalnum():
+            out.append(ch)
+        else:
+            out.append("_")
+    slug = "".join(out).strip("_")
+    slug = "_".join([p for p in slug.split("_") if p])
+    return slug[:max_len] if len(slug) > max_len else slug
+
+
+def dataset_key(info: DatasetInfo) -> str:
+    did = info.resolved_dataset_id
+    ver = info.dataset_version
+    base = f"openml_{did}" if did is not None else f"openml_{_slug(info.dataset_name)}"
+    if ver is not None:
+        base += f"_v{ver}"
+    return f"{base}__{_slug(info.dataset_name)}"
+
+
+@dataclass(frozen=True)
+class SplitInfo:
+    idx_train: np.ndarray
+    idx_test: np.ndarray
+    stratified: bool
+
+
+def make_split_indices(
     y: pd.Series,
-    frac: float,
-    rng: np.random.Generator,
-) -> pd.Series:
-    """Randomly flip a fraction of labels to other classes."""
-    if frac <= 0.0:
-        return y
+    seed: int,
+    *,
+    test_size: float,
+    stratify: bool = True,
+) -> SplitInfo:
+    idx = np.arange(len(y))
+    strat = y if (stratify and y.nunique() > 1) else None
+    try:
+        idx_tr, idx_te = train_test_split(
+            idx,
+            test_size=test_size,
+            random_state=seed,
+            stratify=strat,
+        )
+        return SplitInfo(idx_train=np.asarray(idx_tr, dtype=int), idx_test=np.asarray(idx_te, dtype=int), stratified=strat is not None)
+    except ValueError as e:
+        # Fall back to unstratified split (important for small class counts).
+        print(f"[warn] Stratified split failed (seed={seed}): {e}. Falling back to unstratified split.")
+        idx_tr, idx_te = train_test_split(
+            idx,
+            test_size=test_size,
+            random_state=seed,
+            stratify=None,
+        )
+        return SplitInfo(idx_train=np.asarray(idx_tr, dtype=int), idx_test=np.asarray(idx_te, dtype=int), stratified=False)
 
-    y_poison = y.reset_index(drop=True).copy()
-    n = len(y_poison)
-    n_flip = int(round(frac * n))
-    if n_flip == 0:
-        return y
 
-    classes = np.asarray(sorted(pd.unique(y_poison)))
-    if classes.size < 2:
-        return y
-
-    idx = rng.choice(n, size=n_flip, replace=False)
-    for i in idx:
-        current = y_poison.iloc[i]
-        choices = classes[classes != current]
-        if choices.size == 0:
-            continue
-        y_poison.iloc[i] = rng.choice(choices)
-
-    return y_poison
+@dataclass(frozen=True)
+class Case:
+    condition: str
+    param_type: str
+    param_value: float
+    applies_to: Literal["none", "train", "test", "both"]
+    artifacts: Dict[str, Any]
 
 
-def _poison_context(
-    X_train: pd.DataFrame,
-    y_train: pd.Series,
-    X_test: pd.DataFrame,
-    y_test: pd.Series,
-    poison_frac: float,
-    rng: np.random.Generator,
-) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series]:
-    """Add synthetic outlier rows to the training context only, keep test clean."""
-    if poison_frac <= 0.0:
-        return X_train, y_train, X_test, y_test
-
-    n_out = int(round(poison_frac * len(X_train)))
-    if n_out == 0:
-        return X_train, y_train, X_test, y_test
-
-    num_cols = list(X_train.select_dtypes(include="number").columns)
-    cat_cols = [c for c in X_train.columns if c not in num_cols]
-
-    num_stats: Dict[str, Tuple[float, float]] = {}
-    for col in num_cols:
-        m = float(X_train[col].mean())
-        s = float(X_train[col].std() or 1.0)
-        num_stats[col] = (m, s)
-
-    cat_values = {c: X_train[c].dropna().unique() for c in cat_cols}
-
-    rows: List[Dict[str, Any]] = []
-    for _ in range(n_out):
-        row: Dict[str, Any] = {}
-        for col in num_cols:
-            m, s = num_stats[col]
-            row[col] = rng.normal(loc=m, scale=3.0 * s)  # heavy-tailed numeric outlier
-        for col in cat_cols:
-            vals = cat_values.get(col)
-            if vals is not None and len(vals) > 0:
-                row[col] = rng.choice(vals)
-            else:
-                row[col] = np.nan
-        rows.append(row)
-
-    X_out = pd.DataFrame(rows, columns=X_train.columns)
-    y_out = rng.choice(y_train.values, size=n_out)
-
-    X_train_poisoned = pd.concat(
-        [X_train.reset_index(drop=True), X_out.reset_index(drop=True)],
-        ignore_index=True,
-    )
-    y_train_poisoned = pd.concat(
-        [
-            y_train.reset_index(drop=True),
-            pd.Series(y_out, index=range(len(y_train), len(y_train) + n_out)),
-        ],
-        ignore_index=True,
-    )
-
-    return X_train_poisoned, y_train_poisoned, X_test, y_test
+def case_id(case: Case) -> str:
+    return _slug(f"{case.condition}__{case.param_type}__{case.param_value}__{case.applies_to}", max_len=160)
 
 
 # ---------------------------------------------------------------------------
-# Literature-aligned corruptions (TabPFN-style)
+# Corruption artifacts (paired across checkpoints)
 # ---------------------------------------------------------------------------
 
 
-def add_uninformative_features_shuffled(
+def _stable_case_rng(dataset_key: str, seed: int) -> np.random.Generator:
+    h = hashlib.sha256(f"{dataset_key}__{seed}".encode("utf-8")).digest()
+    s = int.from_bytes(h[:4], byteorder="little", signed=False)
+    return np.random.default_rng(s)
+
+
+def make_uninformative_artifacts(
     X_train: pd.DataFrame,
     X_test: pd.DataFrame,
     n_add: int,
     rng: np.random.Generator,
-    *,
-    with_replacement: bool = True,
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    TabPFN-style uninformative features:
-      - pick existing columns
-      - create copies whose values are randomly permuted across rows
-        (preserves marginal distribution + missingness, breaks label association)
+) -> Dict[str, Any]:
+    cols = list(X_train.columns)
+    if n_add <= 0 or not cols:
+        return {"kind": "uninformative_features_shuffled", "n_add": 0, "picked_cols": [], "train_perm": None, "test_perm": None}
 
-    We permute train and test independently to preserve each split's marginals.
-    Works for numeric + categorical/object columns, because we permute raw values.
-    """
+    picked = rng.choice(cols, size=int(n_add), replace=True)
+    train_perm = np.stack([rng.permutation(len(X_train)) for _ in range(int(n_add))], axis=0).astype(np.int32)
+    test_perm = np.stack([rng.permutation(len(X_test)) for _ in range(int(n_add))], axis=0).astype(np.int32)
+    return {
+        "kind": "uninformative_features_shuffled",
+        "n_add": int(n_add),
+        "picked_cols": picked.tolist(),
+        "train_perm": train_perm,
+        "test_perm": test_perm,
+    }
+
+
+def apply_uninformative_artifacts(
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
+    art: Dict[str, Any],
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    n_add = int(art.get("n_add", 0) or 0)
     if n_add <= 0:
         return X_train, X_test
 
-    cols = list(X_train.columns)
-    if len(cols) == 0:
-        return X_train, X_test
-
-    if with_replacement:
-        picked = rng.choice(cols, size=n_add, replace=True)
-    else:
-        n_add = min(n_add, len(cols))
-        picked = rng.choice(cols, size=n_add, replace=False)
+    picked_cols: List[str] = list(art["picked_cols"])
+    train_perm: np.ndarray = np.asarray(art["train_perm"])
+    test_perm: np.ndarray = np.asarray(art["test_perm"])
 
     X_tr = X_train.reset_index(drop=True).copy()
     X_te = X_test.reset_index(drop=True).copy()
 
-    for i, c in enumerate(picked):
-        new_c = f"uninformative_shuffle_{c}_{i}"
-        tr_vals = X_tr[c].to_numpy(copy=True)
-        te_vals = X_te[c].to_numpy(copy=True)
-
-        tr_perm = rng.permutation(tr_vals)
-        te_perm = rng.permutation(te_vals)
-
-        X_tr[new_c] = tr_perm
-        X_te[new_c] = te_perm
+    for i, src in enumerate(picked_cols):
+        new_c = f"uninformative_shuffle_{src}_{i}"
+        tr_vals = X_tr[src].to_numpy(copy=True)
+        te_vals = X_te[src].to_numpy(copy=True)
+        X_tr[new_c] = tr_vals[train_perm[i]]
+        X_te[new_c] = te_vals[test_perm[i]]
 
     return X_tr, X_te
 
 
-def apply_tabpfn_cell_outliers(
+def make_outlier_artifacts(
     X: pd.DataFrame,
     rng: np.random.Generator,
     *,
-    p_cell: float = 0.02,
-    outlier_factor: float = 50.0,
-    numeric_only: bool = True,
-) -> pd.DataFrame:
-    """
-    TabPFN-style cell-wise outliers (numeric features):
-      - For each numeric cell independently with probability p_cell,
-        multiply the value by u ~ Uniform(0, outlier_factor).
-    """
-    if outlier_factor <= 0 or p_cell <= 0:
-        return X
-
-    X_out = X.copy()
-    num_cols = (
-        list(X_out.select_dtypes(include="number").columns)
-        if numeric_only
-        else list(X_out.columns)
-    )
-    if not num_cols:
-        return X_out
-
+    p_cell: float,
+    outlier_factor: float,
+) -> Dict[str, Any]:
+    num_cols = list(X.select_dtypes(include="number").columns)
+    idx_map: Dict[str, np.ndarray] = {}
+    mult_map: Dict[str, np.ndarray] = {}
     for c in num_cols:
-        col = X_out[c].to_numpy(copy=True)
+        col = X[c].to_numpy(copy=False)
         finite = np.isfinite(col)
-        mask = (rng.random(size=col.shape[0]) < p_cell) & finite
-        if not np.any(mask):
-            continue
-        mult = rng.uniform(0.0, float(outlier_factor), size=int(mask.sum()))
-        col[mask] = col[mask] * mult
-        X_out[c] = col
+        mask = (rng.random(size=col.shape[0]) < float(p_cell)) & finite
+        idx = np.where(mask)[0].astype(np.int32)
+        mult = rng.uniform(0.0, float(outlier_factor), size=int(idx.size)).astype(np.float32)
+        idx_map[c] = idx
+        mult_map[c] = mult
+    return {
+        "kind": "cell_outliers_tabpfn",
+        "p_cell": float(p_cell),
+        "outlier_factor": float(outlier_factor),
+        "numeric_cols": num_cols,
+        "idx_map": idx_map,
+        "mult_map": mult_map,
+    }
 
+
+def apply_outlier_artifacts(X: pd.DataFrame, art: Dict[str, Any]) -> pd.DataFrame:
+    X_out = X.copy()
+    num_cols: List[str] = list(art.get("numeric_cols", []))
+    idx_map: Dict[str, np.ndarray] = art.get("idx_map", {})
+    mult_map: Dict[str, np.ndarray] = art.get("mult_map", {})
+    for c in num_cols:
+        idx = np.asarray(idx_map.get(c, np.asarray([], dtype=np.int32)))
+        if idx.size == 0:
+            continue
+        mult = np.asarray(mult_map.get(c, np.asarray([], dtype=np.float32)))
+        col = X_out[c].to_numpy(copy=True)
+        col[idx] = col[idx] * mult
+        X_out[c] = col
     return X_out
 
 
-# ---------------------------------------------------------------------------
-# Main robustness panel for a single checkpoint
-# ---------------------------------------------------------------------------
+def make_label_flip_artifacts(y_train: pd.Series, frac: float, rng: np.random.Generator) -> Dict[str, Any]:
+    y = y_train.reset_index(drop=True)
+    n = len(y)
+    n_flip = int(round(float(frac) * n))
+    if n_flip <= 0:
+        return {"kind": "icl_noisy_demo_labels", "frac": float(frac), "idx": np.asarray([], dtype=np.int32), "new_labels": np.asarray([], dtype=object)}
+
+    classes = np.asarray(pd.unique(y))
+    if classes.size < 2:
+        return {"kind": "icl_noisy_demo_labels", "frac": float(frac), "idx": np.asarray([], dtype=np.int32), "new_labels": np.asarray([], dtype=object)}
+
+    idx = rng.choice(n, size=n_flip, replace=False).astype(np.int32)
+    new_labels: List[Any] = []
+    for i in idx:
+        current = y.iloc[int(i)]
+        choices = classes[classes != current]
+        new_labels.append(rng.choice(choices))
+
+    return {"kind": "icl_noisy_demo_labels", "frac": float(frac), "idx": idx, "new_labels": np.asarray(new_labels, dtype=object)}
 
 
-def run_literature_robustness_panel(
-    ds_name: str,
+def apply_label_flip_artifacts(y_train: pd.Series, art: Dict[str, Any]) -> pd.Series:
+    y_poison = y_train.reset_index(drop=True).copy()
+    idx = np.asarray(art.get("idx", np.asarray([], dtype=np.int32)))
+    new_labels = np.asarray(art.get("new_labels", np.asarray([], dtype=object)), dtype=object)
+    for i, lab in zip(idx, new_labels):
+        y_poison.iloc[int(i)] = lab
+    return y_poison
+
+
+def _sample_random_orthogonal_matrix(k: int, rng: np.random.Generator) -> np.ndarray:
+    if k <= 0:
+        raise ValueError("k must be positive for orthogonal matrix sampling.")
+    A = rng.normal(size=(k, k))
+    Q, _ = np.linalg.qr(A)
+    if np.linalg.det(Q) < 0:
+        Q[:, 0] = -Q[:, 0]
+    return Q
+
+
+def _apply_kdim_rotation_matrix(
     X: pd.DataFrame,
-    y: pd.Series,
-    checkpoint: Path,
-    device: str,
-    n_estimators: int,
-    seed: int,
+    cols: List[str],
+    mu: np.ndarray,
+    sigma: np.ndarray,
+    R: np.ndarray,
+) -> pd.DataFrame:
+    if not cols:
+        return X
+    X_rot = X.copy()
+    # Ensure float dtype for rotated columns to avoid pandas dtype warnings/errors
+    # when the original columns are integer/boolean types.
+    X_rot[cols] = X_rot[cols].astype(float)
+    Z = X_rot[cols].to_numpy(dtype=float)
+    Z = (Z - mu) / sigma
+    Z_rot = Z @ R.T
+    X_rot.loc[:, cols] = Z_rot
+    return X_rot
+
+
+def build_cases(
+    X_train: pd.DataFrame,
+    X_test: pd.DataFrame,
+    y_train: pd.Series,
+    rng: np.random.Generator,
     *,
     uninformative_ns: Sequence[int],
     outlier_factors: Sequence[float],
     outlier_p_cell: float,
-    outliers_apply_to: str,  # "train"|"test"|"both"
+    outliers_apply_to: Literal["train", "test", "both"],
     label_poison_fracs: Sequence[float],
-    context_outlier_fracs: Sequence[float],
-    use_hierarchical: bool,
-    results_postfix: str = "",
-) -> List[Dict[str, Any]]:
-    """
-    Run robustness diagnostics for a single TabICL checkpoint on one dataset.
+    enable_rotation: bool,
+    rotation_k: int,
+) -> List[Case]:
+    cases: List[Case] = [
+        Case(condition="clean", param_type="none", param_value=0.0, applies_to="none", artifacts={})
+    ]
 
-    Returns a list of rows with metrics under different corruption conditions.
-    """
-    print(f"\n=== Literature-aligned robustness (single model): {ds_name} ===")
-    rng = np.random.default_rng(seed)
-
-    # Train/test split (similar to other robustness scripts, modest test size)
-    stratify = y if y.nunique() > 1 else None
-    try:
-        X_tr, X_te, y_tr, y_te = train_test_split(
-            X,
-            y,
-            test_size=0.2,
-            random_state=seed,
-            stratify=stratify,
-        )
-    except ValueError:
-        X_tr, X_te, y_tr, y_te = train_test_split(
-            X,
-            y,
-            test_size=0.2,
-            random_state=seed,
-            stratify=None,
+    for n_add in [n for n in uninformative_ns if int(n) > 0]:
+        art = make_uninformative_artifacts(X_train, X_test, int(n_add), rng)
+        cases.append(
+            Case(
+                condition="uninformative_features_shuffled",
+                param_type="n_add",
+                param_value=float(int(n_add)),
+                applies_to="both",
+                artifacts=art,
+            )
         )
 
-    robustness_rows: List[Dict[str, Any]] = []
-
-    def _fit_clf(X_train: pd.DataFrame, y_train: pd.Series) -> TabICLClassifier:
-        clf = TabICLClassifier(
-            device=device,
-            model_path=str(checkpoint),
-            allow_auto_download=False,
-            use_hierarchical=use_hierarchical,
-            n_estimators=n_estimators,
-            random_state=seed,
-            verbose=False,
+    for fac in [f for f in outlier_factors if float(f) > 0.0]:
+        train_art = make_outlier_artifacts(X_train, rng, p_cell=outlier_p_cell, outlier_factor=float(fac)) if outliers_apply_to in ("train", "both") else None
+        test_art = make_outlier_artifacts(X_test, rng, p_cell=outlier_p_cell, outlier_factor=float(fac)) if outliers_apply_to in ("test", "both") else None
+        cases.append(
+            Case(
+                condition="cell_outliers_tabpfn",
+                param_type="outlier_factor",
+                param_value=float(fac),
+                applies_to=outliers_apply_to,
+                artifacts={
+                    "kind": "cell_outliers_tabpfn",
+                    "p_cell": float(outlier_p_cell),
+                    "outlier_factor": float(fac),
+                    "train": train_art,
+                    "test": test_art,
+                },
+            )
         )
-        clf.fit(X_train, y_train)
-        return clf
 
-    # ---- Clean baseline
-    print("  Clean baseline:")
-    clf_clean = _fit_clf(X_tr, y_tr)
-    m_clean = _eval_metrics_from_fitted_clf(clf_clean, X_te, y_te)
+    for frac in [f for f in label_poison_fracs if float(f) > 0.0]:
+        art = make_label_flip_artifacts(y_train, float(frac), rng)
+        cases.append(
+            Case(
+                condition="icl_noisy_demo_labels",
+                param_type="frac",
+                param_value=float(frac),
+                applies_to="train",
+                artifacts=art,
+            )
+        )
 
-    robustness_rows.append(
-        {
-            "dataset": ds_name,
-            "condition": "clean",
-            "param_type": "none",
-            "param_value": 0.0,
-            "n_test": len(X_te),
-            "acc": m_clean.accuracy,
-            "f1": m_clean.f1_macro,
-            "nll": m_clean.log_loss,
-            "ece": m_clean.ece,
-            "seed": seed,
-            "n_estimators": n_estimators,
-            "use_hierarchical": bool(use_hierarchical),
-            "checkpoint": str(checkpoint),
+    if enable_rotation:
+        num_cols = list(X_train.select_dtypes(include="number").columns)
+        k = int(min(max(2, int(rotation_k)), len(num_cols))) if num_cols else 0
+        if k >= 2:
+            rot_seed = int(rng.integers(0, 1_000_000))
+            rng_rot = np.random.default_rng(rot_seed)
+            col_idx = rng_rot.choice(len(num_cols), size=k, replace=False)
+            cols_k = [num_cols[i] for i in col_idx]
+            mu = X_train[cols_k].mean().fillna(0.0).to_numpy(dtype=float)
+            sigma = X_train[cols_k].std().replace(0.0, 1.0).fillna(1.0).to_numpy(dtype=float)
+            R = _sample_random_orthogonal_matrix(k, rng_rot)
+            cols_hash = hashlib.sha256("|".join(cols_k).encode("utf-8")).hexdigest()[:12]
+            cases.append(
+                Case(
+                    condition="feature_rotation_kdim_both",
+                    param_type="k_subspace",
+                    param_value=float(k),
+                    applies_to="both",
+                    artifacts={
+                        "kind": "feature_rotation_kdim_both",
+                        "rotation_seed": rot_seed,
+                        "rotation_cols": cols_k,
+                        "rotation_cols_hash": cols_hash,
+                        "mu": mu,
+                        "sigma": sigma,
+                        "R": R,
+                    },
+                )
+            )
+        else:
+            print("[info] Rotation enabled but dataset has <2 numeric columns; skipping rotation case.")
+
+    return cases
+
+
+def save_corruptions(
+    run_dir: Path,
+    ds_key: str,
+    seed: int,
+    cases: Sequence[Case],
+) -> None:
+    out_dir = run_dir / "corruptions" / ds_key
+    ensure_dir(out_dir)
+
+    meta_rows: List[Dict[str, Any]] = []
+    arrays: Dict[str, Any] = {}
+
+    for case in cases:
+        cid = case_id(case)
+        row = {
+            "case_id": cid,
+            "condition": case.condition,
+            "param_type": case.param_type,
+            "param_value": case.param_value,
+            "applies_to": case.applies_to,
+            "artifact_kind": case.artifacts.get("kind"),
         }
-    )
 
-    # ---- (1) Uninformative feature injection (TabPFN-style)
-    for n_add in [n for n in uninformative_ns if n > 0]:
-        print(f"  Uninformative features (shuffled copies): n_add={n_add}")
-        X_tr_u, X_te_u = add_uninformative_features_shuffled(X_tr, X_te, n_add, rng)
+        kind = case.artifacts.get("kind")
+        if kind == "uninformative_features_shuffled":
+            arrays[f"{cid}__picked_cols"] = np.asarray(case.artifacts["picked_cols"], dtype=object)
+            arrays[f"{cid}__train_perm"] = np.asarray(case.artifacts["train_perm"], dtype=np.int32)
+            arrays[f"{cid}__test_perm"] = np.asarray(case.artifacts["test_perm"], dtype=np.int32)
+        elif kind == "icl_noisy_demo_labels":
+            arrays[f"{cid}__idx"] = np.asarray(case.artifacts["idx"], dtype=np.int32)
+            arrays[f"{cid}__new_labels"] = np.asarray(case.artifacts["new_labels"], dtype=object)
+        elif kind == "cell_outliers_tabpfn":
+            row["p_cell"] = case.artifacts.get("p_cell")
+            row["outlier_factor"] = case.artifacts.get("outlier_factor")
+            for which in ("train", "test"):
+                art = case.artifacts.get(which)
+                if art is None:
+                    continue
+                num_cols = list(art.get("numeric_cols", []))
+                arrays[f"{cid}__{which}__numeric_cols"] = np.asarray(num_cols, dtype=object)
+                idx_map = art.get("idx_map", {})
+                mult_map = art.get("mult_map", {})
+                for c in num_cols:
+                    cslug = _slug(c, max_len=80)
+                    arrays[f"{cid}__{which}__{cslug}__idx"] = np.asarray(idx_map.get(c, np.asarray([], dtype=np.int32)), dtype=np.int32)
+                    arrays[f"{cid}__{which}__{cslug}__mult"] = np.asarray(mult_map.get(c, np.asarray([], dtype=np.float32)), dtype=np.float32)
+        elif kind == "feature_rotation_kdim_both":
+            row["rotation_seed"] = int(case.artifacts["rotation_seed"])
+            row["rotation_cols_hash"] = str(case.artifacts["rotation_cols_hash"])
+            arrays[f"{cid}__rotation_cols"] = np.asarray(case.artifacts["rotation_cols"], dtype=object)
+            arrays[f"{cid}__mu"] = np.asarray(case.artifacts["mu"], dtype=np.float64)
+            arrays[f"{cid}__sigma"] = np.asarray(case.artifacts["sigma"], dtype=np.float64)
+            arrays[f"{cid}__R"] = np.asarray(case.artifacts["R"], dtype=np.float64)
 
-        clf_u = _fit_clf(X_tr_u, y_tr)
-        m_u = _eval_metrics_from_fitted_clf(clf_u, X_te_u, y_te)
+        meta_rows.append(row)
 
-        robustness_rows.append(
-            {
-                "dataset": ds_name,
-                "condition": "uninformative_features_shuffled",
-                "param_type": "n_add",
-                "param_value": int(n_add),
-                "n_test": len(X_te_u),
-                "acc": m_u.accuracy,
-                "f1": m_u.f1_macro,
-                "nll": m_u.log_loss,
-                "ece": m_u.ece,
-                "seed": seed,
-                "n_estimators": n_estimators,
-                "use_hierarchical": bool(use_hierarchical),
-                "checkpoint": str(checkpoint),
-            }
-        )
-
-    # ---- (2) Cell-wise outliers (TabPFN-style)
-    positive_factors = [f for f in outlier_factors if f and f > 0.0]
-    if positive_factors:
-        for fac in positive_factors:
-            print(
-                f"  Cell-wise numeric outliers: factor={fac}, "
-                f"p_cell={outlier_p_cell}, apply_to={outliers_apply_to}"
-            )
-            X_tr_o, X_te_o = X_tr, X_te
-            if outliers_apply_to in ("train", "both"):
-                X_tr_o = apply_tabpfn_cell_outliers(
-                    X_tr_o,
-                    rng,
-                    p_cell=outlier_p_cell,
-                    outlier_factor=fac,
-                )
-            if outliers_apply_to in ("test", "both"):
-                X_te_o = apply_tabpfn_cell_outliers(
-                    X_te_o,
-                    rng,
-                    p_cell=outlier_p_cell,
-                    outlier_factor=fac,
-                )
-
-            clf_o = _fit_clf(X_tr_o, y_tr)
-            m_o = _eval_metrics_from_fitted_clf(clf_o, X_te_o, y_te)
-
-            robustness_rows.append(
-                {
-                    "dataset": ds_name,
-                    "condition": "cell_outliers_tabpfn",
-                    "param_type": "outlier_factor",
-                    "param_value": float(fac),
-                    "n_test": len(X_te_o),
-                    "acc": m_o.accuracy,
-                    "f1": m_o.f1_macro,
-                    "nll": m_o.log_loss,
-                    "ece": m_o.ece,
-                    "seed": seed,
-                    "n_estimators": n_estimators,
-                    "use_hierarchical": bool(use_hierarchical),
-                    "checkpoint": str(checkpoint),
-                }
-            )
-
-    # ---- (3) Demonstration corruption: label flips on context labels
-    for frac in [f for f in label_poison_fracs if f > 0.0]:
-        print(f"  Label flip poisoning (context labels): frac={frac}")
-        y_tr_poison = _flip_labels(y_tr, frac, rng)
-
-        clf_lp = _fit_clf(X_tr, y_tr_poison)
-        m_lp = _eval_metrics_from_fitted_clf(clf_lp, X_te, y_te)
-
-        robustness_rows.append(
-            {
-                "dataset": ds_name,
-                "condition": "label_flip_poison",
-                "param_type": "frac",
-                "param_value": float(frac),
-                "n_test": len(X_te),
-                "acc": m_lp.accuracy,
-                "f1": m_lp.f1_macro,
-                "nll": m_lp.log_loss,
-                "ece": m_lp.ece,
-                "seed": seed,
-                "n_estimators": n_estimators,
-                "use_hierarchical": bool(use_hierarchical),
-                "checkpoint": str(checkpoint),
-            }
-        )
-
-    # ---- (4) Optional: ICL-specific context poisoning via synthetic outlier rows
-    for frac in [f for f in context_outlier_fracs if f > 0.0]:
-        print(f"  Context outlier-row injection (train only): frac={frac}")
-        X_tr_p, y_tr_p, X_te_c, y_te_c = _poison_context(
-            X_tr,
-            y_tr,
-            X_te,
-            y_te,
-            frac,
-            rng,
-        )
-
-        clf_cp = _fit_clf(X_tr_p, y_tr_p)
-        m_cp = _eval_metrics_from_fitted_clf(clf_cp, X_te_c, y_te_c)
-
-        robustness_rows.append(
-            {
-                "dataset": ds_name,
-                "condition": "context_outlier_rows",
-                "param_type": "frac",
-                "param_value": float(frac),
-                "n_test": len(X_te_c),
-                "acc": m_cp.accuracy,
-                "f1": m_cp.f1_macro,
-                "nll": m_cp.log_loss,
-                "ece": m_cp.ece,
-                "seed": seed,
-                "n_estimators": n_estimators,
-                "use_hierarchical": bool(use_hierarchical),
-                "checkpoint": str(checkpoint),
-            }
-        )
-
-    # Persist
-    if robustness_rows:
-        rob_filename = (
-            f"compare_mini_tabicl_robustness_lit{results_postfix}.csv"
-            if results_postfix
-            else "compare_mini_tabicl_robustness_lit.csv"
-        )
-        out_path = REPO_ROOT / "results" / rob_filename
-
-        cols = [
-            "dataset",
-            "condition",
-            "param_type",
-            "param_value",
-            "n_test",
-            "acc",
-            "f1",
-            "nll",
-            "ece",
-            "seed",
-            "n_estimators",
-            "use_hierarchical",
-            "checkpoint",
-        ]
-        _append_rows_csv(robustness_rows, out_path, cols)
-
-    return robustness_rows
+    save_json(out_dir / f"seed_{seed}.json", {"dataset_key": ds_key, "seed": int(seed), "cases": meta_rows})
+    if arrays:
+        np.savez_compressed(out_dir / f"seed_{seed}.npz", **arrays)
 
 
 # ---------------------------------------------------------------------------
@@ -692,15 +800,34 @@ def run_literature_robustness_panel(
 
 
 def parse_args() -> argparse.Namespace:
-    ap = argparse.ArgumentParser(
-        description="Literature-aligned robustness diagnostics for a single mini-TabICL checkpoint."
+    ap = argparse.ArgumentParser(description="Thesis-rigorous robustness runner for TabICL checkpoints.")
+
+    ap.add_argument(
+        "--run_dir",
+        type=str,
+        default=None,
+        help="Run directory (default: results/robustness/<run_name_or_timestamp>/).",
+    )
+    ap.add_argument(
+        "--run_name",
+        type=str,
+        default=None,
+        help="Optional run name used when --run_dir is not provided.",
     )
 
     ap.add_argument(
-        "--checkpoint",
+        "--checkpoints",
         type=str,
+        nargs="+",
         required=True,
-        help="Path to the TabICL checkpoint to evaluate.",
+        help="Checkpoint paths to evaluate (e.g. SA EA-ICL EA-FULL).",
+    )
+    ap.add_argument(
+        "--checkpoint_names",
+        type=str,
+        nargs="*",
+        default=None,
+        help="Optional names for checkpoints (must match --checkpoints length).",
     )
 
     ap.add_argument(
@@ -710,19 +837,41 @@ def parse_args() -> argparse.Namespace:
         help="Device to use (default: cuda if available, else cpu).",
     )
     ap.add_argument("--n_estimators", type=int, default=32)
-    ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument(
+        "--batch_size",
+        type=int,
+        default=8,
+        help="Inference batch size over ensemble members inside TabICLClassifier (lower = less VRAM).",
+    )
+    ap.add_argument("--seed", type=int, default=42)
     ap.add_argument(
         "--seeds",
         type=int,
         nargs="*",
-        default=[42, 43, 44, 45, 46, 47, 48, 49, 50, 51],
-        help="Optional list of seeds for a small sweep. When provided, overrides --seed.",
+        default=None,
+        help="Explicit list of seeds. When provided, overrides the default derived sweep.",
     )
     ap.add_argument(
-        "--use_hierarchical",
-        action="store_true",
-        help="Enable hierarchical classification in TabICLClassifier.",
+        "--n_seeds",
+        type=int,
+        default=5,
+        help="Number of seeds to run when --seeds is not provided (seeds = seed..seed+n_seeds-1).",
     )
+    ap.add_argument(
+        "--test_size",
+        type=float,
+        default=0.2,
+        help="Test split fraction.",
+    )
+    ap.add_argument(
+        "--no_stratify",
+        action="store_true",
+        help="Disable stratified splitting (default: stratify when possible).",
+    )
+
+    ap.add_argument("--use_hierarchical", dest="use_hierarchical", action="store_true")
+    ap.add_argument("--no_hierarchical", dest="use_hierarchical", action="store_false")
+    ap.set_defaults(use_hierarchical=True)
 
     # Dataset selection: OpenML IDs
     ap.add_argument(
@@ -757,30 +906,42 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--outliers_apply_to",
         type=str,
-        default="both",
+        default="test",
         choices=["train", "test", "both"],
-        help="Apply cell-wise outliers to train, test, or both.",
+        help="Apply cell-wise outliers to train, test, or both (default: test).",
     )
     ap.add_argument(
         "--label_poison_fracs",
         type=float,
         nargs="*",
-        default=[0.0, 0.1],
-        help="Fractions of training labels to flip (ICL demonstration corruption).",
+        default=[0.1],
+        help="Fractions of training labels to flip (ICL noisy demonstration labels).",
     )
-    ap.add_argument(
-        "--context_outlier_fracs",
-        type=float,
-        nargs="*",
-        default=[0.0],
-        help="Fractions of synthetic outlier rows to inject into training context (ICL-specific).",
+    lg = ap.add_mutually_exclusive_group()
+    lg.add_argument(
+        "--enable_label_noise",
+        dest="enable_label_noise",
+        action="store_true",
+        help="Enable label-noise / noisy-demonstration-label cases (default).",
     )
+    lg.add_argument(
+        "--disable_label_noise",
+        dest="enable_label_noise",
+        action="store_false",
+        help="Disable label-noise / noisy-demonstration-label cases.",
+    )
+    ap.set_defaults(enable_label_noise=True)
 
     ap.add_argument(
-        "--results_postfix",
-        type=str,
-        default="",
-        help="Optional string appended before '.csv' in result filenames (e.g. '_run2').",
+        "--enable_rotation",
+        action="store_true",
+        help="Enable rotation invariance stress test on a numeric subspace (train+test rotated together).",
+    )
+    ap.add_argument(
+        "--rotation_k",
+        type=int,
+        default=8,
+        help="Rotation subspace dimension (k) when --enable_rotation is set.",
     )
 
     return ap.parse_args()
@@ -788,12 +949,25 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    ckpt = Path(args.checkpoint).expanduser().resolve()
-    if not ckpt.is_file():
-        raise SystemExit(f"Checkpoint not found: {ckpt}")
-
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+
+    # --- Run directory + run state
+    if args.run_dir:
+        run_dir = Path(args.run_dir).expanduser()
+        if not run_dir.is_absolute():
+            run_dir = (REPO_ROOT / run_dir).resolve()
+    else:
+        ts = _dt.datetime.now(_dt.timezone.utc).strftime("%Y%m%d_%H%M%S")
+        name = args.run_name or ts
+        run_dir = (REPO_ROOT / "results" / "robustness" / name).resolve()
+    ensure_dir(run_dir)
+
+    save_json(run_dir / "env.json", get_env_info(device))
+    save_json(run_dir / "run_config.json", vars(args))
+
+    ckpts = parse_checkpoints(args.checkpoints, args.checkpoint_names)
+    save_json(run_dir / "checkpoints.json", [c.__dict__ for c in ckpts])
 
     # Choose dataset list
     if args.openml_ids is not None and len(args.openml_ids) > 0:
@@ -803,61 +977,329 @@ def main() -> None:
 
     # Determine seeds to run
     if args.seeds:
-        seed_values = list(dict.fromkeys(args.seeds))
+        seed_values = list(dict.fromkeys(int(s) for s in args.seeds))
     else:
-        seed_values = [int(args.seed)]
+        base = int(args.seed)
+        seed_values = [base + i for i in range(int(args.n_seeds))]
 
-    all_rows: List[Dict[str, Any]] = []
-    for seed in seed_values:
-        set_seed(seed)
-        if len(seed_values) > 1:
-            print(f"\n##### Seed {seed} #####")
+    metrics_path = run_dir / "metrics.csv"
+    metrics_cols = [
+        # checkpoint
+        "checkpoint_name",
+        "checkpoint_path",
+        "checkpoint_sha256",
+        # dataset
+        "dataset_key",
+        "dataset_name",
+        "resolved_dataset_id",
+        "resolved_task_id",
+        "dataset_version",
+        "input_spec",
+        # split
+        "seed",
+        "test_size",
+        "stratified",
+        "n_train",
+        "n_test",
+        # condition/case
+        "case_id",
+        "condition",
+        "param_type",
+        "param_value",
+        "applies_to",
+        "p_cell",
+        "rotation_seed",
+        "rotation_cols_hash",
+        # metrics
+        "acc",
+        "f1_macro",
+        "nll",
+        "ece",
+        # settings
+        "n_estimators",
+        "batch_size",
+        "use_hierarchical",
+        "device",
+    ]
 
-        for ds_id in openml_ids:
-            try:
-                X, y, ds_name = fetch_openml_dataset(int(ds_id))
-            except Exception as e:
-                print(f"[WARN] Could not load OpenML dataset '{ds_id}': {e}. Skipping.")
-                continue
+    dataset_rows: List[Dict[str, Any]] = []
+    splits_arrays: Dict[str, Any] = {}
+    splits_meta: List[Dict[str, Any]] = []
 
-            rows = run_literature_robustness_panel(
-                ds_name=ds_name,
-                X=X,
-                y=y,
-                checkpoint=ckpt,
-                device=device,
-                n_estimators=args.n_estimators,
-                seed=seed,
+    for ds_id in openml_ids:
+        try:
+            X, y, info = fetch_openml_dataset_with_info(int(ds_id))
+        except Exception as e:
+            print(f"[WARN] Could not load OpenML dataset '{ds_id}': {e}. Skipping.")
+            continue
+
+        ds_key = dataset_key(info)
+        dataset_rows.append(
+            {
+                "dataset_key": ds_key,
+                "dataset_name": info.dataset_name,
+                "input_spec": info.input_spec,
+                "resolved_dataset_id": info.resolved_dataset_id,
+                "resolved_task_id": info.resolved_task_id,
+                "dataset_version": info.dataset_version,
+                "n_rows": int(X.shape[0]),
+                "n_features": int(X.shape[1]),
+                "n_classes": int(pd.Series(y).nunique(dropna=True)),
+            }
+        )
+
+        for seed in seed_values:
+            set_seed(seed)
+            print(f"\n=== Dataset: {info.dataset_name} | seed={seed} ===")
+
+            split = make_split_indices(y, seed, test_size=float(args.test_size), stratify=not bool(args.no_stratify))
+            idx_tr, idx_te = split.idx_train, split.idx_test
+
+            splits_arrays[f"{ds_key}__seed_{seed}__train_idx"] = idx_tr.astype(np.int32)
+            splits_arrays[f"{ds_key}__seed_{seed}__test_idx"] = idx_te.astype(np.int32)
+            splits_meta.append(
+                {
+                    "dataset_key": ds_key,
+                    "seed": int(seed),
+                    "test_size": float(args.test_size),
+                    "stratified": bool(split.stratified),
+                    "n_train": int(idx_tr.size),
+                    "n_test": int(idx_te.size),
+                }
+            )
+
+            X_tr = X.iloc[idx_tr].reset_index(drop=True)
+            y_tr = y.iloc[idx_tr].reset_index(drop=True)
+            X_te = X.iloc[idx_te].reset_index(drop=True)
+            y_te = y.iloc[idx_te].reset_index(drop=True)
+
+            case_rng = _stable_case_rng(ds_key, seed)
+            cases = build_cases(
+                X_train=X_tr,
+                X_test=X_te,
+                y_train=y_tr,
+                rng=case_rng,
                 uninformative_ns=args.uninformative_ns,
                 outlier_factors=args.outlier_factors,
-                outlier_p_cell=args.outlier_p_cell,
+                outlier_p_cell=float(args.outlier_p_cell),
                 outliers_apply_to=args.outliers_apply_to,
-                label_poison_fracs=args.label_poison_fracs,
-                context_outlier_fracs=args.context_outlier_fracs,
-                use_hierarchical=args.use_hierarchical,
-                results_postfix=args.results_postfix,
+                label_poison_fracs=(args.label_poison_fracs if bool(args.enable_label_noise) else []),
+                enable_rotation=bool(args.enable_rotation),
+                rotation_k=int(args.rotation_k),
             )
-            all_rows.extend(rows)
+            save_corruptions(run_dir, ds_key, seed, cases)
+            expected_rows_per_ds_seed = len(cases) * len(ckpts)
 
-    # Simple summary: mean ΔNLL vs clean per condition/param
-    if all_rows:
-        df = pd.DataFrame(all_rows)
-        clean = df[df["condition"] == "clean"][["dataset", "nll"]].rename(
-            columns={"nll": "nll_clean"}
-        )
-        non_clean = df[df["condition"] != "clean"]
-        if not non_clean.empty:
-            merged = non_clean.merge(clean, on="dataset", how="left")
-            merged["delta_nll_vs_clean"] = merged["nll"] - merged["nll_clean"]
-            print("\n=== Summary: mean ΔNLL (corrupted - clean) ===")
-            summary = (
-                merged.groupby(["condition", "param_type", "param_value"])[
-                    "delta_nll_vs_clean"
-                ]
-                .mean()
-                .sort_values()
-            )
-            print(summary)
+            rows_out: List[Dict[str, Any]] = []
+            for ck in ckpts:
+                print(f"  [checkpoint] {ck.name}")
+
+                def _fit_clf(X_train: pd.DataFrame, y_train: pd.Series) -> TabICLClassifier:
+                    clf = TabICLClassifier(
+                        device=device,
+                        model_path=str(ck.path),
+                        allow_auto_download=False,
+                        use_hierarchical=bool(args.use_hierarchical),
+                        n_estimators=int(args.n_estimators),
+                        batch_size=int(args.batch_size),
+                        random_state=int(seed),
+                        verbose=False,
+                    )
+                    clf.fit(X_train, y_train)
+                    return clf
+
+                # Important for VRAM: never keep 2 models on GPU at once.
+                # We evaluate "no-refit" cases (clean + test-only shifts) using a single clean-fit model,
+                # then delete it before running refit-requiring cases.
+                cases_no_refit: List[Case] = []
+                cases_refit: List[Case] = []
+                for case in cases:
+                    kind = case.artifacts.get("kind")
+                    if case.condition == "clean":
+                        cases_no_refit.append(case)
+                    elif kind == "cell_outliers_tabpfn" and case.artifacts.get("train") is None:
+                        # test-only outliers: reuse clean-context model
+                        cases_no_refit.append(case)
+                    else:
+                        cases_refit.append(case)
+
+                clf_clean: TabICLClassifier | None = None
+                try:
+                    maybe_free_torch_memory()
+                    clf_clean = _fit_clf(X_tr, y_tr)
+
+                    for case in cases_no_refit:
+                        cid = case_id(case)
+                        X_te_c = X_te
+                        p_cell: float | None = None
+                        rotation_seed: int | None = None
+                        rotation_cols_hash: str | None = None
+
+                        kind = case.artifacts.get("kind")
+                        if case.condition == "clean":
+                            pass
+                        elif kind == "cell_outliers_tabpfn":
+                            p_cell = float(case.artifacts.get("p_cell", float("nan")))
+                            test_art = case.artifacts.get("test")
+                            if test_art is not None:
+                                X_te_c = apply_outlier_artifacts(X_te_c, test_art)
+                        else:
+                            raise RuntimeError(f"Unexpected no-refit case kind: {kind} ({case.condition})")
+
+                        try:
+                            m = _eval_metrics_from_fitted_clf(clf_clean, X_te_c, y_te)
+                        except Exception as e:
+                            print(
+                                f"[WARN] Failed case {case.condition} ({cid}) for {ck.name} on {info.dataset_name}: {e}"
+                            )
+                            maybe_free_torch_memory()
+                            continue
+
+                        rows_out.append(
+                            {
+                                "checkpoint_name": ck.name,
+                                "checkpoint_path": ck.path,
+                                "checkpoint_sha256": ck.sha256,
+                                "dataset_key": ds_key,
+                                "dataset_name": info.dataset_name,
+                                "resolved_dataset_id": info.resolved_dataset_id,
+                                "resolved_task_id": info.resolved_task_id,
+                                "dataset_version": info.dataset_version,
+                                "input_spec": info.input_spec,
+                                "seed": int(seed),
+                                "test_size": float(args.test_size),
+                                "stratified": bool(split.stratified),
+                                "n_train": int(len(X_tr)),
+                                "n_test": int(len(X_te_c)),
+                                "case_id": cid,
+                                "condition": case.condition,
+                                "param_type": case.param_type,
+                                "param_value": float(case.param_value),
+                                "applies_to": case.applies_to,
+                                "p_cell": p_cell,
+                                "rotation_seed": rotation_seed,
+                                "rotation_cols_hash": rotation_cols_hash,
+                                "acc": m.accuracy,
+                                "f1_macro": m.f1_macro,
+                                "nll": m.log_loss,
+                                "ece": m.ece,
+                                "n_estimators": int(args.n_estimators),
+                                "batch_size": int(args.batch_size),
+                                "use_hierarchical": bool(args.use_hierarchical),
+                                "device": device,
+                            }
+                        )
+                finally:
+                    # Free clean model before any refit cases to avoid peak VRAM doubling.
+                    if clf_clean is not None:
+                        try:
+                            del clf_clean
+                        except Exception:
+                            pass
+                    maybe_free_torch_memory()
+
+                for case in cases_refit:
+                    cid = case_id(case)
+                    X_tr_c, y_tr_c = X_tr, y_tr
+                    X_te_c = X_te
+                    p_cell: float | None = None
+                    rotation_seed: int | None = None
+                    rotation_cols_hash: str | None = None
+
+                    kind = case.artifacts.get("kind")
+                    if kind == "uninformative_features_shuffled":
+                        X_tr_c, X_te_c = apply_uninformative_artifacts(X_tr, X_te, case.artifacts)
+                    elif kind == "cell_outliers_tabpfn":
+                        p_cell = float(case.artifacts.get("p_cell", float("nan")))
+                        train_art = case.artifacts.get("train")
+                        test_art = case.artifacts.get("test")
+                        if train_art is not None:
+                            X_tr_c = apply_outlier_artifacts(X_tr_c, train_art)
+                        if test_art is not None:
+                            X_te_c = apply_outlier_artifacts(X_te_c, test_art)
+                    elif kind == "icl_noisy_demo_labels":
+                        y_tr_c = apply_label_flip_artifacts(y_tr, case.artifacts)
+                    elif kind == "feature_rotation_kdim_both":
+                        rotation_seed = int(case.artifacts["rotation_seed"])
+                        rotation_cols_hash = str(case.artifacts["rotation_cols_hash"])
+                        cols = list(case.artifacts["rotation_cols"])
+                        mu = np.asarray(case.artifacts["mu"], dtype=float)
+                        sigma = np.asarray(case.artifacts["sigma"], dtype=float)
+                        R = np.asarray(case.artifacts["R"], dtype=float)
+                        X_tr_c = _apply_kdim_rotation_matrix(X_tr_c, cols, mu, sigma, R)
+                        X_te_c = _apply_kdim_rotation_matrix(X_te_c, cols, mu, sigma, R)
+                    else:
+                        raise RuntimeError(f"Unknown case kind: {kind} (condition={case.condition})")
+
+                    clf_case: TabICLClassifier | None = None
+                    try:
+                        maybe_free_torch_memory()
+                        clf_case = _fit_clf(X_tr_c, y_tr_c)
+                        m = _eval_metrics_from_fitted_clf(clf_case, X_te_c, y_te)
+                    except Exception as e:
+                        print(
+                            f"[WARN] Failed case {case.condition} ({cid}) for {ck.name} on {info.dataset_name}: {e}"
+                        )
+                        maybe_free_torch_memory()
+                        continue
+                    finally:
+                        if clf_case is not None:
+                            try:
+                                del clf_case
+                            except Exception:
+                                pass
+                        maybe_free_torch_memory()
+
+                    rows_out.append(
+                        {
+                            "checkpoint_name": ck.name,
+                            "checkpoint_path": ck.path,
+                            "checkpoint_sha256": ck.sha256,
+                            "dataset_key": ds_key,
+                            "dataset_name": info.dataset_name,
+                            "resolved_dataset_id": info.resolved_dataset_id,
+                            "resolved_task_id": info.resolved_task_id,
+                            "dataset_version": info.dataset_version,
+                            "input_spec": info.input_spec,
+                            "seed": int(seed),
+                            "test_size": float(args.test_size),
+                            "stratified": bool(split.stratified),
+                            "n_train": int(len(X_tr_c)),
+                            "n_test": int(len(X_te_c)),
+                            "case_id": cid,
+                            "condition": case.condition,
+                            "param_type": case.param_type,
+                            "param_value": float(case.param_value),
+                            "applies_to": case.applies_to,
+                            "p_cell": p_cell,
+                            "rotation_seed": rotation_seed,
+                            "rotation_cols_hash": rotation_cols_hash,
+                            "acc": m.accuracy,
+                            "f1_macro": m.f1_macro,
+                            "nll": m.log_loss,
+                            "ece": m.ece,
+                            "n_estimators": int(args.n_estimators),
+                            "batch_size": int(args.batch_size),
+                            "use_hierarchical": bool(args.use_hierarchical),
+                            "device": device,
+                        }
+                    )
+
+            _append_rows_csv(rows_out, metrics_path, metrics_cols)
+            print(f"  Wrote {len(rows_out)} rows to {metrics_path}")
+            if len(rows_out) != expected_rows_per_ds_seed:
+                print(
+                    f"[warn] Row count mismatch for {info.dataset_name} seed={seed}: "
+                    f"expected {expected_rows_per_ds_seed}, got {len(rows_out)}"
+                )
+
+    # Persist dataset list and splits
+    if dataset_rows:
+        (run_dir / "datasets.csv").parent.mkdir(parents=True, exist_ok=True)
+        pd.DataFrame(dataset_rows).to_csv(run_dir / "datasets.csv", index=False)
+    if splits_arrays:
+        np.savez_compressed(run_dir / "splits.npz", **splits_arrays)
+        save_json(run_dir / "splits_meta.json", splits_meta)
 
 
 if __name__ == "__main__":
