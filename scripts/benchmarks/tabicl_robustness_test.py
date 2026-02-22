@@ -29,6 +29,8 @@ import datetime as _dt
 import gc
 import hashlib
 import json
+import math
+import os
 import platform
 import sys
 from dataclasses import dataclass
@@ -38,6 +40,7 @@ from typing import Any, Dict, Iterable, List, Literal, Sequence, Tuple
 import numpy as np
 import pandas as pd
 import torch
+import torch.nn.functional as F
 from sklearn.metrics import accuracy_score, f1_score, log_loss
 from sklearn.model_selection import train_test_split
 
@@ -49,6 +52,8 @@ if str(SRC_DIR) not in sys.path:
     sys.path.insert(0, str(SRC_DIR))
 
 from tabicl.sklearn.classifier import TabICLClassifier
+from tabicl.pdlc.embed import extract_tf_row_embeddings
+from tabicl.model.attention import compute_elliptical_diag
 
 
 # Default OpenML IDs: Panel B (robustness characterization set)
@@ -329,12 +334,330 @@ def compute_ece(y_true: np.ndarray, proba: np.ndarray, n_bins: int = 15) -> floa
     return float(ece)
 
 
+def compute_brier(y_true: np.ndarray, proba: np.ndarray) -> float:
+    """Multi-class Brier score: mean_i sum_k (p_ik - 1[y_i=k])^2 (lower is better)."""
+    y_true = np.asarray(y_true, dtype=int)
+    proba = np.asarray(proba, dtype=float)
+    if proba.ndim != 2:
+        raise ValueError("proba must be 2D (n_samples, n_classes)")
+    n, k = proba.shape
+    if y_true.shape[0] != n:
+        raise ValueError("y_true length must match proba rows")
+    y_onehot = np.zeros((n, k), dtype=float)
+    valid = (y_true >= 0) & (y_true < k)
+    y_onehot[np.arange(n)[valid], y_true[valid]] = 1.0
+    return float(np.mean(np.sum((proba - y_onehot) ** 2, axis=1)))
+
+
+def _stable_subsample_idx(n: int, k: int, *, seed: int) -> np.ndarray:
+    if n <= k:
+        return np.arange(n, dtype=int)
+    rng = np.random.default_rng(int(seed))
+    return np.sort(rng.choice(n, size=int(k), replace=False).astype(int))
+
+
+def _subsample_seed_for_dataset(ds_key: str, seed: int) -> int:
+    """Deterministic seed used for row-subsampling, tied to dataset_key and split seed."""
+    h = hashlib.sha256(f"{ds_key}__{int(seed)}".encode("utf-8")).digest()
+    return int.from_bytes(h[:4], byteorder="little", signed=False)
+
+
+def _pairwise_cosine_stats(Z: np.ndarray, *, max_rows: int, subsample_seed: int) -> Tuple[float, float]:
+    """Return (mean_cos, p95_cos) over off-diagonal pairwise cosines (on a stable subset)."""
+    Z = np.asarray(Z, dtype=np.float64)
+    if Z.ndim != 2 or Z.shape[0] < 2:
+        return float("nan"), float("nan")
+    n = int(Z.shape[0])
+    idx = _stable_subsample_idx(n, int(max_rows), seed=int(subsample_seed))
+    Zs = Z[idx]
+    norms = np.linalg.norm(Zs, axis=1, keepdims=True) + 1e-12
+    Z_norm = Zs / norms
+    S = Z_norm @ Z_norm.T
+    mask = ~np.eye(S.shape[0], dtype=bool)
+    vals = S[mask]
+    if vals.size == 0:
+        return float("nan"), float("nan")
+    return float(vals.mean()), float(np.quantile(vals, 0.95))
+
+
+def _collapse_from_embeddings(Z: np.ndarray, *, max_rows: int, subsample_seed: int) -> Tuple[float, float]:
+    """Return (collapse_top1, d_eff) from covariance spectrum on a stable subset."""
+    Z = np.asarray(Z, dtype=np.float64)
+    if Z.ndim != 2 or Z.shape[0] < 2:
+        return float("nan"), float("nan")
+    n = int(Z.shape[0])
+    idx = _stable_subsample_idx(n, int(max_rows), seed=int(subsample_seed))
+    Zs = Z[idx]
+    Zc = Zs - Zs.mean(axis=0, keepdims=True)
+    # Eigenvalues of covariance via SVD for stability; cov eigenvalues = s^2/(n-1)
+    try:
+        s = np.linalg.svd(Zc, full_matrices=False, compute_uv=False)
+    except Exception:
+        C = np.cov(Zc, rowvar=False)
+        evals = np.linalg.eigvalsh(C)
+        evals = np.sort(np.clip(evals, a_min=0.0, a_max=None))[::-1]
+        if evals.size == 0:
+            return float("nan"), float("nan")
+        s1 = float(evals.sum())
+        collapse_top1 = float(evals[0] / s1) if s1 > 0 else float("nan")
+        s2 = float((evals**2).sum())
+        d_eff = float((s1 * s1) / s2) if s2 > 0 else float("nan")
+        return collapse_top1, d_eff
+
+    evals = (s**2) / max(1, (Zc.shape[0] - 1))
+    if evals.size == 0:
+        return float("nan"), float("nan")
+    s1 = float(evals.sum())
+    collapse_top1 = float(evals[0] / s1) if s1 > 0 else float("nan")
+    s2 = float((evals**2).sum())
+    d_eff = float((s1 * s1) / s2) if s2 > 0 else float("nan")
+    return collapse_top1, d_eff
+
+
+def compute_tfrow_collapse_metrics(
+    clf: TabICLClassifier,
+    X_test: pd.DataFrame,
+    *,
+    max_rows_spectrum: int,
+    max_rows_cosine: int,
+    subsample_seed: int,
+) -> Dict[str, float]:
+    """Collapse metrics on TFrow output for test rows (embeddings_test)."""
+    res = extract_tf_row_embeddings(clf, X_test, choose_random_variant=False)
+    Z = np.asarray(res["embeddings_test"])
+    collapse_top1, d_eff = _collapse_from_embeddings(Z, max_rows=int(max_rows_spectrum), subsample_seed=int(subsample_seed))
+    cos_mean, cos_p95 = _pairwise_cosine_stats(Z, max_rows=int(max_rows_cosine), subsample_seed=int(subsample_seed))
+    return {
+        "collapse_top1": float(collapse_top1),
+        "d_eff": float(d_eff),
+        "cos_mean": float(cos_mean),
+        "cos_p95": float(cos_p95),
+    }
+
+
+@torch.no_grad()
+def _compute_test_to_train_weights(
+    model,
+    R_cond: torch.Tensor,
+    train_size: int,
+    *,
+    chunk_test: int,
+    use_fp16: bool,
+) -> torch.Tensor:
+    """Mean-head test→train attention weights (T_test, T_train) with low memory."""
+    from tabicl.model.learning import ICLearning  # local import to avoid cycles
+
+    device = R_cond.device
+    enc: ICLearning = model.icl_predictor
+    tf_icl = enc.tf_icl
+    blocks = list(tf_icl.blocks)
+
+    x = R_cond
+    v_prev = None
+    for i, blk in enumerate(blocks[:-1]):
+        x = blk(x, key_padding_mask=None, attn_mask=train_size, rope=tf_icl.rope, v_prev=v_prev, block_index=i)
+        v_prev = getattr(blk, "_last_v", None)
+
+    last = blocks[-1]
+    q_in = last.norm1(x) if last.norm_first else x
+    B, T, E = q_in.shape
+    nh = last.attn.num_heads
+    hs = E // nh
+    q, k, v = F._in_projection_packed(q_in, q_in, q_in, last.attn.in_proj_weight, last.attn.in_proj_bias)
+    q = q.view(B, T, nh, hs).transpose(-3, -2)  # (B, nh, T, hs)
+    k = k.view(B, T, nh, hs).transpose(-3, -2)
+    v = v.view(B, T, nh, hs).transpose(-3, -2)
+
+    if last.elliptical and (v_prev is not None) and (len(blocks) - 1 >= 1):
+        keep = torch.zeros(T, device=device, dtype=torch.float32)
+        keep[:train_size] = 1.0
+        m = compute_elliptical_diag(
+            v,
+            v_prev,
+            delta=last.elliptical_delta,
+            scale_mode=last.elliptical_scale_mode,
+            mask_keep=keep,
+        )
+        m_bc = m.view(1, 1, nh, 1, hs)
+        q = q * m_bc
+        k = k * m_bc
+
+    q_test = q[..., train_size:, :]  # (B, nh, T_test, hs)
+    k_train = k[..., :train_size, :]  # (B, nh, T_train, hs)
+    T_test = int(q_test.shape[-2])
+    T_train = int(k_train.shape[-2])
+
+    Bnh = int(B * nh)
+    q_test_b = q_test.reshape(Bnh, T_test, hs)
+    k_train_b = k_train.reshape(Bnh, T_train, hs)
+    if use_fp16:
+        q_test_b = q_test_b.to(torch.float16)
+        k_train_b = k_train_b.to(torch.float16)
+
+    out = torch.zeros(T_test, T_train, device=device, dtype=torch.float32)
+    scale = 1.0 / math.sqrt(hs)
+
+    for start in range(0, T_test, int(chunk_test)):
+        end = min(T_test, start + int(chunk_test))
+        q_chunk = q_test_b[:, start:end, :]  # (Bnh, t, hs)
+        scores = torch.bmm(q_chunk, k_train_b.transpose(1, 2)) * scale  # (Bnh, t, T_train)
+        w = torch.softmax(scores.to(torch.float32), dim=-1)
+        w_mean = w.mean(dim=0)  # (t, T_train)
+        out[start:end, :] += w_mean
+
+    return out
+
+
+def _build_episode(clf: TabICLClassifier, X_te: pd.DataFrame) -> Tuple[torch.Tensor, int]:
+    """Construct a single deterministic ICL episode from X_te.
+
+    Returns
+    -------
+    (R_cond, train_size, y_train_shifted, shift_offset)
+      - R_cond: conditioned row representations for the combined (train+test) sequence
+      - train_size: number of support rows
+      - y_train_shifted: shifted (encoded) train labels used for conditioning
+      - shift_offset: cyclic class shift offset used for this variant
+    """
+    X_te_num = clf.X_encoder_.transform(X_te)
+    data = clf.ensemble_generator_.transform(X_te_num)
+    methods = list(data.keys())
+    norm_method = methods[0]
+    Xs, ys_shifted = data[norm_method]
+    shuffle_patterns = clf.ensemble_generator_.feature_shuffle_patterns_[norm_method]
+    shift_offsets = clf.ensemble_generator_.class_shift_offsets_[norm_method]
+
+    vidx = 0
+    for i, p in enumerate(shuffle_patterns):
+        if list(p) == sorted(p):
+            vidx = i
+            break
+
+    X_variant = Xs[vidx]
+    y_train_shifted = ys_shifted[vidx]
+    shift_offset = int(shift_offsets[vidx]) if len(shift_offsets) > vidx else 0
+    train_size = int(y_train_shifted.shape[0])
+
+    model = clf.model_.to(clf.device_)
+    model.eval()
+
+    X_tensor = torch.from_numpy(X_variant).float().unsqueeze(0).to(clf.device_)
+    with torch.no_grad():
+        col_out = model.col_embedder(X_tensor, train_size=train_size, mgr_config=clf.inference_config_.COL_CONFIG)
+        row_reps = model.row_interactor(col_out, mgr_config=clf.inference_config_.ROW_CONFIG)
+        yt = torch.as_tensor(y_train_shifted, device=clf.device_, dtype=torch.float32).unsqueeze(0)
+        R_cond = row_reps.clone()
+        R_cond[:, :train_size] = R_cond[:, :train_size] + model.icl_predictor.y_encoder(yt)
+    return R_cond, train_size, np.asarray(y_train_shifted, dtype=int), int(shift_offset)
+
+
+def attention_neff_summary(weights_tt: torch.Tensor) -> Tuple[float, float]:
+    """Mean/std N_eff over test rows given (T_test, T_train) weights."""
+    if weights_tt.ndim != 2 or weights_tt.numel() == 0:
+        return float("nan"), float("nan")
+    W = weights_tt
+    finite = torch.isfinite(W)
+    any_finite = finite.any(dim=1)
+    if not any_finite.any():
+        return float("nan"), float("nan")
+    W = W[any_finite]
+    finite = finite[any_finite]
+
+    W_clean = torch.where(finite, W, torch.zeros_like(W))
+    row_sums = W_clean.sum(dim=1, keepdim=True).clamp_min(1e-12)
+    alpha = W_clean / row_sums
+
+    s2 = (alpha**2).sum(dim=1)
+    mask = (s2 > 0) & torch.isfinite(s2)
+    if not mask.any():
+        return float("nan"), float("nan")
+    neff = 1.0 / s2[mask]
+    neff_np = neff.detach().cpu().numpy().astype(np.float64)
+    return float(neff_np.mean()), float(neff_np.std())
+
+
+def neighbor_label_purity(
+    weights_tt: torch.Tensor,
+    y_train_shifted: np.ndarray,
+    y_test_shifted: np.ndarray,
+    *,
+    topk: int = 5,
+) -> Tuple[float, float]:
+    """Top-1 hit rate and top-k label purity using attention as neighbourhood weights."""
+    if weights_tt.ndim != 2 or weights_tt.numel() == 0:
+        return float("nan"), float("nan")
+
+    T_test, T_train = weights_tt.shape
+    W = weights_tt.detach().cpu().numpy()
+    y_tr = np.asarray(y_train_shifted)
+    y_te = np.asarray(y_test_shifted)
+    if y_tr.shape[0] != T_train or y_te.shape[0] != T_test:
+        return float("nan"), float("nan")
+
+    k = max(1, min(int(topk), int(T_train)))
+    top1_hits: List[float] = []
+    purities: List[float] = []
+    for t_idx in range(T_test):
+        alpha = W[t_idx]
+        if not np.isfinite(alpha).any():
+            continue
+        top_idx = np.argsort(-alpha)[:k]
+        neigh_labels = y_tr[top_idx]
+        qlab = y_te[t_idx]
+        top1_hits.append(float(neigh_labels[0] == qlab))
+        purities.append(float((neigh_labels == qlab).mean()))
+
+    if not purities:
+        return float("nan"), float("nan")
+    return float(np.mean(top1_hits)), float(np.mean(purities))
+
+
+def compute_tficl_attention_metrics(
+    clf: TabICLClassifier,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+    *,
+    max_test_rows: int,
+    chunk_test: int,
+    use_fp16: bool,
+    subsample_seed: int,
+) -> Dict[str, float]:
+    if int(max_test_rows) > 0 and int(X_test.shape[0]) > int(max_test_rows):
+        idx = _stable_subsample_idx(int(X_test.shape[0]), int(max_test_rows), seed=int(subsample_seed))
+        X_use = X_test.iloc[idx].reset_index(drop=True)
+        y_use = y_test.iloc[idx].reset_index(drop=True)
+    else:
+        X_use = X_test
+        y_use = y_test
+
+    R_cond, train_size, y_train_shifted, shift_offset = _build_episode(clf, X_use)
+    w_tt = _compute_test_to_train_weights(
+        clf.model_,
+        R_cond,
+        train_size,
+        chunk_test=int(chunk_test),
+        use_fp16=bool(use_fp16),
+    )
+    neff_mean, neff_std = attention_neff_summary(w_tt)
+
+    y_te_int = clf.y_encoder_.transform(y_use)
+    y_te_shifted = (np.asarray(y_te_int, dtype=int) + int(shift_offset)) % int(clf.n_classes_)
+    purity_top1, purity_top5 = neighbor_label_purity(w_tt, y_train_shifted, y_te_shifted, topk=5)
+    return {
+        "neff_mean": float(neff_mean),
+        "neff_std": float(neff_std),
+        "purity_top1": float(purity_top1),
+        "purity_top5": float(purity_top5),
+    }
+
+
 @dataclass
 class BehaviourMetrics:
     accuracy: float
     f1_macro: float
     log_loss: float
     ece: float
+    brier: float
 
 
 def _eval_metrics_from_fitted_clf(
@@ -351,11 +674,13 @@ def _eval_metrics_from_fitted_clf(
     ll = log_loss(y_test, proba, labels=clf.classes_)
     y_true_int = clf.y_encoder_.transform(y_test)
     ece = compute_ece(y_true_int, proba)
+    brier = compute_brier(y_true_int, proba)
     return BehaviourMetrics(
         accuracy=float(acc),
         f1_macro=float(f1),
         log_loss=float(ll),
         ece=float(ece),
+        brier=float(brier),
     )
 
 
@@ -401,6 +726,54 @@ def parse_checkpoints(checkpoint_paths: Sequence[str], checkpoint_names: Sequenc
     for name, p in zip(names, paths):
         out.append(CheckpointSpec(name=name, path=str(p), sha256=sha256_file(p)))
     return out
+
+
+def infer_variant(checkpoint_name: str) -> str:
+    u = str(checkpoint_name).strip().upper()
+    if u.startswith("SA"):
+        return "SA"
+    if u.startswith("EA"):
+        return "EA"
+    return ""
+
+
+def infer_case_label(case: Case) -> str:
+    def _fmt(v: float) -> str:
+        try:
+            fv = float(v)
+        except Exception:
+            return str(v)
+        if np.isfinite(fv) and abs(fv - round(fv)) < 1e-12:
+            return str(int(round(fv)))
+        return f"{fv:g}"
+
+    if case.condition == "clean":
+        return "clean"
+    kind = case.artifacts.get("kind")
+    if kind == "cell_outliers_tabpfn":
+        return f"outliers_{case.applies_to}_fac{_fmt(case.param_value)}"
+    if kind == "icl_noisy_demo_labels":
+        return f"label_noise_train_frac{_fmt(case.param_value)}"
+    if kind == "uninformative_features_shuffled":
+        return f"uninformative_{case.applies_to}_n{_fmt(case.param_value)}"
+    if kind == "feature_rotation_kdim_both":
+        return f"rotation_both_k{_fmt(case.param_value)}"
+    return str(case.condition)
+
+
+def infer_scope(case: Case, *, refit: bool) -> str:
+    """Scope describes *what was corrupted* (not whether a refit happened)."""
+    if case.condition == "clean":
+        return "none"
+    if not refit:
+        return "test_only"
+    if case.applies_to == "train":
+        return "train_only"
+    if case.applies_to == "test":
+        return "test_only"
+    if case.applies_to == "both":
+        return "train_and_test"
+    return "none"
 
 
 def _slug(s: str, max_len: int = 80) -> str:
@@ -881,6 +1254,12 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="Optional list of OpenML dataset IDs. If omitted, uses a default CC18-like panel.",
     )
+    ap.add_argument(
+        "--openml_cache_dir",
+        type=str,
+        default=None,
+        help="Override OpenML cache directory (also sets env OPENML_CACHE_DIR). Useful on read-only $HOME.",
+    )
 
     # Literature-aligned robustness knobs
     ap.add_argument(
@@ -944,6 +1323,50 @@ def parse_args() -> argparse.Namespace:
         help="Rotation subspace dimension (k) when --enable_rotation is set.",
     )
 
+    # Geometry + attention hooks (for unified behaviour/geometry tables)
+    ap.add_argument(
+        "--skip_geometry",
+        action="store_true",
+        help="Skip TFrow collapse metrics (faster).",
+    )
+    ap.add_argument(
+        "--geom_max_rows_spectrum",
+        type=int,
+        default=2048,
+        help="Max #test rows used for covariance-spectrum collapse metrics (stable subsample).",
+    )
+    ap.add_argument(
+        "--geom_max_rows_cosine",
+        type=int,
+        default=512,
+        help="Max #test rows used for pairwise-cosine metrics (stable subsample).",
+    )
+
+    ap.add_argument(
+        "--skip_attention",
+        action="store_true",
+        help="Skip TFicl attention behaviour metrics (N_eff; much faster).",
+    )
+    ap.add_argument(
+        "--attn_max_test_rows",
+        type=int,
+        default=1024,
+        help="Max #test rows used for attention behaviour metrics (stable subsample).",
+    )
+    ap.add_argument(
+        "--attn_chunk_test",
+        type=int,
+        default=1024,
+        help="Chunk size over test queries for attention-weight computation (lower = less VRAM).",
+    )
+    ap.add_argument(
+        "--no_attn_fp16",
+        dest="attn_use_fp16",
+        action="store_false",
+        help="Disable fp16 matmuls inside attention-weight computation.",
+    )
+    ap.set_defaults(attn_use_fp16=True)
+
     return ap.parse_args()
 
 
@@ -951,6 +1374,18 @@ def main() -> None:
     args = parse_args()
     device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
+
+    if args.openml_cache_dir:
+        cache_dir = str(Path(args.openml_cache_dir).expanduser().resolve())
+        os.environ["OPENML_CACHE_DIR"] = cache_dir
+        try:
+            import openml  # lazy import only when needed
+
+            Path(cache_dir).mkdir(parents=True, exist_ok=True)
+            openml.config.set_root_cache_directory(cache_dir)
+            print(f"[info] OpenML cache dir: {cache_dir}")
+        except Exception as e:
+            print(f"[warn] Failed to set OpenML cache dir to '{cache_dir}': {e}")
 
     # --- Run directory + run state
     if args.run_dir:
@@ -988,7 +1423,10 @@ def main() -> None:
         "checkpoint_name",
         "checkpoint_path",
         "checkpoint_sha256",
+        "variant",
+        "checkpoint",
         # dataset
+        "dataset",
         "dataset_key",
         "dataset_name",
         "resolved_dataset_id",
@@ -1003,6 +1441,9 @@ def main() -> None:
         "n_test",
         # condition/case
         "case_id",
+        "case",
+        "severity",
+        "scope",
         "condition",
         "param_type",
         "param_value",
@@ -1015,6 +1456,15 @@ def main() -> None:
         "f1_macro",
         "nll",
         "ece",
+        "brier",
+        "collapse_top1",
+        "d_eff",
+        "cos_mean",
+        "cos_p95",
+        "neff_mean",
+        "neff_std",
+        "purity_top1",
+        "purity_top5",
         # settings
         "n_estimators",
         "batch_size",
@@ -1091,6 +1541,7 @@ def main() -> None:
             expected_rows_per_ds_seed = len(cases) * len(ckpts)
 
             rows_out: List[Dict[str, Any]] = []
+            subsample_seed = _subsample_seed_for_dataset(ds_key, seed)
             for ck in ckpts:
                 print(f"  [checkpoint] {ck.name}")
 
@@ -1130,6 +1581,8 @@ def main() -> None:
 
                     for case in cases_no_refit:
                         cid = case_id(case)
+                        case_label = infer_case_label(case)
+                        scope = infer_scope(case, refit=False)
                         X_te_c = X_te
                         p_cell: float | None = None
                         rotation_seed: int | None = None
@@ -1155,11 +1608,48 @@ def main() -> None:
                             maybe_free_torch_memory()
                             continue
 
+                        geom: Dict[str, float] = {"collapse_top1": float("nan"), "d_eff": float("nan"), "cos_mean": float("nan"), "cos_p95": float("nan")}
+                        attn: Dict[str, float] = {
+                            "neff_mean": float("nan"),
+                            "neff_std": float("nan"),
+                            "purity_top1": float("nan"),
+                            "purity_top5": float("nan"),
+                        }
+                        if not bool(args.skip_geometry):
+                            try:
+                                geom = compute_tfrow_collapse_metrics(
+                                    clf_clean,
+                                    X_te_c,
+                                    max_rows_spectrum=int(args.geom_max_rows_spectrum),
+                                    max_rows_cosine=int(args.geom_max_rows_cosine),
+                                    subsample_seed=int(subsample_seed),
+                                )
+                            except Exception as e:
+                                print(f"[WARN] Geometry metrics failed for {ck.name} case={case_label} ({cid}): {e}")
+                                maybe_free_torch_memory()
+                        if not bool(args.skip_attention):
+                            try:
+                                attn = compute_tficl_attention_metrics(
+                                    clf_clean,
+                                    X_te_c,
+                                    y_te,
+                                    max_test_rows=int(args.attn_max_test_rows),
+                                    chunk_test=int(args.attn_chunk_test),
+                                    use_fp16=bool(args.attn_use_fp16),
+                                    subsample_seed=int(subsample_seed),
+                                )
+                            except Exception as e:
+                                print(f"[WARN] Attention metrics failed for {ck.name} case={case_label} ({cid}): {e}")
+                                maybe_free_torch_memory()
+
                         rows_out.append(
                             {
                                 "checkpoint_name": ck.name,
                                 "checkpoint_path": ck.path,
                                 "checkpoint_sha256": ck.sha256,
+                                "variant": infer_variant(ck.name),
+                                "checkpoint": ck.name,
+                                "dataset": ds_key,
                                 "dataset_key": ds_key,
                                 "dataset_name": info.dataset_name,
                                 "resolved_dataset_id": info.resolved_dataset_id,
@@ -1172,6 +1662,9 @@ def main() -> None:
                                 "n_train": int(len(X_tr)),
                                 "n_test": int(len(X_te_c)),
                                 "case_id": cid,
+                                "case": case_label,
+                                "severity": float(case.param_value),
+                                "scope": scope,
                                 "condition": case.condition,
                                 "param_type": case.param_type,
                                 "param_value": float(case.param_value),
@@ -1183,6 +1676,15 @@ def main() -> None:
                                 "f1_macro": m.f1_macro,
                                 "nll": m.log_loss,
                                 "ece": m.ece,
+                                "brier": m.brier,
+                                "collapse_top1": geom["collapse_top1"],
+                                "d_eff": geom["d_eff"],
+                                "cos_mean": geom["cos_mean"],
+                                "cos_p95": geom["cos_p95"],
+                                "neff_mean": attn["neff_mean"],
+                                "neff_std": attn["neff_std"],
+                                "purity_top1": attn["purity_top1"],
+                                "purity_top5": attn["purity_top5"],
                                 "n_estimators": int(args.n_estimators),
                                 "batch_size": int(args.batch_size),
                                 "use_hierarchical": bool(args.use_hierarchical),
@@ -1200,6 +1702,8 @@ def main() -> None:
 
                 for case in cases_refit:
                     cid = case_id(case)
+                    case_label = infer_case_label(case)
+                    scope = infer_scope(case, refit=True)
                     X_tr_c, y_tr_c = X_tr, y_tr
                     X_te_c = X_te
                     p_cell: float | None = None
@@ -1232,10 +1736,45 @@ def main() -> None:
                         raise RuntimeError(f"Unknown case kind: {kind} (condition={case.condition})")
 
                     clf_case: TabICLClassifier | None = None
+                    geom = {"collapse_top1": float("nan"), "d_eff": float("nan"), "cos_mean": float("nan"), "cos_p95": float("nan")}
+                    attn = {
+                        "neff_mean": float("nan"),
+                        "neff_std": float("nan"),
+                        "purity_top1": float("nan"),
+                        "purity_top5": float("nan"),
+                    }
                     try:
                         maybe_free_torch_memory()
                         clf_case = _fit_clf(X_tr_c, y_tr_c)
                         m = _eval_metrics_from_fitted_clf(clf_case, X_te_c, y_te)
+
+                        if not bool(args.skip_geometry):
+                            try:
+                                geom = compute_tfrow_collapse_metrics(
+                                    clf_case,
+                                    X_te_c,
+                                    max_rows_spectrum=int(args.geom_max_rows_spectrum),
+                                    max_rows_cosine=int(args.geom_max_rows_cosine),
+                                    subsample_seed=int(subsample_seed),
+                                )
+                            except Exception as e:
+                                print(f"[WARN] Geometry metrics failed for {ck.name} case={case_label} ({cid}): {e}")
+                                maybe_free_torch_memory()
+
+                        if not bool(args.skip_attention):
+                            try:
+                                attn = compute_tficl_attention_metrics(
+                                    clf_case,
+                                    X_te_c,
+                                    y_te,
+                                    max_test_rows=int(args.attn_max_test_rows),
+                                    chunk_test=int(args.attn_chunk_test),
+                                    use_fp16=bool(args.attn_use_fp16),
+                                    subsample_seed=int(subsample_seed),
+                                )
+                            except Exception as e:
+                                print(f"[WARN] Attention metrics failed for {ck.name} case={case_label} ({cid}): {e}")
+                                maybe_free_torch_memory()
                     except Exception as e:
                         print(
                             f"[WARN] Failed case {case.condition} ({cid}) for {ck.name} on {info.dataset_name}: {e}"
@@ -1255,6 +1794,9 @@ def main() -> None:
                             "checkpoint_name": ck.name,
                             "checkpoint_path": ck.path,
                             "checkpoint_sha256": ck.sha256,
+                            "variant": infer_variant(ck.name),
+                            "checkpoint": ck.name,
+                            "dataset": ds_key,
                             "dataset_key": ds_key,
                             "dataset_name": info.dataset_name,
                             "resolved_dataset_id": info.resolved_dataset_id,
@@ -1267,6 +1809,9 @@ def main() -> None:
                             "n_train": int(len(X_tr_c)),
                             "n_test": int(len(X_te_c)),
                             "case_id": cid,
+                            "case": case_label,
+                            "severity": float(case.param_value),
+                            "scope": scope,
                             "condition": case.condition,
                             "param_type": case.param_type,
                             "param_value": float(case.param_value),
@@ -1278,6 +1823,15 @@ def main() -> None:
                             "f1_macro": m.f1_macro,
                             "nll": m.log_loss,
                             "ece": m.ece,
+                            "brier": m.brier,
+                            "collapse_top1": geom["collapse_top1"],
+                            "d_eff": geom["d_eff"],
+                            "cos_mean": geom["cos_mean"],
+                            "cos_p95": geom["cos_p95"],
+                            "neff_mean": attn["neff_mean"],
+                            "neff_std": attn["neff_std"],
+                            "purity_top1": attn["purity_top1"],
+                            "purity_top5": attn["purity_top5"],
                             "n_estimators": int(args.n_estimators),
                             "batch_size": int(args.batch_size),
                             "use_hierarchical": bool(args.use_hierarchical),
