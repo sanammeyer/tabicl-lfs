@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TabPDL head diagnosis script (macro-collapse, similarity quality, margins, head swaps, ablations).
+TabPDL head diagnosis script (macro-collapse, similarity quality, margins, head swaps).
 
 This script is intended to debug failure cases where a TabPDL (PDLC-style) head
 collapses to predicting 1–2 classes.
@@ -10,7 +10,7 @@ Implements:
   B) Pairwise AUC/AP of PDLC similarity gamma on support-support pairs
   C) Margin analysis (top-1 minus top-2 gap) per query
   D) Head swap test (SA head <-> PDL head across backbones)
-  E) Ablations: agg / topk / embed_norm / inference temperature
+  E) Optional top-k sweep (single-variant, head-only)
 
 Examples
 --------
@@ -27,12 +27,6 @@ Examples
     --sa_checkpoint checkpoints/mini_tabicl_stage2_sa/step-1000.ckpt \
     --pdl_checkpoint checkpoints/mini_tabicl_stage2_pdl/step-1000.ckpt
 
-  # Quick ablation sweep on aggregation only (single-variant episode)
-  python scripts/diagnostics/diagnose_tabpdl_head.py \
-    --datasets car \
-    --pdl_checkpoint checkpoints/mini_tabicl_stage2_pdl/step-1000.ckpt \
-    --pdl_agg_sweep posterior_avg,class_pool,sum
-
 Notes
 -----
 - `posterior_avg` is the faithful PDLC posterior aggregation used for TabPDL runs in this repo.
@@ -47,6 +41,7 @@ import copy
 import gc
 import json
 import math
+import random
 import sys
 from dataclasses import asdict, dataclass
 from pathlib import Path
@@ -108,6 +103,16 @@ def make_parser() -> argparse.ArgumentParser:
     p.add_argument("--fold", type=int, default=0, help="Fold index for OpenML tasks (default: 0).")
     p.add_argument("--test_size", type=float, default=0.5, help="Test size for random split (default: 0.5).")
     p.add_argument("--seed", type=int, default=42, help="Random seed.")
+    p.add_argument(
+        "--seeds",
+        type=str,
+        default=None,
+        help=(
+            "Optional comma-separated seeds for multi-seed runs. "
+            "If set, runs each seed in an isolated subdirectory under --out_dir (seed{N}/...). "
+            "Within a seed-run, the same seed is used for ALL random choices (splits, episode RNG, sampling)."
+        ),
+    )
 
     p.add_argument("--sa_checkpoint", type=str, default=None, help="Checkpoint trained with standard head (SA).")
     p.add_argument("--pdl_checkpoint", type=str, default=None, help="Checkpoint trained with TabPDL head.")
@@ -162,16 +167,8 @@ def make_parser() -> argparse.ArgumentParser:
     # Optional extra tests
     p.add_argument("--head_swap", action="store_true", help="Run head swap test (requires both checkpoints).")
 
-    # Ablation sweeps (single-variant episode; requires --pdl_checkpoint)
-    p.add_argument("--pdl_agg_sweep", type=str, default=None, help="Comma-separated agg modes to sweep.")
+    # Optional head-only sweeps (single-variant episode; requires --pdl_checkpoint)
     p.add_argument("--pdl_topk_sweep", type=str, default=None, help="Comma-separated topk values (use 'none').")
-    p.add_argument("--pdl_embed_norm_sweep", type=str, default=None, help="Comma-separated embed_norm values (none,l2).")
-    p.add_argument(
-        "--pdl_infer_temp_sweep",
-        type=str,
-        default=None,
-        help="Comma-separated inference temperatures (e.g. 0.5,1.0,2.0).",
-    )
     p.add_argument(
         "--pdl_uncertainty",
         action="store_true",
@@ -1240,6 +1237,7 @@ def tune_pdlc_topk_on_support_val(
     n_estimators: int,
     batch_size: int,
     seed: int,
+    split_seed: Optional[int] = None,
     pdlc_agg: str,
     pdlc_inference_temperature: Optional[float],
     pdlc_bilinear: Optional[str],
@@ -1255,7 +1253,8 @@ def tune_pdlc_topk_on_support_val(
 
     Uses the single-variant embedding path for speed. Returns (best_k, rows).
     """
-    Xa, ya, Xv, yv = _split_train_for_anchor_weights(X_train, y_train, val_frac=val_frac, seed=seed)
+    split_seed = int(seed) if split_seed is None else int(split_seed)
+    Xa, ya, Xv, yv = _split_train_for_anchor_weights(X_train, y_train, val_frac=val_frac, seed=split_seed)
     # Disable gating during tuning-data generation; we sweep it manually at the head level.
     pdl_tune_clf = _make_pdl_anchor_clf(
         checkpoint_path=str(checkpoint_path),
@@ -1275,7 +1274,7 @@ def tune_pdlc_topk_on_support_val(
         pdl_tune_clf,
         Xv,
         variant=str(variant),
-        rng=np.random.default_rng(seed),
+        rng=np.random.default_rng(split_seed),
         train_index=Xa.index,
         test_index=Xv.index,
     )
@@ -1286,10 +1285,6 @@ def tune_pdlc_topk_on_support_val(
 
     # Encode validation labels in the tuning-clf label space
     y_true = encode_y_true_for_index(pdl_tune_clf, y_train, Xv.index)
-
-    head = model.icl_predictor.pdlc_head
-    base_norm = str(head.cfg.embed_norm)
-    base_temp = float(getattr(head.cfg, "Inference_temperature", 1.0))
 
     rows: List[Dict[str, Any]] = []
     best_k: Optional[int] = None
@@ -1303,8 +1298,6 @@ def tune_pdlc_topk_on_support_val(
             episode=episode,
             agg=str(pdlc_agg),
             topk=k,
-            embed_norm=base_norm,
-            infer_temp=base_temp if pdlc_inference_temperature is None else float(pdlc_inference_temperature),
             device=device,
         )
         proba = logits_to_proba(logits)
@@ -1334,17 +1327,6 @@ def tune_pdlc_topk_on_support_val(
     return best_k, rows
 
 
-@dataclass
-class VariantRun:
-    name: str
-    acc: float
-    pred_counts: List[int]
-    n_predicted_classes: int
-    top1_frac: float
-    top2_frac: float
-    margin_median: float
-
-
 @torch.no_grad()
 def pdl_variant_logits_from_embeddings(
     model,
@@ -1353,8 +1335,6 @@ def pdl_variant_logits_from_embeddings(
     *,
     agg: str,
     topk: Optional[int],
-    embed_norm: str,
-    infer_temp: Optional[float],
     device: torch.device,
 ) -> np.ndarray:
     head = getattr(model.icl_predictor, "pdlc_head", None)
@@ -1365,9 +1345,6 @@ def pdl_variant_logits_from_embeddings(
     try:
         head.cfg.agg = str(agg)
         head.cfg.topk = topk
-        head.cfg.embed_norm = str(embed_norm)
-        if infer_temp is not None:
-            head.cfg.Inference_temperature = float(infer_temp)
 
         train_size = episode.train_size
         H_support = src[:train_size].unsqueeze(0).to(device)
@@ -1388,24 +1365,6 @@ def logits_to_proba(logits: np.ndarray) -> np.ndarray:
     x_max = np.max(x, axis=-1, keepdims=True)
     e = np.exp(x - x_max)
     return e / np.sum(e, axis=-1, keepdims=True)
-
-
-def summarize_variant_run(
-    name: str,
-    y_true: np.ndarray,
-    logits: np.ndarray,
-) -> VariantRun:
-    proba = logits_to_proba(logits)
-    diag, y_pred, margin = compute_basic_diagnostics(y_true, proba)
-    return VariantRun(
-        name=name,
-        acc=diag.acc,
-        pred_counts=diag.pred_counts,
-        n_predicted_classes=diag.n_predicted_classes,
-        top1_frac=diag.pred_top1_frac,
-        top2_frac=diag.pred_top2_frac,
-        margin_median=diag.margin_median,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -1566,30 +1525,43 @@ def _safe_corr(a: np.ndarray, b: np.ndarray) -> float:
     return float(np.corrcoef(x, y)[0, 1])
 
 
-def main() -> None:
-    args = make_parser().parse_args()
-    device = resolve_device(args.device)
-    rng = np.random.default_rng(args.seed)
+def _parse_int_csv(s: Optional[str]) -> List[int]:
+    out: List[int] = []
+    for tok in _csv_list(s):
+        out.append(int(tok))
+    return out
 
-    out_dir = Path(args.out_dir)
-    if not args.no_save:
-        out_dir.mkdir(parents=True, exist_ok=True)
 
+def set_global_seed(seed: int) -> None:
+    """Best-effort seeding for reproducibility (python/random + numpy + torch)."""
+    seed = int(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    try:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+    except Exception:
+        pass
+
+
+def _run_for_seed(
+    args: argparse.Namespace,
+    *,
+    seed: int,
+    dataset_specs: Sequence[Dict[str, Any]],
+    device: torch.device,
+    out_dir: Path,
+) -> Dict[str, Any]:
     # Lazily import to keep this script usable even when only some checkpoints are provided.
     from tabicl.sklearn.classifier import TabICLClassifier  # type: ignore
     from tabicl import InferenceConfig  # type: ignore
     from tabicl.model.tabicl import TabICL  # type: ignore
 
-    dataset_specs: List[Dict[str, Any]] = []
-    if args.datasets is not None:
-        for d in _csv_list(args.datasets):
-            dataset_specs.append({"kind": "dataset", "id_or_name": d})
-    if args.openml_tasks is not None:
-        for t in _csv_list(args.openml_tasks):
-            dataset_specs.append({"kind": "task", "task_id": int(t), "fold": int(args.fold)})
-
-    if args.sa_checkpoint is None and args.pdl_checkpoint is None:
-        raise SystemExit("Provide at least one of --sa_checkpoint or --pdl_checkpoint.")
+    overall: Dict[str, Any] = {
+        "args": {**vars(args), "seed": int(seed)},
+        "datasets": [],
+    }
 
     def _validate_checkpoint_path(flag: str, path: Optional[str]) -> None:
         if path is None:
@@ -1606,11 +1578,6 @@ def main() -> None:
     _validate_checkpoint_path("--sa_checkpoint", args.sa_checkpoint)
     _validate_checkpoint_path("--pdl_checkpoint", args.pdl_checkpoint)
 
-    overall: Dict[str, Any] = {
-        "args": vars(args),
-        "datasets": [],
-    }
-
     for spec in dataset_specs:
         if spec["kind"] == "task":
             X, y, ds_name, ds_id, tr_idx, te_idx = fetch_openml_task(int(spec["task_id"]), int(spec["fold"]))
@@ -1620,13 +1587,21 @@ def main() -> None:
         else:
             X, y, ds_name, ds_id = fetch_openml_dataset(spec["id_or_name"])
             X_train, X_test, y_train, y_test = train_test_split(
-                X, y, test_size=float(args.test_size), random_state=int(args.seed), stratify=y
+                X, y, test_size=float(args.test_size), random_state=int(seed), stratify=y
             )
-            split_info = {"kind": "random_stratified", "test_size": float(args.test_size), "seed": int(args.seed)}
+            split_info = {
+                "kind": "random_stratified",
+                "test_size": float(args.test_size),
+                "seed": int(seed),
+            }
+
+        rng_episode_main = np.random.default_rng(int(seed))
+        rng_episode_weighted = np.random.default_rng(int(seed))
 
         ds_out = {
             "dataset_name": ds_name,
             "dataset_id": int(ds_id),
+            "seed": int(seed),
             "n_rows": int(X.shape[0]),
             "n_features": int(X.shape[1]),
             "split": split_info,
@@ -1634,7 +1609,7 @@ def main() -> None:
             "errors": [],
             "pdl_gamma": None,
             "variant": None,
-            "variant_runs": [],
+            "pdl_topk_sweep": None,
             "head_swap": None,
             "pdlc_topk_tune": None,
         }
@@ -1647,12 +1622,14 @@ def main() -> None:
                 raise SystemExit("--pdlc_topk_tune requires --pdl_checkpoint.")
             try:
                 candidates = _parse_topk_candidates(str(args.pdlc_topk_tune_candidates))
+                tune_split_seed = int(seed)
                 best_k, rows = tune_pdlc_topk_on_support_val(
                     checkpoint_path=str(args.pdl_checkpoint),
                     device=device,
                     n_estimators=int(args.n_estimators),
                     batch_size=int(args.batch_size),
-                    seed=int(args.seed),
+                    seed=int(seed),
+                    split_seed=int(tune_split_seed),
                     pdlc_agg=str(args.pdlc_agg),
                     pdlc_inference_temperature=args.pdlc_inference_temperature,
                     pdlc_bilinear=args.pdlc_bilinear,
@@ -1674,7 +1651,9 @@ def main() -> None:
                     "note": "Tuning uses a single-variant episode on a held-out subset of the train split; the chosen topk is then used for full-ensemble evaluation on the full train split.",
                 }
                 k_str = "None" if best_k is None else str(int(best_k))
-                print(f"[PDL topk-tune] metric={args.pdlc_topk_tune_metric} best_topk={k_str} candidates={candidates}")
+                print(
+                    f"[PDL topk-tune] metric={args.pdlc_topk_tune_metric} best_topk={k_str} candidates={candidates}"
+                )
                 if not args.no_save:
                     base = out_dir / ds_name / "pdlc_topk_tune"
                     _maybe_write_csv(base / "tune.csv", pd.DataFrame(rows), args.no_save)
@@ -1695,6 +1674,7 @@ def main() -> None:
                     model_path=args.sa_checkpoint,
                     allow_auto_download=False,
                     device=str(device),
+                    random_state=int(seed),
                     softmax_temperature=float(args.softmax_temperature),
                     average_logits=True,
                 )
@@ -1749,6 +1729,7 @@ def main() -> None:
                     model_path=args.pdl_checkpoint,
                     allow_auto_download=False,
                     device=str(device),
+                    random_state=int(seed),
                     softmax_temperature=float(args.softmax_temperature),
                     average_logits=True,
                     pdlc_agg=str(args.pdlc_agg) if args.pdlc_agg is not None else None,
@@ -1807,15 +1788,17 @@ def main() -> None:
         # -------------------------------
         # B/E on a single variant episode
         # -------------------------------
+        episode_main: Optional[EpisodeVariant] = None
         if pdl_clf is not None:
             episode = materialize_episode_variant(
                 pdl_clf,
                 X_test,
                 variant=str(args.variant),
-                rng=rng,
+                rng=rng_episode_main,
                 train_index=X_train.index,
                 test_index=X_test.index,
             )
+            episode_main = episode
             ds_out["variant"] = asdict(episode) | {"X_variant": None, "y_train_shifted": None}
             # Only store shapes for JSON
             ds_out["variant"]["X_shape"] = list(map(int, episode.X_variant.shape))
@@ -1851,7 +1834,7 @@ def main() -> None:
                 infer_cfg,
                 device=device,
                 max_pairs=int(args.max_pairs),
-                seed=int(args.seed),
+                seed=int(seed),
                 src=src,
             )
             ds_out["pdl_gamma"] = asdict(gamma_sep)
@@ -1883,8 +1866,6 @@ def main() -> None:
                             episode=episode,
                             agg=str(getattr(pdl_model.icl_predictor.pdlc_head.cfg, "agg", "posterior_avg")),
                             topk=getattr(pdl_model.icl_predictor.pdlc_head.cfg, "topk", None),
-                            embed_norm=str(getattr(pdl_model.icl_predictor.pdlc_head.cfg, "embed_norm", "none")),
-                            infer_temp=getattr(pdl_model.icl_predictor.pdlc_head.cfg, "Inference_temperature", None),
                             device=device,
                         )
                         proba_sv = logits_to_proba(logits_sv)
@@ -1957,8 +1938,9 @@ def main() -> None:
                     if args.pdl_checkpoint is None:
                         raise ValueError("--pdl_learn_anchor_weights requires --pdl_checkpoint.")
 
+                    anchor_split_seed = int(seed)
                     Xa, ya, Xv, yv = _split_train_for_anchor_weights(
-                        X_train, y_train, val_frac=float(args.pdl_anchor_val_frac), seed=int(args.seed)
+                        X_train, y_train, val_frac=float(args.pdl_anchor_val_frac), seed=int(anchor_split_seed)
                     )
                     # Learn weights on Xv, evaluate on X_test. Both use the same anchor set Xa.
                     Xq = pd.concat([Xv, X_test], axis=0)
@@ -1970,7 +1952,7 @@ def main() -> None:
                         device=device,
                         n_estimators=int(args.n_estimators),
                         batch_size=int(args.batch_size),
-                        seed=int(args.seed),
+                        seed=int(seed),
                         pdlc_agg=str(args.pdlc_agg),
                         pdlc_inference_temperature=args.pdlc_inference_temperature,
                         pdlc_topk=pdlc_topk_effective,
@@ -1983,7 +1965,7 @@ def main() -> None:
                         pdl_anchor_clf,
                         Xq,
                         variant=str(args.variant),
-                        rng=rng,
+                        rng=rng_episode_weighted,
                         train_index=Xa.index,
                         test_index=Xq.index,
                     )
@@ -2031,7 +2013,7 @@ def main() -> None:
                         prune_lambda=float(args.pdl_anchor_weight_prune_lambda),
                         entropy_lambda=float(args.pdl_anchor_weight_entropy_lambda),
                         prune_topm=args.pdl_anchor_weight_prune_topm,
-                        seed=int(args.seed),
+                        seed=int(seed),
                         device=device,
                     )
 
@@ -2102,82 +2084,71 @@ def main() -> None:
                 except Exception as e:
                     print(f"[warn] Failed to learn/apply anchor weights: {e}")
 
-            # Ablations / single-variant runs
-            assert [str(i) for i in list(X_test.index)] == episode.test_index, "Episode test_index mismatch vs X_test."
-            y_true_variant = encode_y_true_for_index(pdl_clf, y_test, X_test.index)
+            # Optional head-only top-k sweep on the same single-variant episode.
+            # (Keeps aggregation / similarity / temperature fixed to the effective wrapper config.)
+            if args.pdl_topk_sweep:
+                assert [str(i) for i in list(X_test.index)] == episode.test_index, "Episode test_index mismatch vs X_test."
+                y_true_variant = encode_y_true_for_index(pdl_clf, y_test, X_test.index)
 
-            # Precompute ICL embeddings once (used for all sweeps that only affect the head)
-            # (already computed above)
+                def _parse_topk_list(v: Optional[str]) -> List[Optional[int]]:
+                    out: List[Optional[int]] = []
+                    for s in _csv_list(v):
+                        if s.lower() in {"none", "null"}:
+                            out.append(None)
+                            continue
+                        k = int(s)
+                        if k <= 0:
+                            out.append(None)
+                        else:
+                            out.append(k)
+                    seen = set()
+                    uniq: List[Optional[int]] = []
+                    for k in out:
+                        if k not in seen:
+                            uniq.append(k)
+                            seen.add(k)
+                    return uniq
 
-            def _parse_topk_list(v: Optional[str]) -> List[Optional[int]]:
-                out: List[Optional[int]] = []
-                for s in _csv_list(v):
-                    if s.lower() in {"none", "null"}:
-                        out.append(None)
-                    else:
-                        out.append(int(s))
-                return out
-
-            agg_sweep = _csv_list(args.pdl_agg_sweep) or []
-            topk_sweep = _parse_topk_list(args.pdl_topk_sweep) if args.pdl_topk_sweep else []
-            norm_sweep = _csv_list(args.pdl_embed_norm_sweep) or []
-            temp_sweep = [float(x) for x in _csv_list(args.pdl_infer_temp_sweep)] if args.pdl_infer_temp_sweep else []
-
-            if agg_sweep or topk_sweep or norm_sweep or temp_sweep:
-                # Build a manageable cartesian product; default to current values when not swept.
                 head = pdl_model.icl_predictor.pdlc_head
-                base_agg = str(head.cfg.agg)
-                base_topk = head.cfg.topk
-                base_norm = str(head.cfg.embed_norm)
-                base_temp = float(getattr(head.cfg, "Inference_temperature", 1.0))
+                base_agg = str(getattr(head.cfg, "agg", "posterior_avg"))
+                sweep = _parse_topk_list(args.pdl_topk_sweep)
 
-                aggs = agg_sweep or [base_agg]
-                if agg_sweep and base_agg not in aggs:
-                    # Ensure the faithful/baseline config is included for direct comparison.
-                    aggs = [base_agg] + aggs
-                topks = topk_sweep or [base_topk]
-                norms = norm_sweep or [base_norm]
-                temps = temp_sweep or [base_temp]
-
-                # Hard cap to avoid accidental combinatorial explosions
-                cap = 48
-                combos_all = [(a, k, n, t) for a in aggs for k in topks for n in norms for t in temps]
-                baseline = (base_agg, base_topk, base_norm, base_temp)
-                if len(combos_all) > cap:
-                    # Randomly sample configs to avoid systematic ordering bias.
-                    # Keep the baseline config if present.
-                    idx_all = np.arange(len(combos_all))
-                    if baseline in combos_all and cap >= 2:
-                        baseline_idx = combos_all.index(baseline)
-                        remaining = np.delete(idx_all, baseline_idx)
-                        pick = rng.choice(remaining, size=cap - 1, replace=False)
-                        idx = np.concatenate([[baseline_idx], pick])
-                    else:
-                        idx = rng.choice(idx_all, size=cap, replace=False)
-                    combos = [combos_all[int(i)] for i in idx]
-                    print(f"[warn] Ablation combinations randomly capped to {cap} configs (total={len(combos_all)}).")
-                else:
-                    combos = combos_all
-
-                for agg, topk, norm, temp in combos:
-                    tag = f"agg={agg}|topk={topk}|norm={norm}|temp={temp:g}"
+                rows: List[Dict[str, Any]] = []
+                for k in sweep:
                     logits = pdl_variant_logits_from_embeddings(
                         pdl_model,
                         src=src,
                         episode=episode,
-                        agg=agg,
-                        topk=topk,
-                        embed_norm=norm,
-                        infer_temp=temp,
+                        agg=base_agg,
+                        topk=k,
                         device=device,
                     )
-                    run = summarize_variant_run(f"pdl_ablate:{tag}", y_true_variant, logits)
-                    ds_out["variant_runs"].append(asdict(run))
+                    proba = logits_to_proba(logits)
+                    diag, _, _ = compute_basic_diagnostics(y_true_variant, proba)
+                    rows.append(
+                        {
+                            "topk": k,
+                            "acc": float(diag.acc),
+                            "macro_f1": float(diag.macro_f1),
+                            "weighted_f1": float(diag.weighted_f1),
+                            "n_predicted_classes": int(diag.n_predicted_classes),
+                            "pred_entropy_norm": float(diag.pred_entropy_norm),
+                            "pred_top1_frac": float(diag.pred_top1_frac),
+                            "margin_median": float(diag.margin_median),
+                        }
+                    )
                     if args.verbose:
+                        k_str = "None" if k is None else str(int(k))
                         print(
-                            f"[ablate] {tag} acc={run.acc:.4f} n_pred={run.n_predicted_classes}/{len(run.pred_counts)} "
-                            f"top1={run.top1_frac:.3f} margin_med={run.margin_median:.3f}"
+                            f"[topk_sweep] k={k_str} acc={diag.acc:.4f} macro_f1={diag.macro_f1:.4f} "
+                            f"n_pred={diag.n_predicted_classes} top1={diag.pred_top1_frac:.3f} "
+                            f"H={diag.pred_entropy_norm:.3f} margin_med={diag.margin_median:.3f}"
                         )
+
+                ds_out["pdl_topk_sweep"] = {"agg": base_agg, "rows": rows}
+                if not args.no_save:
+                    base = out_dir / ds_name / "pdl_topk_sweep"
+                    _maybe_write_csv(base / "sweep.csv", pd.DataFrame(rows), args.no_save)
 
         # -------------------------------
         # D: head swap test (single-variant)
@@ -2199,7 +2170,7 @@ def main() -> None:
                         if core_sa.get(k) != core_pdl.get(k):
                             print(f"  {k}: sa={core_sa.get(k)} pdl={core_pdl.get(k)}")
 
-                # Episode: use PDL classifier (already fitted) if available, else fit a small helper
+                # Episode: reuse the main single-variant episode when available (fairness across diagnostics).
                 if pdl_clf is None:
                     helper = TabICLClassifier(
                         n_estimators=8,
@@ -2209,6 +2180,7 @@ def main() -> None:
                         model_path=args.pdl_checkpoint,
                         allow_auto_download=False,
                         device=str(device),
+                        random_state=int(seed),
                         softmax_temperature=float(args.softmax_temperature),
                         average_logits=True,
                     )
@@ -2217,15 +2189,17 @@ def main() -> None:
                 else:
                     pdl_clf_for_episode = pdl_clf
 
-                episode = materialize_episode_variant(
-                    pdl_clf_for_episode,
-                    X_test,
-                    variant=str(args.variant),
-                    rng=rng,
-                    train_index=X_train.index,
-                    test_index=X_test.index,
-                )
-                assert [str(i) for i in list(X_test.index)] == episode.test_index, "Episode test_index mismatch vs X_test."
+                swap_episode = episode_main
+                if swap_episode is None:
+                    swap_episode = materialize_episode_variant(
+                        pdl_clf_for_episode,
+                        X_test,
+                        variant=str(args.variant),
+                        rng=rng_episode_main,
+                        train_index=X_train.index,
+                        test_index=X_test.index,
+                    )
+                assert [str(i) for i in list(X_test.index)] == swap_episode.test_index, "Episode test_index mismatch vs X_test."
                 y_true_variant = encode_y_true_for_index(pdl_clf_for_episode, y_test, X_test.index)
 
                 backbone_prefixes = [
@@ -2263,19 +2237,29 @@ def main() -> None:
                 infer_cfg.update_from_dict(init)
 
                 proba_pdl_on_sa = eval_model_on_episode_logits(
-                    model_pdl_on_sa, episode, infer_cfg, device=device, return_proba=True, softmax_temperature=float(args.softmax_temperature)
+                    model_pdl_on_sa,
+                    swap_episode,
+                    infer_cfg,
+                    device=device,
+                    return_proba=True,
+                    softmax_temperature=float(args.softmax_temperature),
                 )
                 diag_a, _, _ = compute_basic_diagnostics(y_true_variant, proba_pdl_on_sa)
 
                 proba_sa_on_pdl = eval_model_on_episode_logits(
-                    model_sa_on_pdl, episode, infer_cfg, device=device, return_proba=True, softmax_temperature=float(args.softmax_temperature)
+                    model_sa_on_pdl,
+                    swap_episode,
+                    infer_cfg,
+                    device=device,
+                    return_proba=True,
+                    softmax_temperature=float(args.softmax_temperature),
                 )
                 diag_b, _, _ = compute_basic_diagnostics(y_true_variant, proba_sa_on_pdl)
 
-                episode_meta = asdict(episode) | {"X_variant": None, "y_train_shifted": None}
+                episode_meta = asdict(swap_episode) | {"X_variant": None, "y_train_shifted": None}
                 try:
-                    episode_meta["X_shape"] = list(map(int, episode.X_variant.shape))
-                    episode_meta["y_train_shifted_shape"] = list(map(int, episode.y_train_shifted.shape))
+                    episode_meta["X_shape"] = list(map(int, swap_episode.X_variant.shape))
+                    episode_meta["y_train_shifted_shape"] = list(map(int, swap_episode.y_train_shifted.shape))
                 except Exception:
                     pass
                 episode_meta.pop("X_variant", None)
@@ -2294,7 +2278,54 @@ def main() -> None:
         overall["datasets"].append(ds_out)
         _maybe_write_json(out_dir / ds_name / "summary.json", ds_out, args.no_save)
 
-    _maybe_write_json(out_dir / "summary_all.json", overall, args.no_save)
+    return overall
+
+
+def main() -> None:
+    args = make_parser().parse_args()
+    device = resolve_device(args.device)
+    base_out_dir = Path(args.out_dir)
+    if not args.no_save:
+        base_out_dir.mkdir(parents=True, exist_ok=True)
+
+    dataset_specs: List[Dict[str, Any]] = []
+    if args.datasets is not None:
+        for d in _csv_list(args.datasets):
+            dataset_specs.append({"kind": "dataset", "id_or_name": d})
+    if args.openml_tasks is not None:
+        for t in _csv_list(args.openml_tasks):
+            dataset_specs.append({"kind": "task", "task_id": int(t), "fold": int(args.fold)})
+
+    if args.sa_checkpoint is None and args.pdl_checkpoint is None:
+        raise SystemExit("Provide at least one of --sa_checkpoint or --pdl_checkpoint.")
+
+    seed_list = _parse_int_csv(args.seeds) if args.seeds else [int(args.seed)]
+    if not seed_list:
+        raise SystemExit("No seeds provided.")
+
+    if len(seed_list) == 1:
+        seed = int(seed_list[0])
+        set_global_seed(seed)
+        overall = _run_for_seed(args, seed=seed, dataset_specs=dataset_specs, device=device, out_dir=base_out_dir)
+        _maybe_write_json(base_out_dir / "summary_all.json", overall, args.no_save)
+        return
+
+    runs: List[Dict[str, Any]] = []
+    for seed in seed_list:
+        seed = int(seed)
+        out_dir = base_out_dir / f"seed{seed}"
+        if not args.no_save:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        set_global_seed(seed)
+        overall = _run_for_seed(args, seed=seed, dataset_specs=dataset_specs, device=device, out_dir=out_dir)
+        _maybe_write_json(out_dir / "summary_all.json", overall, args.no_save)
+        runs.append({"seed": seed, "out_dir": str(out_dir), "summary_all": str(out_dir / "summary_all.json")})
+
+    _maybe_write_json(
+        base_out_dir / "summary_seeds.json",
+        {"args": vars(args), "seeds": list(map(int, seed_list)), "runs": runs},
+        args.no_save,
+    )
 
 
 if __name__ == "__main__":
