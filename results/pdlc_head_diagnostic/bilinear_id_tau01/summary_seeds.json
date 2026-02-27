@@ -1,0 +1,76 @@
+{
+  "args": {
+    "batch_size": 8,
+    "datasets": "40975,40982,4538,1475,1497,11,1467,1068,1050,1056,310,43551,46962,46809,40983,4135,38",
+    "device": "auto",
+    "fold": 0,
+    "head_swap": false,
+    "max_pairs": 250000,
+    "n_estimators": 32,
+    "no_save": false,
+    "openml_tasks": null,
+    "out_dir": "results/pdlc_head_diagnostic/bilinear_id_tau01",
+    "pdl_anchor_val_frac": 0.2,
+    "pdl_anchor_weight_entropy_lambda": 0.0,
+    "pdl_anchor_weight_lr": 0.5,
+    "pdl_anchor_weight_prune_lambda": 0.0,
+    "pdl_anchor_weight_prune_topm": null,
+    "pdl_anchor_weight_steps": 300,
+    "pdl_anchor_weight_use_topk": false,
+    "pdl_checkpoint": "checkpoints/mini_tabicl_stage2_pdl_posterior_avg/step-1000.ckpt",
+    "pdl_learn_anchor_weights": false,
+    "pdl_topk_sweep": null,
+    "pdl_uncertainty": false,
+    "pdlc_agg": "posterior_avg",
+    "pdlc_bilinear": "identity",
+    "pdlc_inference_temperature": null,
+    "pdlc_tau_override": 0.1,
+    "pdlc_topk": 32,
+    "pdlc_topk_tune": false,
+    "pdlc_topk_tune_candidates": "8,16,32,64,128",
+    "pdlc_topk_tune_metric": "macro_f1",
+    "pdlc_topk_tune_val_frac": 0.2,
+    "sa_checkpoint": "checkpoints/mini_tabicl_stage2_sa/step-1000.ckpt",
+    "seed": 42,
+    "seeds": "42,43,44,45,46",
+    "softmax_temperature": 0.9,
+    "test_size": 0.2,
+    "use_amp": false,
+    "variant": "identity",
+    "verbose": false
+  },
+  "runs": [
+    {
+      "out_dir": "results/pdlc_head_diagnostic/bilinear_id_tau01/seed42",
+      "seed": 42,
+      "summary_all": "results/pdlc_head_diagnostic/bilinear_id_tau01/seed42/summary_all.json"
+    },
+    {
+      "out_dir": "results/pdlc_head_diagnostic/bilinear_id_tau01/seed43",
+      "seed": 43,
+      "summary_all": "results/pdlc_head_diagnostic/bilinear_id_tau01/seed43/summary_all.json"
+    },
+    {
+      "out_dir": "results/pdlc_head_diagnostic/bilinear_id_tau01/seed44",
+      "seed": 44,
+      "summary_all": "results/pdlc_head_diagnostic/bilinear_id_tau01/seed44/summary_all.json"
+    },
+    {
+      "out_dir": "results/pdlc_head_diagnostic/bilinear_id_tau01/seed45",
+      "seed": 45,
+      "summary_all": "results/pdlc_head_diagnostic/bilinear_id_tau01/seed45/summary_all.json"
+    },
+    {
+      "out_dir": "results/pdlc_head_diagnostic/bilinear_id_tau01/seed46",
+      "seed": 46,
+      "summary_all": "results/pdlc_head_diagnostic/bilinear_id_tau01/seed46/summary_all.json"
+    }
+  ],
+  "seeds": [
+    42,
+    43,
+    44,
+    45,
+    46
+  ]
+}
