@@ -25,11 +25,49 @@ def _rolling_mean(y: np.ndarray, window: int) -> np.ndarray:
     )
 
 
-def _load_csv(csv_path: Path, metric: str) -> Tuple[np.ndarray, np.ndarray]:
+def _select_segment(df: pd.DataFrame, which: str) -> pd.DataFrame:
+    """Select one segment when logs contain multiple runs appended.
+
+    Segments are detected by `step` resets (step[t] < step[t-1]).
+    """
+    which = which.strip().lower()
+    if which not in {"last", "first", "longest"}:
+        raise ValueError(f"Invalid segment selector: {which!r} (expected: last|first|longest)")
+
+    if df.empty:
+        return df
+
+    step = df["step"].to_numpy(dtype=float)
+    seg = np.zeros(len(df), dtype=int)
+    cur = 0
+    for i in range(1, len(df)):
+        if step[i] < step[i - 1]:
+            cur += 1
+        seg[i] = cur
+    df = df.assign(_seg=seg)
+
+    seg_ids = sorted(df["_seg"].unique().tolist())
+    if len(seg_ids) <= 1:
+        return df.drop(columns=["_seg"])
+
+    if which == "last":
+        chosen = seg_ids[-1]
+    elif which == "first":
+        chosen = seg_ids[0]
+    else:
+        sizes = df.groupby("_seg", as_index=True).size()
+        chosen = int(sizes.idxmax())
+
+    return df[df["_seg"] == chosen].drop(columns=["_seg"]).reset_index(drop=True)
+
+
+def _load_csv(csv_path: Path, metric: str, segment: str) -> Tuple[np.ndarray, np.ndarray]:
     df = pd.read_csv(csv_path, usecols=["step", metric])
     df["step"] = pd.to_numeric(df["step"], errors="coerce")
     df[metric] = pd.to_numeric(df[metric], errors="coerce")
-    df = df.dropna(subset=["step", metric]).sort_values("step").reset_index(drop=True)
+    df = df.dropna(subset=["step", metric]).reset_index(drop=True)
+    df = _select_segment(df, segment)
+    df = df.sort_values("step").reset_index(drop=True)
     return df["step"].to_numpy(dtype=float), df[metric].to_numpy(dtype=float)
 
 
@@ -57,14 +95,19 @@ def _plot_two_stage(
     out_path: Path,
     rolling_stage1: int,
     rolling_stage2: int,
+    stage1_segment: str,
+    stage2_segment: str,
+    label: str | None,
     color: str = "#1f77b4",
 ) -> None:
-    s1_step, s1_y = _load_csv(stage1_csv, metric)
-    s2_step, s2_y = _load_csv(stage2_csv, metric)
+    s1_step, s1_y = _load_csv(stage1_csv, metric, segment=stage1_segment)
+    s2_step, s2_y = _load_csv(stage2_csv, metric, segment=stage2_segment)
 
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(10.5, 4.0), sharey=True)
 
     ylab = _pretty_label(metric)
+    if label:
+        fig.suptitle(str(label), fontsize=11)
 
     ax1.plot(s1_step, _rolling_mean(s1_y, rolling_stage1), color=color, linewidth=1.5)
     ax1.set_title("Stage 1: Adaptation")
@@ -83,7 +126,7 @@ def _plot_two_stage(
     if s2_step.size:
         ax2.set_xlim(float(s2_step.min()), float(s2_step.max()))
 
-    fig.tight_layout()
+    fig.tight_layout(rect=(0.0, 0.0, 1.0, 0.96 if label else 1.0))
     fig.savefig(out_path, bbox_inches="tight")
     plt.close(fig)
 
@@ -120,6 +163,18 @@ def main() -> None:
         help="Stage-2 EA metrics CSV.",
     )
     parser.add_argument(
+        "--stage1_segment",
+        default="last",
+        choices=["last", "first", "longest"],
+        help="Which segment to plot if stage1 logs contain multiple appended runs (default: last).",
+    )
+    parser.add_argument(
+        "--stage2_segment",
+        default="last",
+        choices=["last", "first", "longest"],
+        help="Which segment to plot if stage2 logs contain multiple appended runs (default: last).",
+    )
+    parser.add_argument(
         "--metric",
         default="icl_L2_sparsity",
         help="Metric column name to plot (default: icl_L2_sparsity).",
@@ -139,6 +194,11 @@ def main() -> None:
         "--out_dir",
         default="results/training_metrics_analysis",
         help="Output directory.",
+    )
+    parser.add_argument(
+        "--label",
+        default=None,
+        help="Optional figure title (e.g., 'EA-ICL (icl-only)' or 'EA-FULL (row+icl)').",
     )
     parser.add_argument(
         "--rolling_stage1",
@@ -169,10 +229,12 @@ def main() -> None:
             out_path=out_path,
             rolling_stage1=int(args.rolling_stage1),
             rolling_stage2=int(args.rolling_stage2),
+            stage1_segment=str(args.stage1_segment),
+            stage2_segment=str(args.stage2_segment),
+            label=args.label,
         )
         print(f"Wrote: {out_path}")
 
 
 if __name__ == "__main__":
     main()
-
