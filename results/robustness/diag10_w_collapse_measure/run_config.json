@@ -1,0 +1,61 @@
+{
+  "attn_chunk_test": 512,
+  "attn_max_test_rows": 2048,
+  "attn_use_fp16": true,
+  "batch_size": 8,
+  "checkpoint_names": [
+    "SA",
+    "EA-ICL",
+    "EA-FULL"
+  ],
+  "checkpoints": [
+    "checkpoints/mini_tabicl_stage2_sa/step-1000.ckpt",
+    "checkpoints/mini_tabicl_stage2_ea_icl_only/step-1000.ckpt",
+    "checkpoints/mini_tabicl_stage2_ea_row_icl/step-1000.ckpt"
+  ],
+  "device": "cuda",
+  "enable_label_noise": true,
+  "enable_rotation": true,
+  "geom_max_rows_cosine": 2048,
+  "geom_max_rows_spectrum": 8192,
+  "label_poison_fracs": [
+    0.1
+  ],
+  "n_estimators": 32,
+  "n_seeds": 5,
+  "no_stratify": false,
+  "openml_cache_dir": "/workspace/tabicl-lfs/.openml_cache",
+  "openml_ids": [
+    7592,
+    14965,
+    9976,
+    14952,
+    14969,
+    32,
+    146821,
+    9978,
+    43,
+    9960
+  ],
+  "outlier_factors": [
+    0.0,
+    10.0,
+    50.0
+  ],
+  "outlier_p_cell": 0.02,
+  "outliers_apply_to": "both",
+  "rotation_k": 8,
+  "run_dir": "results/robustness/diag10_w_collapse_measure",
+  "run_name": null,
+  "seed": 42,
+  "seeds": null,
+  "skip_attention": false,
+  "skip_geometry": false,
+  "test_size": 0.2,
+  "uninformative_ns": [
+    0,
+    10,
+    50
+  ],
+  "use_hierarchical": true
+}
